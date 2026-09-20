@@ -15,6 +15,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.musicdlp.ui.theme.MusicDLPTheme
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -39,26 +40,44 @@ class MainActivity : ComponentActivity() {
 fun MainScreen() {
     val navController = rememberNavController()
     val viewModel: MusicViewModel = viewModel()
-    
+    val snackbarHostState = remember { SnackbarHostState() }
+    val errorMessage by viewModel.errorMessage.collectAsState()
+
+    LaunchedEffect(errorMessage) {
+        errorMessage?.let {
+            snackbarHostState.showSnackbar(it)
+            viewModel.clearError()
+        }
+    }
+
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
+            val navBackStackEntry by navController.currentBackStackEntryAsState()
+            val currentDestination = navBackStackEntry?.destination?.route
+            
             NavigationBar {
                 NavigationBarItem(
                     icon = { Icon(Icons.Default.Home, contentDescription = "Swipe") },
                     label = { Text("Swipe") },
-                    selected = true, // Simplified
-                    onClick = { navController.navigate("swipe") }
+                    selected = currentDestination == "swipe",
+                    onClick = { 
+                        navController.navigate("swipe") {
+                            popUpTo("swipe") { inclusive = true }
+                        }
+                        viewModel.resumeSwiping()
+                    }
                 )
                 NavigationBarItem(
                     icon = { Icon(Icons.Default.Favorite, contentDescription = "Liked") },
                     label = { Text("Liked") },
-                    selected = false,
+                    selected = currentDestination == "liked",
                     onClick = { navController.navigate("liked") }
                 )
                 NavigationBarItem(
                     icon = { Icon(Icons.Default.List, contentDescription = "Disliked") },
                     label = { Text("Disliked") },
-                    selected = false,
+                    selected = currentDestination == "disliked",
                     onClick = { navController.navigate("disliked") }
                 )
             }
