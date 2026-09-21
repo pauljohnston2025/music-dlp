@@ -208,13 +208,22 @@ fun SwipingScreen(viewModel: MusicViewModel) {
                         ) {
                             Button(
                                 onClick = { viewModel.dislikeSong(currentSong) },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.Red),
+                                enabled = currentSong.isMetadataCleaned == true
                             ) {
                                 Text("NOPE", fontWeight = FontWeight.Bold, color = Color.White)
                             }
                             Button(
+                                onClick = { viewModel.skipSong(currentSong) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.Gray),
+                                enabled = currentSong.isMetadataCleaned == true
+                            ) {
+                                Text("SKIP", fontWeight = FontWeight.Bold, color = Color.White)
+                            }
+                            Button(
                                 onClick = { viewModel.likeSong(currentSong) },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
+                                enabled = currentSong.isMetadataCleaned == true
                             ) {
                                 Text("LIKE", fontWeight = FontWeight.Bold, color = Color.White)
                             }
@@ -242,45 +251,58 @@ fun TinderCard(
     onSwipedLeft: () -> Unit,
     onSwipedRight: () -> Unit
 ) {
+    val currentOnSwipedLeft by rememberUpdatedState(onSwipedLeft)
+    val currentOnSwipedRight by rememberUpdatedState(onSwipedRight)
+    
     val isSongLoading by viewModel.isSongLoading.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val offsetX = remember { Animatable(0f) }
+    val offsetY = remember { Animatable(0f) }
     val coroutineScope = rememberCoroutineScope()
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .height(580.dp)
-            .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+            .offset { IntOffset(offsetX.value.roundToInt(), offsetY.value.roundToInt()) }
             .graphicsLayer {
                 rotationZ = offsetX.value / 20
             }
-            .pointerInput(Unit) {
-                detectDragGestures(
-                    onDrag = { change, dragAmount ->
-                        change.consume()
-                        coroutineScope.launch {
-                            offsetX.snapTo(offsetX.value + dragAmount.x)
+            .pointerInput(song.id) {
+                if (song.isMetadataCleaned == true) {
+                    detectDragGestures(
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            coroutineScope.launch {
+                                offsetX.snapTo(offsetX.value + dragAmount.x)
+                                offsetY.snapTo(offsetY.value + dragAmount.y)
+                            }
+                        },
+                        onDragEnd = {
+                            if (offsetX.value > 400) {
+                                coroutineScope.launch {
+                                    offsetX.animateTo(1000f)
+                                    currentOnSwipedRight()
+                                }
+                            } else if (offsetX.value < -400) {
+                                coroutineScope.launch {
+                                    offsetX.animateTo(-1000f)
+                                    currentOnSwipedLeft()
+                                }
+                            } else if (offsetY.value < -400) {
+                                coroutineScope.launch {
+                                    offsetY.animateTo(-1000f)
+                                    viewModel.skipSong(song)
+                                }
+                            } else {
+                                coroutineScope.launch {
+                                    offsetX.animateTo(0f)
+                                    offsetY.animateTo(0f)
+                                }
+                            }
                         }
-                    },
-                    onDragEnd = {
-                        if (offsetX.value > 400) {
-                            coroutineScope.launch {
-                                offsetX.animateTo(1000f)
-                                onSwipedRight()
-                            }
-                        } else if (offsetX.value < -400) {
-                            coroutineScope.launch {
-                                offsetX.animateTo(-1000f)
-                                onSwipedLeft()
-                            }
-                        } else {
-                            coroutineScope.launch {
-                                offsetX.animateTo(0f)
-                            }
-                        }
-                    }
-                )
+                    )
+                }
             }
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
@@ -311,17 +333,17 @@ fun TinderCard(
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "YouTube: ${song.rawTitle ?: song.title}",
+                    text = "YouTube: ${song.rawTitle ?: "Unknown"}",
                     style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                    modifier = Modifier.alpha(0.7f)
+                    maxLines = 2,
+                    modifier = Modifier.alpha(0.7f).padding(bottom = 4.dp)
                 )
                 
                 var editableTitle by remember(song.id) { mutableStateOf(song.title) }
                 var editableArtist by remember(song.id) { mutableStateOf(song.artist) }
 
                 // Sync UI fields if background cleaning completes after the card is already shown
-                LaunchedEffect(song.title, song.artist) {
+                LaunchedEffect(song.title, song.artist, song.isMetadataCleaned) {
                     editableTitle = song.title
                     editableArtist = song.artist
                 }
@@ -330,9 +352,9 @@ fun TinderCard(
                     value = editableTitle,
                     onValueChange = { 
                         editableTitle = it
-                        song.title = it
+                        viewModel.updateSongNameAndArtist(song, it, editableArtist)
                     },
-                    label = { Text("Title") },
+                    label = { Text("Song Name") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -340,9 +362,9 @@ fun TinderCard(
                     value = editableArtist,
                     onValueChange = { 
                         editableArtist = it
-                        song.artist = it
+                        viewModel.updateSongNameAndArtist(song, editableTitle, it)
                     },
-                    label = { Text("Artist") },
+                    label = { Text("Artist Name") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -389,6 +411,24 @@ fun TinderCard(
                     Text(
                         text = "NOPE",
                         color = Color.Red,
+                        fontSize = 32.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            if (offsetY.value < -50) {
+                Box(
+                    modifier = Modifier
+                        .padding(16.dp)
+                        .align(Alignment.Center)
+                        .border(4.dp, Color.Gray, shape = MaterialTheme.shapes.small)
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .alpha((-offsetY.value / 400f).coerceIn(0f, 1f))
+                ) {
+                    Text(
+                        text = "SKIP",
+                        color = Color.Gray,
                         fontSize = 32.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -546,8 +586,10 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                 }
-                                TextButton(onClick = { viewModel.retryDownload(song) }) {
-                                    Text("Retry")
+                                if (!viewModel.isSongDownloaded(song)) {
+                                    TextButton(onClick = { viewModel.retryDownload(song) }) {
+                                        Text("Retry")
+                                    }
                                 }
                             }
                         },
@@ -609,6 +651,16 @@ fun SettingsScreen(viewModel: MusicViewModel) {
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Update yt-dlp binary")
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Button(
+            onClick = { viewModel.clearDatabase() },
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Clear Library Database", color = MaterialTheme.colorScheme.onError)
         }
     }
 }

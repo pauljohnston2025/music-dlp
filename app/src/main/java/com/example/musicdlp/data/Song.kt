@@ -7,12 +7,15 @@ import androidx.room.PrimaryKey
 data class Song(
     @PrimaryKey
     val id: String,
-    var title: String,
-    var artist: String,
+    val title: String,
+    val artist: String,
     val thumbnailUrl: String,
     val youtubeUrl: String,
     val isLiked: Boolean = false,
     val isDisliked: Boolean = false,
     val isrc: String? = null,
-    val rawTitle: String? = null
+    val rawTitle: String? = null,
+    val isMetadataCleaned: Boolean? = false,
+    val likedAt: Long? = null,
+    val dislikedAt: Long? = null
 )

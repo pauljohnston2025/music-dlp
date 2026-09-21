@@ -50,24 +50,28 @@ class YoutubeDLRepository(private val context: Context) {
     private suspend fun guessWithGemini(rawTitle: String): Pair<String, String>? {
         if (geminiApiKey.isBlank()) return null
         try {
+            // Using a more standard model name and removing responseMimeType in case of version mismatch
             val generativeModel = GenerativeModel(
                 modelName = "gemini-1.5-flash",
-                apiKey = geminiApiKey,
-                generationConfig = generationConfig {
-                    responseMimeType = "application/json"
-                }
+                apiKey = geminiApiKey
             )
             val prompt = """
                 Extract the artist name and song title from this YouTube video title: "$rawTitle".
                 The title often contains noise like "Official Video", "feat.", or the artist's name repeated.
                 Return only a JSON object with "artist" and "title" keys.
                 Ensure "title" only contains the song name, not the artist.
-                Example Input: "Daft Punk - One More Time (Official Music Video)"
                 Example Output: {"artist": "Daft Punk", "title": "One More Time"}
             """.trimIndent()
             
             val response = generativeModel.generateContent(prompt)
-            val text = response.text ?: return null
+            var text = response.text ?: return null
+            
+            // Extract JSON if Gemini wraps it in markdown blocks
+            if (text.contains("{")) {
+                text = text.substringAfter("{").substringBeforeLast("}")
+                text = "{$text}"
+            }
+
             val element = json.decodeFromString<JsonElement>(text).jsonObject
             val artist = element["artist"]?.jsonPrimitive?.content
             val title = element["title"]?.jsonPrimitive?.content
@@ -82,49 +86,79 @@ class YoutubeDLRepository(private val context: Context) {
     }
 
     fun cleanTitleAndArtistRegex(rawTitle: String, uploader: String?): Pair<String, String> {
-        var clean = rawTitle
-            .replace(Regex("(?i)\\(official\\s*(music\\s*)?video\\)|\\[official\\s*(music\\s*)?video\\]"), "")
-            .replace(Regex("(?i)\\(official\\s*audio\\)|\\[official\\s*audio\\]"), "")
-            .replace(Regex("(?i)\\(lyrics?\\s*(video)?\\)|\\[lyrics?\\s*(video)?\\]"), "")
-            .replace(Regex("(?i)\\(visualizer\\)|\\[visualizer\\]"), "")
-            .replace(Regex("(?i)\\(audio\\)|\\[audio\\]"), "")
-            .replace(Regex("(?i)ft\\.?|feat\\.?"), "-")
-            .trim()
+        Napier.d("cleanTitleAndArtistRegex input: $rawTitle, uploader: $uploader", tag = "DEBUG_METADATA")
+        
+        // 1. Split by common separators (dash, colon, pipe)
+        val parts = rawTitle.split(Regex("""\s*[-–—:|]\s*"""), limit = 2)
+        val noiseKeywords = "official|lyric|video|hd|hq|4k|audio|remastered|visualizer|live|concert|full audio|high quality"
+        val noisePattern = Regex("""[\(\[\{].*?($noiseKeywords).*?[\)\]\}]""", RegexOption.IGNORE_CASE)
 
-        clean = clean.replace(Regex("""\(.*?\)|\[.*?\]"""), "").trim()
-
-        val parts = clean.split(Regex("""\s*[-–—:|]\s*"""), limit = 2)
         var artist = uploader ?: "Unknown"
-        var title = clean
+        var title = rawTitle
 
         if (parts.size == 2) {
             val p0 = parts[0].trim()
             val p1 = parts[1].trim()
-            // If first part is reasonably short, assume it's the artist
-            if (p0.length in 1..40 && !p0.contains("http", ignoreCase = true)) {
+            
+            // Check which side has the noise tags
+            val p0HasNoise = noisePattern.containsMatchIn(p0)
+            val p1HasNoise = noisePattern.containsMatchIn(p1)
+
+            if (p0HasNoise && !p1HasNoise) {
+                // Pattern: Title [Official] - Artist
+                title = p0
+                artist = p1
+            } else if (!p0HasNoise && p1HasNoise) {
+                // Pattern: Artist - Title [Official]
                 artist = p0
                 title = p1
             } else {
-                // Otherwise assume p0 is the title and p1 might be extra info
-                title = p0
+                // Default heuristic based on uploader match or length
+                val upLower = uploader?.lowercase() ?: ""
+                if (p0.lowercase().contains(upLower) || upLower.contains(p0.lowercase()) || p0.length in 1..45) {
+                    artist = p0
+                    title = p1
+                } else {
+                    title = p0
+                }
             }
         }
 
-        artist = artist.replace(Regex("(?i)vevo|official|channel|music"), "").trim()
-        if (artist.isBlank()) {
-            artist = uploader?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim() ?: "Unknown"
+        // 2. Cleanup both
+        fun finalCleanup(text: String): String {
+            return text
+                .replace(noisePattern, "")
+                .replace(Regex("""(?i)\b(feat\.?|ft\.?)\b.*"""), "")
+                .replace(Regex("""(?i)\s+(official|video|music|audio|lyric|hd|hq).*$"""), "")
+                .trim()
+                .removeSurrounding("\"").removeSurrounding("'")
+                .removeSurrounding("“", "”").removeSurrounding("‘", "’")
+                .trim()
+                .removePrefix("-").removeSuffix("-")
+                .trim()
         }
 
-        return artist.ifBlank { "Unknown" } to title.ifBlank { rawTitle }
+        artist = finalCleanup(artist)
+        title = finalCleanup(title)
+
+        // 3. Final fallback artist check
+        if (artist.isBlank() || artist.equals("official", true) || artist.equals("video", true)) {
+            artist = uploader?.replace(Regex("(?i)vevo|official|channel|music|\\s+-\\s+topic"), "")?.trim() ?: "Unknown"
+        }
+
+        Napier.i("Regex Result: Artist='$artist', Title='$title'", tag = "DEBUG_METADATA")
+        return artist to title.ifBlank { rawTitle }
     }
 
     suspend fun cleanTitleAndArtist(rawTitle: String, uploader: String?, isrc: String? = null, youtubeUrl: String? = null): Pair<String, String> {
         Napier.d("cleanTitleAndArtist START - rawTitle: $rawTitle", tag = "DEBUG_METADATA")
         
+        fun postClean(text: String) = text.trim().removePrefix("-").removeSuffix("-").trim()
+
         // 1. Try Gemini first if API key is available
         val geminiGuess = guessWithGemini(rawTitle)
         if (geminiGuess != null) {
-            return geminiGuess
+            return postClean(geminiGuess.first) to postClean(geminiGuess.second)
         }
 
         // 2. Try fetching high-quality metadata from YouTube
@@ -140,7 +174,7 @@ class YoutubeDLRepository(private val context: Context) {
                     ?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim()
                 val ytTrack = entry.track
                 if (!ytArtist.isNullOrBlank() && !ytTrack.isNullOrBlank()) {
-                    return ytArtist to ytTrack.trim()
+                    return postClean(ytArtist) to postClean(ytTrack)
                 }
             } catch (e: Exception) {
                 Napier.w("yt-dlp metadata fetch failed: ${e.message}", tag = "DEBUG_METADATA")
@@ -149,8 +183,10 @@ class YoutubeDLRepository(private val context: Context) {
 
         // 3. Fallback to Regex
         val regexResult = cleanTitleAndArtistRegex(rawTitle, uploader)
-        Napier.i("Regex result: ${regexResult.first} - ${regexResult.second}", tag = "DEBUG_METADATA")
-        return regexResult
+        val finalResult = postClean(regexResult.first) to postClean(regexResult.second)
+        
+        Napier.i("Final result: ${finalResult.first} - ${finalResult.second}", tag = "DEBUG_METADATA")
+        return finalResult
     }
 
     suspend fun searchSongsOrPlaylists(query: String): List<String> = withContext(Dispatchers.IO) {
@@ -249,7 +285,7 @@ class YoutubeDLRepository(private val context: Context) {
                     
                     songs.add(
                         Song(
-                            id = entry.id ?: System.currentTimeMillis().toString(),
+                            id = entry.id ?: "url_${"https://www.youtube.com/watch?v=${entry.id}".hashCode()}",
                             title = rawTitle,
                             artist = artist.ifBlank { "Unknown" },
                             thumbnailUrl = thumbnail,
@@ -278,39 +314,23 @@ class YoutubeDLRepository(private val context: Context) {
 
     suspend fun getStreamUrl(youtubeUrl: String): String? = withContext(Dispatchers.IO) {
         val request = YoutubeDLRequest(youtubeUrl)
-        // Prefer m4a for better ExoPlayer compatibility, fallback to any best audio
-        request.addOption("-f", "bestaudio[ext=m4a]/bestaudio/best")
+        request.addOption("-f", "bestaudio")
         request.addOption("-g")
-        request.addOption("--no-playlist")
         request.addOption("--user-agent", userAgent)
-        request.addOption("--force-ipv4") // Sometimes helps with signature issues
         
         Napier.d("Fetching stream URL for: $youtubeUrl", tag = "DEBUG_METADATA")
         return@withContext try {
             val response = YoutubeDL.getInstance().execute(request)
-            var url = response.out.trim().lines().firstOrNull()
-            
-            // If m4a preference failed or returned nothing, retry with a broader filter
-            if (url.isNullOrBlank()) {
-                Napier.w("m4a stream fetch failed, retrying with broad bestaudio", tag = "DEBUG_METADATA")
-                val retryRequest = YoutubeDLRequest(youtubeUrl)
-                retryRequest.addOption("-f", "bestaudio")
-                retryRequest.addOption("-g")
-                retryRequest.addOption("--no-playlist")
-                retryRequest.addOption("--user-agent", userAgent)
-                val retryResponse = YoutubeDL.getInstance().execute(retryRequest)
-                url = retryResponse.out.trim().lines().firstOrNull()
-            }
-
-            if (url != null) {
+            val url = response.out.trim().lines().firstOrNull()
+            if (url != null && url.startsWith("http")) {
                 Napier.d("Stream URL fetched: $url", tag = "DEBUG_METADATA")
+                url
             } else {
-                Napier.w("No stream URL in response. Output: ${response.out}", tag = "DEBUG_METADATA")
+                Napier.w("Invalid stream URL response: ${response.out}", tag = "DEBUG_METADATA")
+                null
             }
-            url
         } catch (e: Exception) {
             Napier.e("Failed to fetch stream URL: ${e.message}", tag = "DEBUG_METADATA")
-            e.printStackTrace()
             null
         }
     }
@@ -322,6 +342,7 @@ class YoutubeDLRepository(private val context: Context) {
     ): String = withContext(Dispatchers.IO) {
         val request = YoutubeDLRequest(song.youtubeUrl)
         request.addOption("-o", File(downloadDir, "%(id)s.%(ext)s").absolutePath)
+        request.addOption("-f", "bestaudio")
         request.addOption("-x")
         request.addOption("--audio-format", "mp3")
         request.addOption("--user-agent", userAgent)
