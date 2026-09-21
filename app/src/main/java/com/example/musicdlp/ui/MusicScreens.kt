@@ -43,6 +43,7 @@ import kotlin.math.roundToInt
 fun SwipingScreen(viewModel: MusicViewModel) {
     val songs by viewModel.songsToSwipe.collectAsState()
     val isPlaylistLoading by viewModel.isPlaylistLoading.collectAsState()
+    val isBuffering by viewModel.isBuffering.collectAsState()
     val playlistTotal by viewModel.playlistTotal.collectAsState()
     val playlistIndex by viewModel.playlistIndex.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
@@ -194,7 +195,7 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             modifier = Modifier.fillMaxWidth().height(650.dp),
             contentAlignment = Alignment.Center
         ) {
-            if (isPlaylistLoading) {
+            if (isPlaylistLoading || (isBuffering && songs.isEmpty())) {
                 CircularProgressIndicator()
             } else if (songs.isNotEmpty()) {
                 val currentSong = songs.first()
@@ -437,10 +438,12 @@ fun TinderCard(
             
             if (isSongLoading) {
                 Box(
-                    modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface.copy(alpha = 0.5f)),
-                    contentAlignment = Alignment.Center
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp),
+                    contentAlignment = Alignment.BottomCenter
                 ) {
-                    CircularProgressIndicator()
+                    CircularProgressIndicator(modifier = Modifier.size(32.dp))
                 }
             }
         }

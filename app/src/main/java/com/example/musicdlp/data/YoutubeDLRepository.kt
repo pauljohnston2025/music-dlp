@@ -22,6 +22,26 @@ import io.github.aakira.napier.Napier
 
 import com.google.ai.client.generativeai.GenerativeModel
 import com.google.ai.client.generativeai.type.generationConfig
+import io.ktor.client.*
+import io.ktor.client.call.*
+import io.ktor.client.engine.okhttp.*
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.client.request.*
+import io.ktor.serialization.kotlinx.json.*
+
+@Serializable
+data class GeminiModelList(
+    val models: List<GeminiModelInfo>? = null
+)
+
+@Serializable
+data class GeminiModelInfo(
+    val name: String? = null,
+    val version: String? = null,
+    val displayName: String? = null,
+    val description: String? = null,
+    val supportedGenerationMethods: List<String>? = null
+)
 
 @Serializable
 data class YtDlpPlaylist(
@@ -47,40 +67,84 @@ class YoutubeDLRepository(private val context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
     var geminiApiKey: String = ""
 
+    private val client = HttpClient(OkHttp) {
+        install(ContentNegotiation) {
+            json(Json {
+                ignoreUnknownKeys = true
+            })
+        }
+    }
+
+    suspend fun listGeminiModels(): List<String> {
+        if (geminiApiKey.isBlank()) return emptyList()
+        try {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models?key=$geminiApiKey"
+            val response: GeminiModelList = client.get(url).body()
+            val modelNames = response.models?.mapNotNull { it.name } ?: emptyList()
+            Napier.i("Available Gemini Models: $modelNames", tag = "DEBUG_METADATA")
+            return modelNames
+        } catch (e: Exception) {
+            Napier.e("Failed to list Gemini models: ${e.message}", tag = "DEBUG_METADATA")
+            return emptyList()
+        }
+    }
+
     private suspend fun guessWithGemini(rawTitle: String): Pair<String, String>? {
         if (geminiApiKey.isBlank()) return null
-        try {
-            // Using a more standard model name and removing responseMimeType in case of version mismatch
-            val generativeModel = GenerativeModel(
-                modelName = "gemini-1.5-flash",
-                apiKey = geminiApiKey
-            )
-            val prompt = """
-                Extract the artist name and song title from this YouTube video title: "$rawTitle".
-                The title often contains noise like "Official Video", "feat.", or the artist's name repeated.
-                Return only a JSON object with "artist" and "title" keys.
-                Ensure "title" only contains the song name, not the artist.
-                Example Output: {"artist": "Daft Punk", "title": "One More Time"}
-            """.trimIndent()
-            
-            val response = generativeModel.generateContent(prompt)
-            var text = response.text ?: return null
-            
-            // Extract JSON if Gemini wraps it in markdown blocks
-            if (text.contains("{")) {
-                text = text.substringAfter("{").substringBeforeLast("}")
-                text = "{$text}"
-            }
+        
+        // List models first to debug what's available for this API key
+        val availableModels = listGeminiModels()
+        
+        // Priority order for models we want to use
+        val preferredModels = listOf("gemini-1.5-flash", "gemini-pro", "gemini-1.5-pro", "gemini-1.0-pro")
+        
+        val modelsToTry = if (availableModels.isNotEmpty()) {
+            // Filter only models that support generation and are in our preferred list or have gemini in name
+            availableModels.map { it.removePrefix("models/") }
+                .filter { name -> 
+                    preferredModels.contains(name) || name.contains("gemini", ignoreCase = true)
+                }
+                .sortedBy { name ->
+                    val index = preferredModels.indexOf(name)
+                    if (index != -1) index else Int.MAX_VALUE
+                }
+        } else {
+            preferredModels
+        }
 
-            val element = json.decodeFromString<JsonElement>(text).jsonObject
-            val artist = element["artist"]?.jsonPrimitive?.content
-            val title = element["title"]?.jsonPrimitive?.content
-            if (!artist.isNullOrBlank() && !title.isNullOrBlank()) {
-                Napier.i("Gemini guess: $artist - $title", tag = "DEBUG_METADATA")
-                return artist to title
+        for (modelName in modelsToTry) {
+            try {
+                val generativeModel = GenerativeModel(
+                    modelName = modelName,
+                    apiKey = geminiApiKey
+                )
+                val prompt = """
+                    Extract the artist name and song title from this YouTube video title: "$rawTitle".
+                    Return a JSON object: {"artist": "ARTIST_NAME", "title": "SONG_TITLE"}
+                    IMPORTANT: The "title" field must ONLY contain the song name, NOT the artist.
+                """.trimIndent()
+                
+                val response = generativeModel.generateContent(prompt)
+                var text = response.text ?: continue
+                
+                // Extract JSON block if present
+                if (text.contains("{")) {
+                    text = text.substringAfter("{").substringBeforeLast("}")
+                    text = "{$text}"
+                }
+
+                val element = json.decodeFromString<JsonElement>(text).jsonObject
+                val artist = element["artist"]?.jsonPrimitive?.content?.trim()
+                val title = element["title"]?.jsonPrimitive?.content?.trim()
+                
+                if (!artist.isNullOrBlank() && !title.isNullOrBlank()) {
+                    Napier.i("Gemini guess ($modelName): Artist='$artist', Title='$title'", tag = "DEBUG_METADATA")
+                    return artist to title
+                }
+            } catch (e: Exception) {
+                Napier.w("Gemini model '$modelName' failed: ${e.message}", tag = "DEBUG_METADATA")
+                // Continue to next model if it's a 404 or support error
             }
-        } catch (e: Exception) {
-            Napier.w("Gemini guess failed: ${e.message}", tag = "DEBUG_METADATA")
         }
         return null
     }
@@ -129,7 +193,7 @@ class YoutubeDLRepository(private val context: Context) {
             return text
                 .replace(noisePattern, "")
                 .replace(Regex("""(?i)\b(feat\.?|ft\.?)\b.*"""), "")
-                .replace(Regex("""(?i)\s+(official|video|music|audio|lyric|hd|hq).*$"""), "")
+                .replace(Regex("""(?i)\s+(official|video|music|audio|lyric|hd|hq|live|concert).*$"""), "")
                 .trim()
                 .removeSurrounding("\"").removeSurrounding("'")
                 .removeSurrounding("“", "”").removeSurrounding("‘", "’")
@@ -141,7 +205,16 @@ class YoutubeDLRepository(private val context: Context) {
         artist = finalCleanup(artist)
         title = finalCleanup(title)
 
-        // 3. Final fallback artist check
+        // 3. If title still starts with artist name, remove it
+        val artistLower = artist.lowercase()
+        if (title.lowercase().startsWith(artistLower)) {
+            val potentialTitle = title.substring(artist.length).trim()
+            if (potentialTitle.startsWith("-") || potentialTitle.startsWith(":") || potentialTitle.startsWith("|")) {
+                title = potentialTitle.substring(1).trim()
+            }
+        }
+
+        // 4. Final fallback artist check
         if (artist.isBlank() || artist.equals("official", true) || artist.equals("video", true)) {
             artist = uploader?.replace(Regex("(?i)vevo|official|channel|music|\\s+-\\s+topic"), "")?.trim() ?: "Unknown"
         }
@@ -154,11 +227,22 @@ class YoutubeDLRepository(private val context: Context) {
         Napier.d("cleanTitleAndArtist START - rawTitle: $rawTitle", tag = "DEBUG_METADATA")
         
         fun postClean(text: String) = text.trim().removePrefix("-").removeSuffix("-").trim()
+        
+        fun ensureTitleOnly(artist: String, title: String): String {
+            val a = artist.lowercase().trim()
+            var t = title.trim()
+            if (t.lowercase().startsWith(a)) {
+                t = t.substring(a.length).trim().removePrefix("-").removePrefix(":").removePrefix("|").trim()
+            }
+            return t
+        }
 
         // 1. Try Gemini first if API key is available
         val geminiGuess = guessWithGemini(rawTitle)
         if (geminiGuess != null) {
-            return postClean(geminiGuess.first) to postClean(geminiGuess.second)
+            val a = postClean(geminiGuess.first)
+            val t = ensureTitleOnly(a, postClean(geminiGuess.second))
+            return a to t
         }
 
         // 2. Try fetching high-quality metadata from YouTube
@@ -174,7 +258,9 @@ class YoutubeDLRepository(private val context: Context) {
                     ?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim()
                 val ytTrack = entry.track
                 if (!ytArtist.isNullOrBlank() && !ytTrack.isNullOrBlank()) {
-                    return postClean(ytArtist) to postClean(ytTrack)
+                    val a = postClean(ytArtist)
+                    val t = ensureTitleOnly(a, postClean(ytTrack))
+                    return a to t
                 }
             } catch (e: Exception) {
                 Napier.w("yt-dlp metadata fetch failed: ${e.message}", tag = "DEBUG_METADATA")
@@ -183,7 +269,9 @@ class YoutubeDLRepository(private val context: Context) {
 
         // 3. Fallback to Regex
         val regexResult = cleanTitleAndArtistRegex(rawTitle, uploader)
-        val finalResult = postClean(regexResult.first) to postClean(regexResult.second)
+        val a = postClean(regexResult.first)
+        val t = ensureTitleOnly(a, postClean(regexResult.second))
+        val finalResult = a to t
         
         Napier.i("Final result: ${finalResult.first} - ${finalResult.second}", tag = "DEBUG_METADATA")
         return finalResult
@@ -268,10 +356,6 @@ class YoutubeDLRepository(private val context: Context) {
                 val songs = mutableListOf<Song>()
                 for (entry in rawEntries) {
                     val rawTitle = entry.title ?: ""
-                    if (rawTitle.contains("live", ignoreCase = true) || rawTitle.contains("concert", ignoreCase = true) || rawTitle.contains("festival", ignoreCase = true)) {
-                        continue
-                    }
-                    
                     // Do NOT run heavy MusicBrainz lookup during playlist load; use raw/uploader info initially so load is instantaneous.
                     // MusicBrainz lookup / cleaning will happen lazily when playing/buffering.
                     val artist = entry.uploader?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim() ?: "Unknown"

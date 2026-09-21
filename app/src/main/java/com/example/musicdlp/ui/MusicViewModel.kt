@@ -24,10 +24,13 @@ import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.YoutubeDLRepository
 import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.io.IOException
@@ -62,6 +65,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val songsToSwipe: StateFlow<List<Song>> = _songsToSwipe
 
     private val pendingBufferQueue = mutableListOf<Song>()
+    private val queueMutex = Mutex()
+    private val processMutex = Mutex()
     
     private val _isBuffering = MutableStateFlow(false)
     val isBuffering: StateFlow<Boolean> = _isBuffering
@@ -173,12 +178,23 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun processQueue() {
-        if (_isBuffering.value) return
-        _isBuffering.value = true
+        if (!processMutex.tryLock()) return
         try {
-            while (pendingBufferQueue.isNotEmpty() && _songsToSwipe.value.size < 5) {
-                val song = pendingBufferQueue.removeAt(0)
+            while (true) {
+                val song = queueMutex.withLock {
+                    if (pendingBufferQueue.isNotEmpty() && _songsToSwipe.value.size < 5) {
+                        pendingBufferQueue.removeAt(0)
+                    } else null
+                } ?: break
                 
+                // 1. FAST ID CHECK - Skip already in library immediately
+                val allSongs = songDao.getAllSongs()
+                if (allSongs.any { it.id == song.id }) {
+                    Napier.d("Skipping song already in library (ID match): ${song.id}", tag = "DEBUG_METADATA")
+                    continue
+                }
+
+                _isBuffering.value = true
                 var workingSong = song
                 if (song.isMetadataCleaned != true) {
                     try {
@@ -187,19 +203,32 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     } catch (e: Exception) {}
                 }
 
-                val allSongs = songDao.getAllSongs()
-                if (allSongs.any { it.title.lowercase().trim() == workingSong.title.lowercase().trim() }) continue
+                // Check again with cleaned title
+                if (allSongs.any { it.title.lowercase().trim() == workingSong.title.lowercase().trim() }) {
+                    Napier.d("Skipping song already in library (Title match): ${workingSong.title}", tag = "DEBUG_METADATA")
+                    continue
+                }
 
+                // 2. Add to UI immediately so user can see it
+                _songsToSwipe.value = _songsToSwipe.value + workingSong
+                
+                // 3. Pre-fetch stream URL in background
                 try {
                     val url = repository.getStreamUrl(workingSong.youtubeUrl)
                     if (url != null) bufferedStreamUrls[workingSong.id] = url
                 } catch (e: Exception) {}
 
-                _songsToSwipe.value = _songsToSwipe.value + workingSong
-                if (_currentlyPlayingId.value == null) playPreview(workingSong)
+                // If nothing is playing, play this one (it's the first)
+                if (_currentlyPlayingId.value == null) {
+                    delay(800) 
+                    playPreview(workingSong)
+                }
+                
+                delay(100) // Yield for UI
             }
         } finally {
             _isBuffering.value = false
+            processMutex.unlock()
         }
     }
 
@@ -236,8 +265,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun saveLikedSong(song: Song) {
         songDao.insertSong(song.copy(isLiked = true))
-        
-        // Queue download
         viewModelScope.launch(Dispatchers.IO) {
             downloadSemaphore.withPermit {
                 try {
@@ -250,10 +277,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     if (!downloadDir.exists()) downloadDir.mkdirs()
                     val finalFile = File(downloadDir, finalFileName)
                     
-                    if (finalFile.exists()) {
-                        Napier.d("File already exists: $finalFileName", tag = "DEBUG_METADATA")
-                        return@withPermit
-                    }
+                    if (finalFile.exists()) return@withPermit
 
                     val downloadedPath: String = if (song.youtubeUrl.startsWith("/")) {
                         val linkFile = File(app.cacheDir, finalFileName)
@@ -306,9 +330,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun retryDownload(song: Song) {
-        viewModelScope.launch {
-            saveLikedSong(song)
-        }
+        viewModelScope.launch { saveLikedSong(song) }
     }
 
     fun playLikedSong(song: Song, onNotDownloaded: () -> Unit) {
@@ -335,6 +357,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun playPreview(song: Song) {
         viewModelScope.launch {
+            if (song.isMetadataCleaned != true) {
+                try {
+                    val (cleanArtist, cleanTitle) = repository.cleanTitleAndArtist(song.title, song.artist, song.isrc, song.youtubeUrl)
+                    val cleanedSong = song.copy(artist = cleanArtist, title = cleanTitle, isMetadataCleaned = true)
+                    _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) cleanedSong else it }
+                } catch (e: Exception) {}
+            }
             _currentlyPlayingId.value = song.id
             _isSongLoading.value = true
             exoPlayer.stop()
@@ -371,21 +400,23 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             _isPlaylistLoading.value = true
             bufferedStreamUrls.clear()
             _songsToSwipe.value = emptyList()
-            pendingBufferQueue.clear()
+            queueMutex.withLock { pendingBufferQueue.clear() }
             try {
                 val results = repository.searchSongsOrPlaylists(query)
                 _playlistTotal.value = results.size
                 processedCount = 0
+                _isPlaylistLoading.value = false // stop spinner early
                 for (url in results) {
-                    try {
-                        val songs = repository.getPlaylistSongs(url)
-                        pendingBufferQueue.addAll(songs)
-                        processQueue()
-                    } catch (e: Exception) {}
+                    launch(Dispatchers.IO) {
+                        try {
+                            val songs = repository.getPlaylistSongs(url)
+                            queueMutex.withLock { pendingBufferQueue.addAll(songs) }
+                            processQueue()
+                        } catch (e: Exception) {}
+                    }
                 }
             } catch (e: Exception) {
                 _errorMessage.value = "Search failed: ${e.message}"
-            } finally {
                 _isPlaylistLoading.value = false
             }
         }
@@ -397,16 +428,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             _isPlaylistLoading.value = true
             bufferedStreamUrls.clear()
             _songsToSwipe.value = emptyList()
-            pendingBufferQueue.clear()
+            queueMutex.withLock { pendingBufferQueue.clear() }
             try {
                 val playlistSongs = repository.getPlaylistSongs(url)
                 _playlistTotal.value = playlistSongs.size
                 processedCount = 0
-                pendingBufferQueue.addAll(playlistSongs)
+                queueMutex.withLock { pendingBufferQueue.addAll(playlistSongs) }
+                _isPlaylistLoading.value = false
                 processQueue()
             } catch (e: Exception) {
                 _errorMessage.value = "Failed to load playlist: ${e.message}"
-            } finally {
                 _isPlaylistLoading.value = false
             }
         }
@@ -417,7 +448,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             _isPlaylistLoading.value = true
             bufferedStreamUrls.clear()
             _songsToSwipe.value = emptyList()
-            pendingBufferQueue.clear()
+            queueMutex.withLock { pendingBufferQueue.clear() }
             try {
                 try { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}
                 val docFile = DocumentFile.fromTreeUri(context, uri) ?: return@launch
@@ -429,11 +460,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 _playlistTotal.value = localSongs.size
                 processedCount = 0
-                pendingBufferQueue.addAll(localSongs)
+                queueMutex.withLock { pendingBufferQueue.addAll(localSongs) }
+                _isPlaylistLoading.value = false
                 processQueue()
             } catch (e: Exception) {
                 _errorMessage.value = "Failed to read local folder: ${e.message}"
-            } finally {
                 _isPlaylistLoading.value = false
             }
         }
@@ -443,8 +474,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             _isPlaylistLoading.value = true
             try {
-                val currentVersion = YoutubeDL.getInstance().version(app)
-                Napier.d("Current yt-dlp version: $currentVersion", tag = "DEBUG_METADATA")
                 val result = YoutubeDL.getInstance().updateYoutubeDL(app)
                 val newVersion = YoutubeDL.getInstance().version(app)
                 _errorMessage.value = "yt-dlp update: $result. Version: $newVersion"
