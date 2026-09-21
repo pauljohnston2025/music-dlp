@@ -63,6 +63,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
 
+    implementation("androidx.documentfile:documentfile:1.0.1")
     implementation(libs.youtubedl.library)
     implementation(libs.youtubedl.ffmpeg)
 
@@ -77,6 +78,8 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.navigation.compose)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.napier)
+    implementation(libs.generative.ai)
 
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

@@ -1,12 +1,12 @@
 {
   "formatVersion": 1,
   "database": {
-    "version": 1,
-    "identityHash": "8715b5a485b87e40e3efdbb3ea786828",
+    "version": 3,
+    "identityHash": "506fe2710f861f92221097d19caf756a",
     "entities": [
       {
         "tableName": "songs",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `thumbnailUrl` TEXT NOT NULL, `youtubeUrl` TEXT NOT NULL, `isLiked` INTEGER NOT NULL, `isDisliked` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `thumbnailUrl` TEXT NOT NULL, `youtubeUrl` TEXT NOT NULL, `isLiked` INTEGER NOT NULL, `isDisliked` INTEGER NOT NULL, `isrc` TEXT, `rawTitle` TEXT, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -49,6 +49,16 @@
             "columnName": "isDisliked",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "isrc",
+            "columnName": "isrc",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "rawTitle",
+            "columnName": "rawTitle",
+            "affinity": "TEXT"
           }
         ],
         "primaryKey": {
@@ -61,7 +71,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '8715b5a485b87e40e3efdbb3ea786828')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '506fe2710f861f92221097d19caf756a')"
     ]
   }
 }

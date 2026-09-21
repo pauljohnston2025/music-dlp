@@ -10,6 +10,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -80,6 +81,12 @@ fun MainScreen() {
                     selected = currentDestination == "disliked",
                     onClick = { navController.navigate("disliked") }
                 )
+                NavigationBarItem(
+                    icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
+                    label = { Text("Settings") },
+                    selected = currentDestination == "settings",
+                    onClick = { navController.navigate("settings") }
+                )
             }
         }
     ) { innerPadding ->
@@ -91,6 +98,7 @@ fun MainScreen() {
             composable("swipe") { SwipingScreen(viewModel) }
             composable("liked") { LikedSongsScreen(viewModel) }
             composable("disliked") { DislikedSongsScreen(viewModel) }
+            composable("settings") { com.example.musicdlp.ui.SettingsScreen(viewModel) }
         }
     }
 }

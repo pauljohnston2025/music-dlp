@@ -1,20 +1,18 @@
 package com.example.musicdlp.data
 
 import androidx.room.Entity
-import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(
-    tableName = "songs",
-    indices = [Index(value = ["title"], unique = true)]
-)
+@Entity(tableName = "songs")
 data class Song(
-    @PrimaryKey val id: String,
-    val title: String,
-    val artist: String,
+    @PrimaryKey
+    val id: String,
+    var title: String,
+    var artist: String,
     val thumbnailUrl: String,
     val youtubeUrl: String,
-    val isLiked: Boolean,
-    val isDisliked: Boolean,
-    val filePath: String? = null
+    val isLiked: Boolean = false,
+    val isDisliked: Boolean = false,
+    val isrc: String? = null,
+    val rawTitle: String? = null
 )

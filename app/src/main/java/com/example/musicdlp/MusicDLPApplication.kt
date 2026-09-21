@@ -6,6 +6,8 @@ import androidx.room.Room
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLException
 import com.yausername.ffmpeg.FFmpeg
+import io.github.aakira.napier.DebugAntilog
+import io.github.aakira.napier.Napier
 
 class MusicDLPApplication : Application() {
 
@@ -14,6 +16,8 @@ class MusicDLPApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+
+        Napier.base(DebugAntilog())
         
         database = Room.databaseBuilder(
             applicationContext,

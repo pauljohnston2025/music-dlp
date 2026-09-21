@@ -14,15 +14,12 @@ interface SongDao {
     @Query("SELECT * FROM songs WHERE isDisliked = 1")
     fun getDislikedSongs(): Flow<List<Song>>
 
-    @Query("SELECT * FROM songs WHERE id = :id")
-    suspend fun getSongById(id: String): Song?
+    @Query("SELECT * FROM songs")
+    suspend fun getAllSongs(): List<Song>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSong(song: Song)
 
-    @Query("SELECT * FROM songs WHERE title LIKE '%' || :query || '%' OR artist LIKE '%' || :query || '%'")
-    fun searchSongs(query: String): Flow<List<Song>>
-
-    @Query("SELECT * FROM songs")
-    suspend fun getAllSongs(): List<Song>
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSongs(songs: List<Song>)
 }
