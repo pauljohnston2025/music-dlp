@@ -1,10 +1,18 @@
 package com.example.musicdlp.ui
 
 import android.app.Application
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import androidx.core.app.NotificationCompat
+import com.example.musicdlp.MainActivity
+import android.content.BroadcastReceiver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import androidx.core.content.ContextCompat
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -72,6 +80,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         skipSong(currentSong)
                     }
                 }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                _currentPlayingSong.value?.let { showPlaybackNotification(it) }
             }
         })
     }
@@ -152,6 +164,108 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentlyPlayingId = MutableStateFlow<String?>(null)
     val currentlyPlayingId: StateFlow<String?> = _currentlyPlayingId
 
+    private val _currentPlayingSong = MutableStateFlow<Song?>(null)
+    val currentPlayingSong: StateFlow<Song?> = _currentPlayingSong
+
+    private val notificationReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                "com.example.musicdlp.ACTION_PLAY_PAUSE" -> {
+                    togglePlayPause()
+                }
+                "com.example.musicdlp.ACTION_LIKE" -> {
+                    val song = _currentPlayingSong.value ?: _songsToSwipe.value.firstOrNull()
+                    song?.let { likeSong(it) }
+                }
+                "com.example.musicdlp.ACTION_DISLIKE" -> {
+                    val song = _currentPlayingSong.value ?: _songsToSwipe.value.firstOrNull()
+                    song?.let { dislikeSong(it) }
+                }
+            }
+        }
+    }
+
+    private fun showPlaybackNotification(song: Song) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                "playback_channel",
+                "Playback Notification",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Shows currently playing song"
+                setShowBadge(true)
+            }
+            val manager = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+
+        val openIntent = Intent(app, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val openPendingIntent = PendingIntent.getActivity(
+            app, 0, openIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val playPauseIntent = Intent("com.example.musicdlp.ACTION_PLAY_PAUSE").setPackage(app.packageName)
+        val playPausePendingIntent = PendingIntent.getBroadcast(
+            app, 1, playPauseIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val likeIntent = Intent("com.example.musicdlp.ACTION_LIKE").setPackage(app.packageName)
+        val likePendingIntent = PendingIntent.getBroadcast(
+            app, 2, likeIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val dislikeIntent = Intent("com.example.musicdlp.ACTION_DISLIKE").setPackage(app.packageName)
+        val dislikePendingIntent = PendingIntent.getBroadcast(
+            app, 3, dislikeIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val isPlaying = exoPlayer.isPlaying
+        val playPauseIcon = if (isPlaying) R.drawable.ic_media_pause else R.drawable.ic_media_play
+        val playPauseTitle = if (isPlaying) "Pause" else "Play"
+
+        val notification = NotificationCompat.Builder(app, "playback_channel")
+            .setContentTitle(song.title.ifBlank { "Unknown Title" })
+            .setContentText(song.artist.ifBlank { song.rawTitle ?: "MusicDLP" })
+            .setSmallIcon(R.drawable.ic_media_play)
+            .setContentIntent(openPendingIntent)
+            .setOngoing(isPlaying)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .addAction(R.drawable.ic_delete, "Dislike", dislikePendingIntent)
+            .addAction(playPauseIcon, playPauseTitle, playPausePendingIntent)
+            .addAction(R.drawable.btn_star_big_on, "Like", likePendingIntent)
+            .build()
+
+        val notificationManager = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        try {
+            notificationManager.notify(1001, notification)
+        } catch (e: Exception) {
+            Napier.w("Could not post playback notification: ${e.message}", tag = "DEBUG_METADATA")
+        }
+    }
+
+    private fun clearPlaybackNotification() {
+        val notificationManager = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        try {
+            notificationManager.cancel(1001)
+        } catch (e: Exception) {}
+    }
+
+    fun togglePlayPause() {
+        if (exoPlayer.isPlaying) {
+            exoPlayer.pause()
+        } else {
+            if (exoPlayer.playerError != null || exoPlayer.playbackState == Player.STATE_IDLE || exoPlayer.mediaItemCount == 0) {
+                val current = _currentPlayingSong.value ?: _songsToSwipe.value.firstOrNull()
+                current?.let { playPreview(it, forceRefreshSource = true) }
+            } else {
+                exoPlayer.play()
+            }
+        }
+    }
+
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
 
@@ -177,9 +291,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val bufferedStreamUrls = mutableMapOf<String, String>()
 
-    override fun onCleared() {
-        exoPlayer.release()
-    }
+
 
     fun setSongNamePrompt(song: Song?) {
         _promptForSongName.value = song
@@ -472,9 +584,24 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private val prefs = application.getSharedPreferences("musicdlp_prefs", Context.MODE_PRIVATE)
+
+    private val _hasUserSwiped = MutableStateFlow(prefs.getBoolean("has_user_swiped", false))
+    val hasUserSwiped: StateFlow<Boolean> = _hasUserSwiped
+
+    fun setHasUserSwiped() {
+        if (!_hasUserSwiped.value) {
+            _hasUserSwiped.value = true
+            prefs.edit().putBoolean("has_user_swiped", true).apply()
+        }
+    }
+
     fun dislikeSong(song: Song) {
         viewModelScope.launch {
-            songDao.insertSong(song.copy(isDisliked = true, dislikedAt = System.currentTimeMillis()))
+            val disliked = song.copy(isDisliked = true, dislikedAt = System.currentTimeMillis())
+            songDao.insertSong(disliked)
+            addPlaylistDislikedSong(disliked)
+            removePlaylistNewSong(song)
             advanceList()
         }
     }
@@ -544,10 +671,19 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 )
 
+                val newThumbnail = if (!selectedVersion.thumbnailUrl.isNullOrBlank()) {
+                    selectedVersion.thumbnailUrl
+                } else if (selectedVersion.youtubeUrl.contains("watch?v=")) {
+                    val id = selectedVersion.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+                    "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                } else {
+                    targetSong.thumbnailUrl
+                }
+
                 val updatedSong = targetSong.copy(
                     youtubeUrl = selectedVersion.youtubeUrl,
                     rawTitle = selectedVersion.rawTitle ?: targetSong.rawTitle,
-                    thumbnailUrl = selectedVersion.thumbnailUrl ?: targetSong.thumbnailUrl,
+                    thumbnailUrl = newThumbnail,
                     alternateYoutubeUrls = Json.encodeToString(currentAlternates)
                 )
 
@@ -574,6 +710,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
             if (targetFile.exists()) {
                 _currentlyPlayingId.value = song.id
+                _currentPlayingSong.value = song
+                showPlaybackNotification(song)
                 exoPlayer.stop()
                 exoPlayer.clearMediaItems()
                 exoPlayer.setMediaItem(MediaItem.fromUri(targetFile.absolutePath))
@@ -602,30 +740,33 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun playPreview(song: Song, forceRefreshSource: Boolean = false) {
         previewJob?.cancel()
         previewJob = viewModelScope.launch {
+            var workingSong = song
             if (song.isMetadataCleaned != true) {
                 try {
                     val cleanResult = repository.cleanTitleAndArtist(song.title, song.artist, song.isrc, song.youtubeUrl)
-                    val cleanedSong = song.copy(
+                    workingSong = song.copy(
                         artist = cleanResult.artist,
                         title = cleanResult.title,
                         metadataSource = cleanResult.source,
                         isMetadataCleaned = true
                     )
-                    _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) cleanedSong else it }
+                    _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) workingSong else it }
                 } catch (e: Exception) {}
             }
-            _currentlyPlayingId.value = song.id
+            _currentlyPlayingId.value = workingSong.id
+            _currentPlayingSong.value = workingSong
+            showPlaybackNotification(workingSong)
             _isSongLoading.value = true
             exoPlayer.stop()
             exoPlayer.clearMediaItems()
             try {
                 if (forceRefreshSource) {
-                    bufferedStreamUrls.remove(song.id)
+                    bufferedStreamUrls.remove(workingSong.id)
                 }
-                var streamUrl = bufferedStreamUrls[song.id]
+                var streamUrl = bufferedStreamUrls[workingSong.id]
                 if (streamUrl == null) {
-                    streamUrl = repository.getStreamUrl(song.youtubeUrl)
-                    if (streamUrl != null) bufferedStreamUrls[song.id] = streamUrl
+                    streamUrl = repository.getStreamUrl(workingSong.youtubeUrl)
+                    if (streamUrl != null) bufferedStreamUrls[workingSong.id] = streamUrl
                 }
                 if (!coroutineContext.isActive) return@launch
                 if (streamUrl != null) {
@@ -634,7 +775,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     exoPlayer.prepare()
                     exoPlayer.play()
                 } else {
-                    _errorMessage.value = "Could not fetch stream URL for ${song.title}"
+                    _errorMessage.value = "Could not fetch stream URL for ${workingSong.title}"
                 }
             } catch (e: Exception) {
                 _errorMessage.value = "Playback error: ${e.message}"
@@ -654,6 +795,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
         _currentlyPlayingId.value = null
+        _currentPlayingSong.value = null
+        clearPlaybackNotification()
         bufferedStreamUrls.clear()
         _songsToSwipe.value = emptyList()
         _playlistLikedSongs.value = emptyList()
@@ -808,6 +951,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
+        val filter = IntentFilter().apply {
+            addAction("com.example.musicdlp.ACTION_PLAY_PAUSE")
+            addAction("com.example.musicdlp.ACTION_LIKE")
+            addAction("com.example.musicdlp.ACTION_DISLIKE")
+        }
+        ContextCompat.registerReceiver(application, notificationReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+
         val prefs = application.getSharedPreferences("musicdlp_prefs", Context.MODE_PRIVATE)
         val savedKey = prefs.getString("gemini_api_key", "") ?: ""
         _geminiApiKey.value = savedKey
@@ -815,5 +965,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             try { YoutubeDL.getInstance().updateYoutubeDL(application) } catch (e: Exception) {}
         }
+    }
+
+    override fun onCleared() {
+        try { app.unregisterReceiver(notificationReceiver) } catch (e: Exception) {}
+        clearPlaybackNotification()
+        exoPlayer.release()
     }
 }

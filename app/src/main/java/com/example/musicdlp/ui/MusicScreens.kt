@@ -335,6 +335,7 @@ fun TinderCard(
     
     val isSongLoading by viewModel.isSongLoading.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
+    val hasUserSwiped by viewModel.hasUserSwiped.collectAsState()
     val offsetX = remember { Animatable(0f) }
     val offsetY = remember { Animatable(0f) }
     val coroutineScope = rememberCoroutineScope()
@@ -353,10 +354,12 @@ fun TinderCard(
                             change.consume()
                             coroutineScope.launch {
                                 offsetX.snapTo(offsetX.value + dragAmount.x)
-                                offsetY.snapTo(offsetY.value + dragAmount.y)
+                                val newY = (offsetY.value + dragAmount.y).coerceAtMost(0f)
+                                offsetY.snapTo(newY)
                             }
                         },
                         onDragEnd = {
+                            viewModel.setHasUserSwiped()
                             if (offsetX.value > 400) {
                                 coroutineScope.launch {
                                     offsetX.animateTo(1000f)
@@ -390,45 +393,17 @@ fun TinderCard(
                     .padding(12.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // On-card NOPE / LIKE Action Row
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Button(
-                        onClick = { currentOnSwipedLeft() },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.Red),
-                        enabled = song.isMetadataCleaned == true,
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Icon(Icons.Default.ChevronLeft, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(2.dp))
-                        Text("NOPE", fontWeight = FontWeight.Bold)
-                    }
-
+                if (!hasUserSwiped) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
+                            .padding(bottom = 6.dp)
                             .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape)
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
                     ) {
                         Icon(Icons.Default.Swipe, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Swipe Left/Right", style = MaterialTheme.typography.labelSmall)
-                    }
-
-                    Button(
-                        onClick = { currentOnSwipedRight() },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
-                        enabled = song.isMetadataCleaned == true,
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Text("LIKE", fontWeight = FontWeight.Bold)
-                        Spacer(modifier = Modifier.width(2.dp))
-                        Icon(Icons.Default.ChevronRight, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text("Swipe: Left (NOPE) • Right (LIKE) • Up (SKIP)", style = MaterialTheme.typography.labelSmall)
                     }
                 }
 
@@ -547,6 +522,24 @@ fun TinderCard(
                     Text(
                         text = "NOPE",
                         color = Color.Red,
+                        fontSize = 32.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            if (offsetY.value < -50) {
+                Box(
+                    modifier = Modifier
+                        .padding(16.dp)
+                        .align(Alignment.BottomCenter)
+                        .border(4.dp, Color.Gray, shape = MaterialTheme.shapes.small)
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .alpha((-offsetY.value / 400f).coerceIn(0f, 1f))
+                ) {
+                    Text(
+                        text = "SKIP",
+                        color = Color.Gray,
                         fontSize = 32.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -714,20 +707,44 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
             }
         }
 
+        val playingIndex = filteredLikedList.indexOfFirst { it.id == currentlyPlayingId }
+
         LazyColumn(modifier = Modifier.weight(1f)) {
-            itemsIndexed(filteredLikedList) { i, song ->
+            items(filteredLikedList) { song ->
                 val isDownloading = downloadProgress.containsKey(song.id)
                 val progress = downloadProgress[song.id] ?: 0f
                 val isPlaying = currentlyPlayingId == song.id
 
-                Column {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isPlaying) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clickable {
+                            viewModel.playLikedSong(song) {
+                                songToPrompt = song
+                            }
+                        }
+                ) {
                     ListItem(
+                        colors = ListItemDefaults.colors(
+                            containerColor = Color.Transparent
+                        ),
                         headlineContent = { 
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(song.title)
+                                Text(
+                                    text = song.title,
+                                    fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.Normal
+                                )
                                 if (isPlaying) {
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(16.dp))
+                                    AssistChip(
+                                        onClick = {},
+                                        label = { Text("Playing", style = MaterialTheme.typography.labelSmall) },
+                                        leadingIcon = { Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(12.dp)) }
+                                    )
                                 }
                             }
                         },
@@ -781,36 +798,38 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
                                     }
                                 }
                             }
-                        },
-                        modifier = Modifier.clickable {
-                            viewModel.playLikedSong(song) {
-                                songToPrompt = song
-                            }
                         }
                     )
-                    
-                    if (isPlaying) {
-                        Box(modifier = Modifier.padding(horizontal = 16.dp)) {
-                            PlayerControls(
-                                viewModel = viewModel,
-                                onPrevious = if (i > 0) {
-                                    {
-                                        val prev = filteredLikedList[i - 1]
-                                        viewModel.playLikedSong(prev) { viewModel.playPreview(prev) }
-                                    }
-                                } else null,
-                                onNext = if (i < filteredLikedList.lastIndex) {
-                                    {
-                                        val next = filteredLikedList[i + 1]
-                                        viewModel.playLikedSong(next) { viewModel.playPreview(next) }
-                                    }
-                                } else null,
-                                canGoPrevious = i > 0,
-                                canGoNext = i < filteredLikedList.lastIndex
-                            )
-                        }
-                    }
-                    HorizontalDivider()
+                }
+            }
+        }
+
+        if (playingIndex != -1) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp)
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    PlayerControls(
+                        viewModel = viewModel,
+                        onPrevious = if (playingIndex > 0) {
+                            {
+                                val prev = filteredLikedList[playingIndex - 1]
+                                viewModel.playLikedSong(prev) { viewModel.playPreview(prev) }
+                            }
+                        } else null,
+                        onNext = if (playingIndex < filteredLikedList.lastIndex) {
+                            {
+                                val next = filteredLikedList[playingIndex + 1]
+                                viewModel.playLikedSong(next) { viewModel.playPreview(next) }
+                            }
+                        } else null,
+                        canGoPrevious = playingIndex > 0,
+                        canGoNext = playingIndex < filteredLikedList.lastIndex
+                    )
                 }
             }
         }
@@ -1091,17 +1110,39 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
             }
         }
 
+        val playingIndex = filteredDislikedList.indexOfFirst { it.id == currentlyPlayingId }
+
         LazyColumn(modifier = Modifier.weight(1f)) {
-            itemsIndexed(filteredDislikedList) { i, song ->
+            items(filteredDislikedList) { song ->
                 val isPlaying = currentlyPlayingId == song.id
-                Column {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isPlaying) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clickable {
+                            viewModel.playPreview(song)
+                        }
+                ) {
                     ListItem(
+                        colors = ListItemDefaults.colors(
+                            containerColor = Color.Transparent
+                        ),
                         headlineContent = { 
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(song.title)
+                                Text(
+                                    text = song.title,
+                                    fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.Normal
+                                )
                                 if (isPlaying) {
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(16.dp))
+                                    AssistChip(
+                                        onClick = {},
+                                        label = { Text("Playing", style = MaterialTheme.typography.labelSmall) },
+                                        leadingIcon = { Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(12.dp)) }
+                                    )
                                 }
                             }
                         },
@@ -1125,24 +1166,28 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
                                     Icon(Icons.Default.MusicNote, contentDescription = null)
                                 }
                             }
-                        },
-                        modifier = Modifier.clickable {
-                            viewModel.playPreview(song)
                         }
                     )
-                    
-                    if (isPlaying) {
-                        Box(modifier = Modifier.padding(horizontal = 16.dp)) {
-                            PlayerControls(
-                                viewModel = viewModel,
-                                onPrevious = if (i > 0) { { viewModel.playPreview(filteredDislikedList[i - 1]) } } else null,
-                                onNext = if (i < filteredDislikedList.lastIndex) { { viewModel.playPreview(filteredDislikedList[i + 1]) } } else null,
-                                canGoPrevious = i > 0,
-                                canGoNext = i < filteredDislikedList.lastIndex
-                            )
-                        }
-                    }
-                    HorizontalDivider()
+                }
+            }
+        }
+
+        if (playingIndex != -1) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp)
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    PlayerControls(
+                        viewModel = viewModel,
+                        onPrevious = if (playingIndex > 0) { { viewModel.playPreview(filteredDislikedList[playingIndex - 1]) } } else null,
+                        onNext = if (playingIndex < filteredDislikedList.lastIndex) { { viewModel.playPreview(filteredDislikedList[playingIndex + 1]) } } else null,
+                        canGoPrevious = playingIndex > 0,
+                        canGoNext = playingIndex < filteredDislikedList.lastIndex
+                    )
                 }
             }
         }
