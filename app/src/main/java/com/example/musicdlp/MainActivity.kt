@@ -88,14 +88,15 @@ fun MainScreen() {
         }
     }
 
-    LaunchedEffect(currentPlayingSong) {
-        currentPlayingSong?.let { song ->
-            snackbarHostState.showSnackbar(
-                message = "Now Playing: ${song.artist.ifBlank { "MusicDLP" }} - ${song.title}",
-                duration = SnackbarDuration.Short
-            )
-        }
-    }
+// done with notification now
+//    LaunchedEffect(currentPlayingSong) {
+//        currentPlayingSong?.let { song ->
+//            snackbarHostState.showSnackbar(
+//                message = "Now Playing: ${song.artist.ifBlank { "MusicDLP" }} - ${song.title}",
+//                duration = SnackbarDuration.Short
+//            )
+//        }
+//    }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },

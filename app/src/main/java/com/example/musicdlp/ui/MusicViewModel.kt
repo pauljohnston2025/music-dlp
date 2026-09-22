@@ -29,6 +29,7 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.example.musicdlp.MusicDLPApplication
+import com.example.musicdlp.R
 import com.example.musicdlp.data.AlternateVersion
 import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.YoutubeDLRepository
@@ -222,20 +223,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         val isPlaying = exoPlayer.isPlaying
-        val playPauseIcon = if (isPlaying) R.drawable.ic_media_pause else R.drawable.ic_media_play
+        val playPauseIcon = if (isPlaying) R.drawable.sharp_pause_24 else R.drawable.sharp_play_arrow_24
         val playPauseTitle = if (isPlaying) "Pause" else "Play"
 
         val notification = NotificationCompat.Builder(app, "playback_channel")
             .setContentTitle(song.title.ifBlank { "Unknown Title" })
             .setContentText(song.artist.ifBlank { song.rawTitle ?: "MusicDLP" })
-            .setSmallIcon(R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.sharp_play_arrow_24)
             .setContentIntent(openPendingIntent)
             .setOngoing(isPlaying)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .addAction(R.drawable.ic_delete, "Dislike", dislikePendingIntent)
+            .addAction(R.drawable.sharp_delete_24, "Dislike", dislikePendingIntent)
             .addAction(playPauseIcon, playPauseTitle, playPausePendingIntent)
-            .addAction(R.drawable.btn_star_big_on, "Like", likePendingIntent)
+            .addAction(R.drawable.sharp_play_arrow_24, "Like", likePendingIntent)
             .build()
 
         val notificationManager = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
