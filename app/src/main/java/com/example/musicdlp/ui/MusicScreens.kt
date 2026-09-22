@@ -10,13 +10,19 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ChevronLeft
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
@@ -24,6 +30,9 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Swipe
+import androidx.compose.ui.text.input.ImeAction
+import androidx.media3.common.Player
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -49,9 +58,9 @@ fun SwipingScreen(viewModel: MusicViewModel) {
     val isPlaylistLoading by viewModel.isPlaylistLoading.collectAsState()
     val isBuffering by viewModel.isBuffering.collectAsState()
     val playlistTotal by viewModel.playlistTotal.collectAsState()
-    val playlistIndex by viewModel.playlistIndex.collectAsState()
     val playlistLikedSongs by viewModel.playlistLikedSongs.collectAsState()
     val playlistDislikedSongs by viewModel.playlistDislikedSongs.collectAsState()
+    val playlistNewSongs by viewModel.playlistNewSongs.collectAsState()
 
     val uniqueLiked = remember(playlistLikedSongs) {
         playlistLikedSongs.distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
@@ -59,9 +68,13 @@ fun SwipingScreen(viewModel: MusicViewModel) {
     val uniqueDisliked = remember(playlistDislikedSongs) {
         playlistDislikedSongs.distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
     }
+    val uniqueNew = remember(playlistNewSongs) {
+        playlistNewSongs.distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
+    }
 
     var showLikedPlaylistDialog by remember { mutableStateOf(false) }
     var showDislikedPlaylistDialog by remember { mutableStateOf(false) }
+    var showNewPlaylistDialog by remember { mutableStateOf(false) }
 
     if (showLikedPlaylistDialog) {
         FilteredSongsDialog(
@@ -78,6 +91,15 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             songs = uniqueDisliked,
             viewModel = viewModel,
             onDismiss = { showDislikedPlaylistDialog = false }
+        )
+    }
+
+    if (showNewPlaylistDialog) {
+        FilteredSongsDialog(
+            title = "New / Upcoming Songs in Playlist",
+            songs = uniqueNew,
+            viewModel = viewModel,
+            onDismiss = { showNewPlaylistDialog = false }
         )
     }
 
@@ -137,175 +159,167 @@ fun SwipingScreen(viewModel: MusicViewModel) {
         )
     }
     
-    var playlistUrl by remember { mutableStateOf("") }
-    var searchQuery by remember { mutableStateOf("") }
-    val scrollState = rememberScrollState()
+    var searchOrUrlInput by remember { mutableStateOf("") }
+    val context = LocalContext.current
+    val directoryPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.queryLocalStorageUri(context, uri)
+        }
+    }
+
+    fun performSearchOrLoad() {
+        val query = searchOrUrlInput.trim()
+        if (query.isBlank()) return
+        if (query.startsWith("http://", true) ||
+            query.startsWith("https://", true) ||
+            query.contains("youtube.com", true) ||
+            query.contains("youtu.be", true)
+        ) {
+            viewModel.loadPlaylist(query)
+        } else {
+            viewModel.searchPlaylists(query)
+        }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(scrollState)
-            .padding(16.dp)
+            .padding(12.dp)
     ) {
-        // Error message box if any, scrollable
+        // 1. Static Top Bar (Unified Search / Playlist URL + Folder Scan)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = searchOrUrlInput,
+                onValueChange = { searchOrUrlInput = it },
+                placeholder = { Text("Search or Paste Playlist URL...") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { performSearchOrLoad() }),
+                trailingIcon = {
+                    IconButton(onClick = { performSearchOrLoad() }, enabled = !isPlaylistLoading) {
+                        Icon(Icons.Default.Search, contentDescription = "Search / Load")
+                    }
+                },
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            IconButton(
+                onClick = { directoryPickerLauncher.launch(null) },
+                enabled = !isPlaylistLoading,
+                modifier = Modifier.size(48.dp)
+            ) {
+                Icon(Icons.Default.FolderOpen, contentDescription = "Scan Local Folder", tint = MaterialTheme.colorScheme.primary)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // 2. Error message box if any
         errorMessage?.let { error ->
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
             ) {
                 Text(
                     text = error,
                     color = MaterialTheme.colorScheme.onErrorContainer,
-                    modifier = Modifier.padding(12.dp)
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(8.dp)
                 )
             }
         }
 
-        TextField(
-            value = playlistUrl,
-            onValueChange = { playlistUrl = it },
-            label = { Text("Playlist URL") },
-            modifier = Modifier.fillMaxWidth()
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Button(
-                onClick = { viewModel.loadPlaylist(playlistUrl) },
-                enabled = !isPlaylistLoading,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Load Playlist")
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // Search bar for similar playlists query from youtube
-        TextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            label = { Text("Search songs or playlists on YouTube") },
-            trailingIcon = {
-                IconButton(onClick = { viewModel.searchPlaylists(searchQuery) }) {
-                    Icon(Icons.Default.Search, contentDescription = "Search Playlists")
-                }
-            },
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // Local storage directory picker
-        val context = LocalContext.current
-        val directoryPickerLauncher = rememberLauncherForActivityResult(
-            contract = ActivityResultContracts.OpenDocumentTree()
-        ) { uri ->
-            if (uri != null) {
-                viewModel.queryLocalStorageUri(context, uri)
-            }
-        }
-
-        Button(
-            onClick = { directoryPickerLauncher.launch(null) },
-            enabled = !isPlaylistLoading,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Choose Local Music Folder to Scan")
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        if (playlistTotal > 0) {
-            Text(
-                text = "Counter: $playlistIndex / $playlistTotal",
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.align(Alignment.CenterHorizontally)
-            )
-            Spacer(modifier = Modifier.height(4.dp))
+        // 3. Static Chips Row: Liked, Disliked, New
+        if (playlistTotal > 0 || uniqueLiked.isNotEmpty() || uniqueDisliked.isNotEmpty() || uniqueNew.isNotEmpty()) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(vertical = 4.dp),
-                horizontalArrangement = Arrangement.Center,
+                horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 AssistChip(
                     onClick = { showLikedPlaylistDialog = true },
                     enabled = uniqueLiked.isNotEmpty(),
-                    label = { Text("${uniqueLiked.size}/$playlistTotal already liked") },
+                    label = { Text("${uniqueLiked.size} liked") },
                     leadingIcon = {
                         Icon(
                             imageVector = Icons.Default.Favorite,
                             contentDescription = null,
                             tint = if (uniqueLiked.isNotEmpty()) Color.Red else Color.Gray,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(14.dp)
                         )
                     }
                 )
-                Spacer(modifier = Modifier.width(8.dp))
                 AssistChip(
                     onClick = { showDislikedPlaylistDialog = true },
                     enabled = uniqueDisliked.isNotEmpty(),
-                    label = { Text("${uniqueDisliked.size}/$playlistTotal disliked") },
+                    label = { Text("${uniqueDisliked.size} disliked") },
                     leadingIcon = {
                         Icon(
                             imageVector = Icons.Default.Close,
                             contentDescription = null,
                             tint = Color.Gray,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                )
+                AssistChip(
+                    onClick = { showNewPlaylistDialog = true },
+                    enabled = uniqueNew.isNotEmpty(),
+                    label = { Text("${uniqueNew.size} new") },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Default.MusicNote,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(14.dp)
                         )
                     }
                 )
             }
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(4.dp))
         }
 
+        // 4. Center Area with TinderCard
         Box(
-            modifier = Modifier.fillMaxWidth().height(650.dp),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
             contentAlignment = Alignment.Center
         ) {
-            if (isPlaylistLoading || (isBuffering && songs.isEmpty())) {
+            if (songs.isEmpty() && (isPlaylistLoading || isBuffering)) {
                 CircularProgressIndicator()
             } else if (songs.isNotEmpty()) {
                 val currentSong = songs.first()
                 key(currentSong.id) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        // NOPE and LIKE buttons above the card
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                            horizontalArrangement = Arrangement.SpaceEvenly,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Button(
-                                onClick = { viewModel.dislikeSong(currentSong) },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.Red),
-                                enabled = currentSong.isMetadataCleaned == true
-                            ) {
-                                Text("NOPE", fontWeight = FontWeight.Bold, color = Color.White)
-                            }
-                            Button(
-                                onClick = { viewModel.likeSong(currentSong) },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
-                                enabled = currentSong.isMetadataCleaned == true
-                            ) {
-                                Text("LIKE", fontWeight = FontWeight.Bold, color = Color.White)
-                            }
-                        }
-
-                        TinderCard(
-                            song = currentSong,
-                            viewModel = viewModel,
-                            onSwipedLeft = { viewModel.dislikeSong(currentSong) },
-                            onSwipedRight = { viewModel.likeSong(currentSong) }
-                        )
-                    }
+                    TinderCard(
+                        song = currentSong,
+                        viewModel = viewModel,
+                        onSwipedLeft = { viewModel.dislikeSong(currentSong) },
+                        onSwipedRight = { viewModel.likeSong(currentSong) }
+                    )
                 }
             } else {
                 Text("No more songs to swipe!")
             }
         }
+
+        // 5. Player Controls Below the Swipable Card
+        val currentSong = songs.firstOrNull()
+        val canGoBack by viewModel.canGoBack.collectAsState()
+        PlayerControls(
+            viewModel = viewModel,
+            onPrevious = { viewModel.goBackToPreviousSong() },
+            onNext = { currentSong?.let { viewModel.skipSong(it) } },
+            canGoPrevious = canGoBack,
+            canGoNext = currentSong != null
+        )
     }
 }
 
@@ -327,8 +341,7 @@ fun TinderCard(
 
     Card(
         modifier = Modifier
-            .fillMaxWidth()
-            .height(580.dp)
+            .fillMaxSize()
             .offset { IntOffset(offsetX.value.roundToInt(), offsetY.value.roundToInt()) }
             .graphicsLayer {
                 rotationZ = offsetX.value / 20
@@ -372,9 +385,53 @@ fun TinderCard(
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             Column(
-                modifier = Modifier.fillMaxSize().padding(16.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(12.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                // On-card NOPE / LIKE Action Row
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = { currentOnSwipedLeft() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Red),
+                        enabled = song.isMetadataCleaned == true,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Icon(Icons.Default.ChevronLeft, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(2.dp))
+                        Text("NOPE", fontWeight = FontWeight.Bold)
+                    }
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape)
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Icon(Icons.Default.Swipe, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Swipe Left/Right", style = MaterialTheme.typography.labelSmall)
+                    }
+
+                    Button(
+                        onClick = { currentOnSwipedRight() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
+                        enabled = song.isMetadataCleaned == true,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text("LIKE", fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.width(2.dp))
+                        Icon(Icons.Default.ChevronRight, contentDescription = null, modifier = Modifier.size(18.dp))
+                    }
+                }
+
                 val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
                     val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
                     "https://i.ytimg.com/vi/$id/hqdefault.jpg"
@@ -386,45 +443,52 @@ fun TinderCard(
                     AsyncImage(
                         model = effectiveThumbnail,
                         contentDescription = null,
-                        modifier = Modifier.weight(0.6f).fillMaxWidth()
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
                     )
                 } else {
                     Box(
-                        modifier = Modifier.weight(0.6f).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant),
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.surfaceVariant),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(64.dp))
                     }
                 }
+
                 Spacer(modifier = Modifier.height(4.dp))
+
                 Text(
                     text = "YouTube: ${song.rawTitle ?: "Unknown"}",
                     style = MaterialTheme.typography.bodySmall,
-                    maxLines = 2,
-                    modifier = Modifier.alpha(0.7f).padding(bottom = 2.dp)
+                    maxLines = 1,
+                    modifier = Modifier.alpha(0.7f)
                 )
                 if (!song.metadataSource.isNullOrBlank()) {
                     Text(
                         text = "Cleaned by: ${song.metadataSource}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(bottom = 4.dp)
+                        fontWeight = FontWeight.Medium
                     )
                 }
-                
+
+                Spacer(modifier = Modifier.height(4.dp))
+
                 var editableTitle by remember(song.id) { mutableStateOf(song.title) }
                 var editableArtist by remember(song.id) { mutableStateOf(song.artist) }
 
-                // Sync UI fields if background cleaning completes after the card is already shown
                 LaunchedEffect(song.title, song.artist, song.isMetadataCleaned) {
                     editableTitle = song.title
                     editableArtist = song.artist
                 }
 
-                TextField(
+                OutlinedTextField(
                     value = editableTitle,
-                    onValueChange = { 
+                    onValueChange = {
                         editableTitle = it
                         viewModel.updateSongNameAndArtist(song, it, editableArtist)
                     },
@@ -432,9 +496,9 @@ fun TinderCard(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                TextField(
+                OutlinedTextField(
                     value = editableArtist,
-                    onValueChange = { 
+                    onValueChange = {
                         editableArtist = it
                         viewModel.updateSongNameAndArtist(song, editableTitle, it)
                     },
@@ -442,8 +506,6 @@ fun TinderCard(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                
-                PlayerControls(viewModel)
 
                 if (errorMessage?.contains("Playback error") == true) {
                     TextButton(onClick = { viewModel.playPreview(song) }) {
@@ -452,7 +514,7 @@ fun TinderCard(
                 }
             }
 
-            // Swiping Hints
+            // Animated Swiping Stamps
             if (offsetX.value > 50) {
                 Box(
                     modifier = Modifier
@@ -491,24 +553,6 @@ fun TinderCard(
                 }
             }
 
-            if (offsetY.value < -50) {
-                Box(
-                    modifier = Modifier
-                        .padding(16.dp)
-                        .align(Alignment.Center)
-                        .border(4.dp, Color.Gray, shape = MaterialTheme.shapes.small)
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                        .alpha((-offsetY.value / 400f).coerceIn(0f, 1f))
-                ) {
-                    Text(
-                        text = "SKIP",
-                        color = Color.Gray,
-                        fontSize = 32.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-            
             if (isSongLoading) {
                 Box(
                     modifier = Modifier
@@ -524,11 +568,14 @@ fun TinderCard(
 }
 
 @Composable
-fun PlayerControls(viewModel: MusicViewModel) {
+fun PlayerControls(
+    viewModel: MusicViewModel,
+    onPrevious: (() -> Unit)? = null,
+    onNext: (() -> Unit)? = null,
+    canGoPrevious: Boolean = true,
+    canGoNext: Boolean = true
+) {
     val player = viewModel.exoPlayer
-    val canGoBack by viewModel.canGoBack.collectAsState()
-    val songs by viewModel.songsToSwipe.collectAsState()
-    val currentSong = songs.firstOrNull()
     var isPlaying by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf(0f) }
 
@@ -557,8 +604,8 @@ fun PlayerControls(viewModel: MusicViewModel) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(
-                onClick = { viewModel.goBackToPreviousSong() },
-                enabled = canGoBack,
+                onClick = { onPrevious?.invoke() },
+                enabled = onPrevious != null && canGoPrevious,
                 modifier = Modifier.size(48.dp)
             ) {
                 Icon(
@@ -568,8 +615,21 @@ fun PlayerControls(viewModel: MusicViewModel) {
                 )
             }
 
+            val songs by viewModel.songsToSwipe.collectAsState()
+            val currentSong = songs.firstOrNull()
+
             IconButton(
-                onClick = { if (isPlaying) player.pause() else player.play() },
+                onClick = {
+                    if (isPlaying) {
+                        player.pause()
+                    } else {
+                        if (player.playerError != null || player.playbackState == Player.STATE_IDLE || player.mediaItemCount == 0) {
+                            currentSong?.let { viewModel.playPreview(it, forceRefreshSource = true) }
+                        } else {
+                            player.play()
+                        }
+                    }
+                },
                 modifier = Modifier.size(48.dp)
             ) {
                 Icon(
@@ -581,8 +641,8 @@ fun PlayerControls(viewModel: MusicViewModel) {
             }
 
             IconButton(
-                onClick = { currentSong?.let { viewModel.skipSong(it) } },
-                enabled = currentSong != null,
+                onClick = { onNext?.invoke() },
+                enabled = onNext != null && canGoNext,
                 modifier = Modifier.size(48.dp)
             ) {
                 Icon(
@@ -648,10 +708,14 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
             modifier = Modifier.fillMaxWidth()
         )
         
-        LazyColumn(modifier = Modifier.weight(1f)) {
-            items(likedSongs.filter { 
+        val filteredLikedList = remember(likedSongs, searchQuery) {
+            likedSongs.filter { 
                 it.title.contains(searchQuery, ignoreCase = true) || it.artist.contains(searchQuery, ignoreCase = true)
-            }) { song ->
+            }
+        }
+
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            itemsIndexed(filteredLikedList) { i, song ->
                 val isDownloading = downloadProgress.containsKey(song.id)
                 val progress = downloadProgress[song.id] ?: 0f
                 val isPlaying = currentlyPlayingId == song.id
@@ -727,7 +791,23 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
                     
                     if (isPlaying) {
                         Box(modifier = Modifier.padding(horizontal = 16.dp)) {
-                            PlayerControls(viewModel)
+                            PlayerControls(
+                                viewModel = viewModel,
+                                onPrevious = if (i > 0) {
+                                    {
+                                        val prev = filteredLikedList[i - 1]
+                                        viewModel.playLikedSong(prev) { viewModel.playPreview(prev) }
+                                    }
+                                } else null,
+                                onNext = if (i < filteredLikedList.lastIndex) {
+                                    {
+                                        val next = filteredLikedList[i + 1]
+                                        viewModel.playLikedSong(next) { viewModel.playPreview(next) }
+                                    }
+                                } else null,
+                                canGoPrevious = i > 0,
+                                canGoNext = i < filteredLikedList.lastIndex
+                            )
                         }
                     }
                     HorizontalDivider()
@@ -744,6 +824,7 @@ fun AlternateVersionsDialog(
     onDismiss: () -> Unit
 ) {
     val alternates = remember(song) { song.getAlternateVersionsList() }
+    val currentlyPlayingId by viewModel.currentlyPlayingId.collectAsState()
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -757,13 +838,13 @@ fun AlternateVersionsDialog(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Select an alternate version to replace your downloaded copy:",
+                    text = "Select an alternate version to preview or replace your downloaded copy:",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(12.dp))
 
-                LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
+                LazyColumn(modifier = Modifier.heightIn(max = 350.dp)) {
                     item {
                         Card(
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -776,6 +857,7 @@ fun AlternateVersionsDialog(
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onPrimaryContainer
                                 )
+                                Spacer(modifier = Modifier.height(4.dp))
                                 Text(
                                     text = song.rawTitle ?: song.title,
                                     style = MaterialTheme.typography.bodyMedium,
@@ -792,30 +874,82 @@ fun AlternateVersionsDialog(
                     }
 
                     items(alternates) { version ->
+                        val previewId = "preview_${version.youtubeUrl.hashCode()}"
+                        val isPreviewPlaying = currentlyPlayingId == previewId
+                        val effectiveThumbnail = if (!version.thumbnailUrl.isNullOrBlank()) {
+                            version.thumbnailUrl
+                        } else if (version.youtubeUrl.contains("watch?v=")) {
+                            val id = version.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+                            "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                        } else {
+                            ""
+                        }
+
                         Card(
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                         ) {
                             Column(modifier = Modifier.padding(12.dp)) {
-                                Text(
-                                    text = version.rawTitle ?: "Alternate Version",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    maxLines = 2
-                                )
-                                Text(
-                                    text = version.youtubeUrl,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1
-                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (effectiveThumbnail.isNotBlank()) {
+                                        AsyncImage(
+                                            model = effectiveThumbnail,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(56.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                    }
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = version.rawTitle ?: "Alternate Version",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 2
+                                        )
+                                        Text(
+                                            text = version.youtubeUrl,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+
                                 Spacer(modifier = Modifier.height(8.dp))
-                                Button(
-                                    onClick = {
-                                        viewModel.replaceLikedSongWithAlternateVersion(song, version)
-                                        onDismiss()
-                                    },
-                                    modifier = Modifier.align(Alignment.End)
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text("Replace Download")
+                                    OutlinedButton(
+                                        onClick = { viewModel.playPreviewByUrl(version.youtubeUrl, version.rawTitle ?: song.title) }
+                                    ) {
+                                        Icon(
+                                            imageVector = if (isPreviewPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(if (isPreviewPlaying) "Pause" else "Preview")
+                                    }
+
+                                    Button(
+                                        onClick = {
+                                            viewModel.replaceLikedSongWithAlternateVersion(song, version)
+                                            onDismiss()
+                                        }
+                                    ) {
+                                        Text("Replace Download")
+                                    }
+                                }
+
+                                if (isPreviewPlaying) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    PlayerControls(
+                                        viewModel = viewModel,
+                                        canGoPrevious = false,
+                                        canGoNext = false
+                                    )
                                 }
                             }
                         }
@@ -895,8 +1029,34 @@ fun SettingsScreen(viewModel: MusicViewModel) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        var showClearDbDialog by remember { mutableStateOf(false) }
+
+        if (showClearDbDialog) {
+            AlertDialog(
+                onDismissRequest = { showClearDbDialog = false },
+                title = { Text("Clear Library Database?") },
+                text = { Text("Are you sure you want to clear the library database? This will delete all song records from the app, but will leave your downloaded music files intact on disk.") },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showClearDbDialog = false
+                            viewModel.clearDatabase()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("Clear Database")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showClearDbDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
         Button(
-            onClick = { viewModel.clearDatabase() },
+            onClick = { showClearDbDialog = true },
             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -925,10 +1085,14 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
         )
         Spacer(modifier = Modifier.height(8.dp))
 
-        LazyColumn(modifier = Modifier.weight(1f)) {
-            items(dislikedSongs.filter { 
+        val filteredDislikedList = remember(dislikedSongs, searchQuery) {
+            dislikedSongs.filter { 
                 it.title.contains(searchQuery, ignoreCase = true) || it.artist.contains(searchQuery, ignoreCase = true)
-            }) { song ->
+            }
+        }
+
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            itemsIndexed(filteredDislikedList) { i, song ->
                 val isPlaying = currentlyPlayingId == song.id
                 Column {
                     ListItem(
@@ -969,7 +1133,13 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
                     
                     if (isPlaying) {
                         Box(modifier = Modifier.padding(horizontal = 16.dp)) {
-                            PlayerControls(viewModel)
+                            PlayerControls(
+                                viewModel = viewModel,
+                                onPrevious = if (i > 0) { { viewModel.playPreview(filteredDislikedList[i - 1]) } } else null,
+                                onNext = if (i < filteredDislikedList.lastIndex) { { viewModel.playPreview(filteredDislikedList[i + 1]) } } else null,
+                                canGoPrevious = i > 0,
+                                canGoNext = i < filteredDislikedList.lastIndex
+                            )
                         }
                     }
                     HorizontalDivider()
@@ -1010,7 +1180,7 @@ fun FilteredSongsDialog(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 LazyColumn(modifier = Modifier.heightIn(max = 350.dp)) {
-                    items(songs) { song ->
+                    itemsIndexed(songs) { i, song ->
                         val isPlaying = currentlyPlayingId == song.id
                         val alternates = song.getAlternateVersionsList()
 
@@ -1074,7 +1244,23 @@ fun FilteredSongsDialog(
 
                             if (isPlaying) {
                                 Box(modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
-                                    PlayerControls(viewModel)
+                                    PlayerControls(
+                                        viewModel = viewModel,
+                                        onPrevious = if (i > 0) {
+                                            {
+                                                val prev = songs[i - 1]
+                                                viewModel.playLikedSong(prev) { viewModel.playPreview(prev) }
+                                            }
+                                        } else null,
+                                        onNext = if (i < songs.lastIndex) {
+                                            {
+                                                val next = songs[i + 1]
+                                                viewModel.playLikedSong(next) { viewModel.playPreview(next) }
+                                            }
+                                        } else null,
+                                        canGoPrevious = i > 0,
+                                        canGoNext = i < songs.lastIndex
+                                    )
                                 }
                             }
                         }

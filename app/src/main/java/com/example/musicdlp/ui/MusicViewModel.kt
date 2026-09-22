@@ -1,6 +1,7 @@
 package com.example.musicdlp.ui
 
 import android.app.Application
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -26,9 +27,11 @@ import com.example.musicdlp.data.YoutubeDLRepository
 import kotlinx.serialization.json.Json
 import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -82,6 +85,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _playlistDislikedSongs = MutableStateFlow<List<Song>>(emptyList())
     val playlistDislikedSongs: StateFlow<List<Song>> = _playlistDislikedSongs
 
+    private val _playlistNewSongs = MutableStateFlow<List<Song>>(emptyList())
+    val playlistNewSongs: StateFlow<List<Song>> = _playlistNewSongs
+
     private fun addPlaylistLikedSong(song: Song) {
         val current = _playlistLikedSongs.value.toMutableList()
         current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
@@ -100,6 +106,19 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val current = _playlistDislikedSongs.value.toMutableList()
         current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
         _playlistDislikedSongs.value = current
+    }
+
+    private fun addPlaylistNewSong(song: Song) {
+        val current = _playlistNewSongs.value.toMutableList()
+        current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
+        current.add(song)
+        _playlistNewSongs.value = current
+    }
+
+    private fun removePlaylistNewSong(song: Song) {
+        val current = _playlistNewSongs.value.toMutableList()
+        current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
+        _playlistNewSongs.value = current
     }
 
     private val skippedHistory = mutableListOf<Song>()
@@ -291,6 +310,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 // 3. Add to UI immediately so user can see it
+                addPlaylistNewSong(workingSong)
                 _songsToSwipe.value = _songsToSwipe.value + workingSong
                 
                 // 4. Pre-fetch stream URL in background
@@ -315,9 +335,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun skipSong(song: Song) {
         viewModelScope.launch {
-            val disliked = song.copy(isDisliked = true, dislikedAt = System.currentTimeMillis())
-            songDao.insertSong(disliked)
-            addPlaylistDislikedSong(disliked)
             skippedHistory.add(song)
             _canGoBack.value = skippedHistory.isNotEmpty()
             advanceList()
@@ -391,6 +408,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             addPlaylistLikedSong(likedToRecord)
+            removePlaylistNewSong(song)
             advanceList()
         }
     }
@@ -567,8 +585,23 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun playPreview(song: Song) {
-        viewModelScope.launch {
+    private var previewJob: Job? = null
+
+    fun playPreviewByUrl(youtubeUrl: String, title: String = "Preview") {
+        val tempSong = Song(
+            id = "preview_${youtubeUrl.hashCode()}",
+            title = title,
+            artist = "",
+            thumbnailUrl = "",
+            youtubeUrl = youtubeUrl,
+            isMetadataCleaned = true
+        )
+        playPreview(tempSong)
+    }
+
+    fun playPreview(song: Song, forceRefreshSource: Boolean = false) {
+        previewJob?.cancel()
+        previewJob = viewModelScope.launch {
             if (song.isMetadataCleaned != true) {
                 try {
                     val cleanResult = repository.cleanTitleAndArtist(song.title, song.artist, song.isrc, song.youtubeUrl)
@@ -586,12 +619,17 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             exoPlayer.stop()
             exoPlayer.clearMediaItems()
             try {
+                if (forceRefreshSource) {
+                    bufferedStreamUrls.remove(song.id)
+                }
                 var streamUrl = bufferedStreamUrls[song.id]
                 if (streamUrl == null) {
                     streamUrl = repository.getStreamUrl(song.youtubeUrl)
                     if (streamUrl != null) bufferedStreamUrls[song.id] = streamUrl
                 }
+                if (!coroutineContext.isActive) return@launch
                 if (streamUrl != null) {
+                    _errorMessage.value = null
                     exoPlayer.setMediaItem(MediaItem.fromUri(streamUrl))
                     exoPlayer.prepare()
                     exoPlayer.play()
@@ -611,27 +649,42 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (currentSong != null && _currentlyPlayingId.value != currentSong.id) playPreview(currentSong)
     }
 
+    private fun resetPlaybackAndQueue() {
+        previewJob?.cancel()
+        exoPlayer.stop()
+        exoPlayer.clearMediaItems()
+        _currentlyPlayingId.value = null
+        bufferedStreamUrls.clear()
+        _songsToSwipe.value = emptyList()
+        _playlistLikedSongs.value = emptyList()
+        _playlistDislikedSongs.value = emptyList()
+        _playlistNewSongs.value = emptyList()
+    }
+
     fun searchPlaylists(query: String) {
         if (query.isBlank()) return
         viewModelScope.launch {
             _isPlaylistLoading.value = true
-            bufferedStreamUrls.clear()
-            _songsToSwipe.value = emptyList()
-            _playlistLikedSongs.value = emptyList()
-            _playlistDislikedSongs.value = emptyList()
+            resetPlaybackAndQueue()
             queueMutex.withLock { pendingBufferQueue.clear() }
             try {
                 val results = repository.searchSongsOrPlaylists(query)
                 _playlistTotal.value = results.size
                 processedCount = 0
-                _isPlaylistLoading.value = false // stop spinner early
-                for (url in results) {
-                    launch(Dispatchers.IO) {
-                        try {
-                            val songs = repository.getPlaylistSongs(url)
-                            queueMutex.withLock { pendingBufferQueue.addAll(songs) }
-                            processQueue()
-                        } catch (e: Exception) {}
+                if (results.isEmpty()) {
+                    _isPlaylistLoading.value = false
+                } else {
+                    for (url in results) {
+                        launch(Dispatchers.IO) {
+                            try {
+                                val songs = repository.getPlaylistSongs(url)
+                                queueMutex.withLock { pendingBufferQueue.addAll(songs) }
+                                processQueue()
+                            } catch (e: Exception) {
+                            } finally {
+                                _isPlaylistLoading.value = false
+                            }
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -645,49 +698,95 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (url.isBlank()) return
         viewModelScope.launch {
             _isPlaylistLoading.value = true
-            bufferedStreamUrls.clear()
-            _songsToSwipe.value = emptyList()
-            _playlistLikedSongs.value = emptyList()
-            _playlistDislikedSongs.value = emptyList()
+            resetPlaybackAndQueue()
             queueMutex.withLock { pendingBufferQueue.clear() }
             try {
                 val playlistSongs = repository.getPlaylistSongs(url)
                 _playlistTotal.value = playlistSongs.size
                 processedCount = 0
                 queueMutex.withLock { pendingBufferQueue.addAll(playlistSongs) }
-                _isPlaylistLoading.value = false
                 processQueue()
             } catch (e: Exception) {
                 _errorMessage.value = "Failed to load playlist: ${e.message}"
+            } finally {
                 _isPlaylistLoading.value = false
             }
         }
     }
 
     fun queryLocalStorageUri(context: Context, uri: Uri) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _isPlaylistLoading.value = true
-            bufferedStreamUrls.clear()
-            _songsToSwipe.value = emptyList()
-            _playlistLikedSongs.value = emptyList()
-            _playlistDislikedSongs.value = emptyList()
+            resetPlaybackAndQueue()
             queueMutex.withLock { pendingBufferQueue.clear() }
+
             try {
-                try { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}
-                val docFile = DocumentFile.fromTreeUri(context, uri) ?: return@launch
-                val audioFiles = docFile.listFiles().filter { it.isFile && (it.name?.endsWith(".mp3", true) == true) }
-                val localSongs = audioFiles.map { file ->
-                    val cachedFile = File(app.cacheDir, file.name ?: "local.mp3")
-                    context.contentResolver.openInputStream(file.uri)?.use { input -> cachedFile.outputStream().use { input.copyTo(it) } }
-                    Song(id = "local_${file.uri.toString().hashCode()}", title = file.name ?: "Unknown", artist = "Unknown", thumbnailUrl = "", youtubeUrl = cachedFile.absolutePath)
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (e: Exception) {}
+
+                val rootDoc = DocumentFile.fromTreeUri(context, uri)
+                if (rootDoc == null || !rootDoc.exists()) {
+                    _errorMessage.value = "Could not access selected folder"
+                    _isPlaylistLoading.value = false
+                    return@launch
                 }
+
+                val supportedExtensions = setOf("mp3", "m4a", "flac", "wav", "ogg", "aac", "opus", "webm")
+
+                fun findAudioFiles(dir: DocumentFile): List<DocumentFile> {
+                    val result = mutableListOf<DocumentFile>()
+                    val files = dir.listFiles()
+                    for (file in files) {
+                        if (file.isDirectory) {
+                            result.addAll(findAudioFiles(file))
+                        } else if (file.isFile) {
+                            val name = file.name ?: ""
+                            val ext = name.substringAfterLast(".", "").lowercase()
+                            if (supportedExtensions.contains(ext)) {
+                                result.add(file)
+                            }
+                        }
+                    }
+                    return result
+                }
+
+                val audioFiles = findAudioFiles(rootDoc)
+                Napier.d("Local folder scan found ${audioFiles.size} audio files", tag = "DEBUG_METADATA")
+
+                if (audioFiles.isEmpty()) {
+                    _errorMessage.value = "No audio files (.mp3, .m4a, .flac, etc.) found in selected folder."
+                    _isPlaylistLoading.value = false
+                    return@launch
+                }
+
+                val localSongs = audioFiles.map { file ->
+                    val fileName = file.name ?: "Unknown"
+                    val nameWithoutExt = fileName.substringBeforeLast(".")
+                    val uriString = file.uri.toString()
+
+                    Song(
+                        id = "local_${uriString.hashCode()}",
+                        title = nameWithoutExt,
+                        artist = "Local File",
+                        thumbnailUrl = "",
+                        youtubeUrl = uriString,
+                        rawTitle = fileName,
+                        isMetadataCleaned = true
+                    )
+                }
+
                 _playlistTotal.value = localSongs.size
                 processedCount = 0
                 queueMutex.withLock { pendingBufferQueue.addAll(localSongs) }
                 _isPlaylistLoading.value = false
                 processQueue()
             } catch (e: Exception) {
-                _errorMessage.value = "Failed to read local folder: ${e.message}"
+                e.printStackTrace()
+                _errorMessage.value = "Failed to scan local folder: ${e.message}"
                 _isPlaylistLoading.value = false
             }
         }

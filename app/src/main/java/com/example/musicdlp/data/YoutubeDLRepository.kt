@@ -551,6 +551,9 @@ class YoutubeDLRepository(private val context: Context) {
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     suspend fun getStreamUrl(youtubeUrl: String): String? = withContext(Dispatchers.IO) {
+        if (youtubeUrl.startsWith("content://") || youtubeUrl.startsWith("file://") || youtubeUrl.startsWith("/")) {
+            return@withContext youtubeUrl
+        }
         val request = YoutubeDLRequest(youtubeUrl)
         request.addOption("-f", "bestaudio")
         request.addOption("-g")
