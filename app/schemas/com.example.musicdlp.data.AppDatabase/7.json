@@ -1,0 +1,102 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 7,
+    "identityHash": "064aec1ceaca855fc7056179f3341556",
+    "entities": [
+      {
+        "tableName": "songs",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `thumbnailUrl` TEXT NOT NULL, `youtubeUrl` TEXT NOT NULL, `isLiked` INTEGER NOT NULL, `isDisliked` INTEGER NOT NULL, `isrc` TEXT, `rawTitle` TEXT, `isMetadataCleaned` INTEGER, `likedAt` INTEGER, `dislikedAt` INTEGER, `metadataSource` TEXT, `alternateYoutubeUrls` TEXT, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "artist",
+            "columnName": "artist",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thumbnailUrl",
+            "columnName": "thumbnailUrl",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "youtubeUrl",
+            "columnName": "youtubeUrl",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isLiked",
+            "columnName": "isLiked",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isDisliked",
+            "columnName": "isDisliked",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isrc",
+            "columnName": "isrc",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "rawTitle",
+            "columnName": "rawTitle",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "isMetadataCleaned",
+            "columnName": "isMetadataCleaned",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "likedAt",
+            "columnName": "likedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "dislikedAt",
+            "columnName": "dislikedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "metadataSource",
+            "columnName": "metadataSource",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "alternateYoutubeUrls",
+            "columnName": "alternateYoutubeUrls",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '064aec1ceaca855fc7056179f3341556')"
+    ]
+  }
+}

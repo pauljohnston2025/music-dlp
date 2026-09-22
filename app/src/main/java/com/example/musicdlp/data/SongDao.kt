@@ -17,6 +17,12 @@ interface SongDao {
     @Query("SELECT * FROM songs")
     suspend fun getAllSongs(): List<Song>
 
+    @Query("SELECT * FROM songs WHERE id = :id LIMIT 1")
+    suspend fun getSongById(id: String): Song?
+
+    @Query("DELETE FROM songs WHERE id = :id")
+    suspend fun deleteSongById(id: String)
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSong(song: Song)
 

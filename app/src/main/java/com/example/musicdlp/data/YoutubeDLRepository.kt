@@ -43,6 +43,19 @@ data class GeminiModelInfo(
     val supportedGenerationMethods: List<String>? = null
 )
 
+data class CleanMetadataResult(
+    val artist: String,
+    val title: String,
+    val source: String
+)
+
+data class GeminiGuessResult(
+    val artist: String,
+    val title: String,
+    val modelUsed: String,
+    val attemptsCount: Int
+)
+
 @Serializable
 data class YtDlpPlaylist(
     val entries: List<YtDlpEntry>? = null
@@ -67,6 +80,54 @@ class YoutubeDLRepository(private val context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
     var geminiApiKey: String = ""
 
+    private val prefs = context.getSharedPreferences("musicdlp_prefs", Context.MODE_PRIVATE)
+
+    var lastWorkingModel: String?
+        get() = prefs.getString("last_working_gemini_model", null)
+        private set(value) {
+            if (value == null) {
+                prefs.edit().remove("last_working_gemini_model").apply()
+            } else {
+                prefs.edit().putString("last_working_gemini_model", value).apply()
+            }
+        }
+
+    private val quotaExhaustedModels = mutableMapOf<String, Long>()
+    private val invalidModels = mutableSetOf<String>()
+
+    private var cachedModelInfos: List<GeminiModelInfo>? = null
+    private var lastModelFetchTime: Long = 0L
+
+    private val PREFERRED_MODELS_ORDER = listOf(
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+        "gemini-2.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-pro-latest",
+        "gemini-2.5-pro",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro"
+    )
+
+    private val UNSUPPORTED_KEYWORDS = listOf(
+        "-tts", "-image", "embedding", "veo", "lyria", "aqa",
+        "computer-use", "robotics", "transcribe", "live", "customtools",
+        "nano-banana", "antigravity", "deep-research"
+    )
+
+    fun clearModelCache() {
+        quotaExhaustedModels.clear()
+        invalidModels.clear()
+        cachedModelInfos = null
+        lastModelFetchTime = 0L
+    }
+
     private val client = HttpClient(OkHttp) {
         install(ContentNegotiation) {
             json(Json {
@@ -89,30 +150,98 @@ class YoutubeDLRepository(private val context: Context) {
         }
     }
 
-    private suspend fun guessWithGemini(rawTitle: String): Pair<String, String>? {
-        if (geminiApiKey.isBlank()) return null
-        
-        // List models first to debug what's available for this API key
-        val availableModels = listGeminiModels()
-        
-        // Priority order for models we want to use
-        val preferredModels = listOf("gemini-1.5-flash", "gemini-pro", "gemini-1.5-pro", "gemini-1.0-pro")
-        
-        val modelsToTry = if (availableModels.isNotEmpty()) {
-            // Filter only models that support generation and are in our preferred list or have gemini in name
-            availableModels.map { it.removePrefix("models/") }
-                .filter { name -> 
-                    preferredModels.contains(name) || name.contains("gemini", ignoreCase = true)
+    suspend fun getAvailableCandidateModels(): List<String> {
+        val now = System.currentTimeMillis()
+        quotaExhaustedModels.entries.removeIf { it.value < now }
+
+        var modelInfos = cachedModelInfos
+        if (modelInfos == null || (now - lastModelFetchTime) > 10 * 60 * 1000L) {
+            if (geminiApiKey.isNotBlank()) {
+                try {
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models?key=$geminiApiKey"
+                    val response: GeminiModelList = client.get(url).body()
+                    modelInfos = response.models ?: emptyList()
+                    cachedModelInfos = modelInfos
+                    lastModelFetchTime = now
+                } catch (e: Exception) {
+                    Napier.e("Failed to list Gemini models: ${e.message}", tag = "DEBUG_METADATA")
                 }
-                .sortedBy { name ->
-                    val index = preferredModels.indexOf(name)
-                    if (index != -1) index else Int.MAX_VALUE
-                }
-        } else {
-            preferredModels
+            }
         }
 
-        for (modelName in modelsToTry) {
+        val rawNames = modelInfos?.mapNotNull { info ->
+            val name = info.name?.removePrefix("models/") ?: return@mapNotNull null
+            val methods = info.supportedGenerationMethods
+            if (methods != null && !methods.contains("generateContent")) {
+                return@mapNotNull null
+            }
+            name
+        } ?: emptyList()
+
+        val candidateBase = if (rawNames.isNotEmpty()) rawNames else PREFERRED_MODELS_ORDER
+
+        val filtered = candidateBase.filter { name ->
+            !invalidModels.contains(name) &&
+            !quotaExhaustedModels.containsKey(name) &&
+            UNSUPPORTED_KEYWORDS.none { kw -> name.contains(kw, ignoreCase = true) } &&
+            (name.contains("gemini", ignoreCase = true) || name.contains("gemma", ignoreCase = true))
+        }.toMutableList()
+
+        val lastWorked = lastWorkingModel
+        if (!lastWorked.isNullOrBlank() &&
+            !invalidModels.contains(lastWorked) &&
+            !quotaExhaustedModels.containsKey(lastWorked) &&
+            !filtered.contains(lastWorked)
+        ) {
+            filtered.add(0, lastWorked)
+        }
+
+        return filtered.sortedWith(Comparator { m1, m2 ->
+            if (m1 == lastWorked) return@Comparator -1
+            if (m2 == lastWorked) return@Comparator 1
+
+            val idx1 = PREFERRED_MODELS_ORDER.indexOf(m1).let { if (it == -1) Int.MAX_VALUE else it }
+            val idx2 = PREFERRED_MODELS_ORDER.indexOf(m2).let { if (it == -1) Int.MAX_VALUE else it }
+
+            if (idx1 != idx2) idx1.compareTo(idx2)
+            else m1.compareTo(m2)
+        })
+    }
+
+    private fun isQuotaExhaustedError(msg: String): Boolean {
+        val lower = msg.lowercase()
+        return lower.contains("quota") ||
+               lower.contains("rate-limit") ||
+               lower.contains("rate_limit") ||
+               lower.contains("resource_exhausted") ||
+               lower.contains("429") ||
+               lower.contains("limit: 0") ||
+               lower.contains("exceeded your current quota")
+    }
+
+    private fun isInvalidModelError(msg: String): Boolean {
+        val lower = msg.lowercase()
+        return lower.contains("404") ||
+               lower.contains("not_found") ||
+               lower.contains("no longer available") ||
+               lower.contains("400") ||
+               lower.contains("invalid_argument") ||
+               lower.contains("modalities")
+    }
+
+    private suspend fun guessWithGemini(rawTitle: String): GeminiGuessResult? {
+        if (geminiApiKey.isBlank()) return null
+
+        val candidates = getAvailableCandidateModels()
+        if (candidates.isEmpty()) {
+            Napier.w("No valid Gemini candidate models available", tag = "DEBUG_METADATA")
+            return null
+        }
+
+        var attemptsCount = 0
+
+        for (modelName in candidates) {
+            attemptsCount++
             try {
                 val generativeModel = GenerativeModel(
                     modelName = modelName,
@@ -123,11 +252,10 @@ class YoutubeDLRepository(private val context: Context) {
                     Return a JSON object: {"artist": "ARTIST_NAME", "title": "SONG_TITLE"}
                     IMPORTANT: The "title" field must ONLY contain the song name, NOT the artist.
                 """.trimIndent()
-                
+
                 val response = generativeModel.generateContent(prompt)
                 var text = response.text ?: continue
-                
-                // Extract JSON block if present
+
                 if (text.contains("{")) {
                     text = text.substringAfter("{").substringBeforeLast("}")
                     text = "{$text}"
@@ -136,14 +264,27 @@ class YoutubeDLRepository(private val context: Context) {
                 val element = json.decodeFromString<JsonElement>(text).jsonObject
                 val artist = element["artist"]?.jsonPrimitive?.content?.trim()
                 val title = element["title"]?.jsonPrimitive?.content?.trim()
-                
+
                 if (!artist.isNullOrBlank() && !title.isNullOrBlank()) {
-                    Napier.i("Gemini guess ($modelName): Artist='$artist', Title='$title'", tag = "DEBUG_METADATA")
-                    return artist to title
+                    Napier.i("Gemini guess ($modelName, attempt $attemptsCount): Artist='$artist', Title='$title'", tag = "DEBUG_METADATA")
+                    lastWorkingModel = modelName
+                    return GeminiGuessResult(artist, title, modelName, attemptsCount)
                 }
             } catch (e: Exception) {
-                Napier.w("Gemini model '$modelName' failed: ${e.message}", tag = "DEBUG_METADATA")
-                // Continue to next model if it's a 404 or support error
+                val msg = e.message ?: ""
+                Napier.w("Gemini model '$modelName' failed on attempt $attemptsCount: $msg", tag = "DEBUG_METADATA")
+
+                if (isQuotaExhaustedError(msg)) {
+                    quotaExhaustedModels[modelName] = System.currentTimeMillis() + 60 * 60 * 1000L
+                    Napier.w("Marked Gemini model '$modelName' as quota exhausted", tag = "DEBUG_METADATA")
+                } else if (isInvalidModelError(msg)) {
+                    invalidModels.add(modelName)
+                    Napier.w("Marked Gemini model '$modelName' as invalid/deprecated", tag = "DEBUG_METADATA")
+                }
+
+                if (modelName == lastWorkingModel) {
+                    lastWorkingModel = null
+                }
             }
         }
         return null
@@ -223,7 +364,7 @@ class YoutubeDLRepository(private val context: Context) {
         return artist to title.ifBlank { rawTitle }
     }
 
-    suspend fun cleanTitleAndArtist(rawTitle: String, uploader: String?, isrc: String? = null, youtubeUrl: String? = null): Pair<String, String> {
+    suspend fun cleanTitleAndArtist(rawTitle: String, uploader: String?, isrc: String? = null, youtubeUrl: String? = null): CleanMetadataResult {
         Napier.d("cleanTitleAndArtist START - rawTitle: $rawTitle", tag = "DEBUG_METADATA")
         
         fun postClean(text: String) = text.trim().removePrefix("-").removeSuffix("-").trim()
@@ -237,12 +378,20 @@ class YoutubeDLRepository(private val context: Context) {
             return t
         }
 
+        var totalAiCandidatesTried = 0
+
         // 1. Try Gemini first if API key is available
-        val geminiGuess = guessWithGemini(rawTitle)
-        if (geminiGuess != null) {
-            val a = postClean(geminiGuess.first)
-            val t = ensureTitleOnly(a, postClean(geminiGuess.second))
-            return a to t
+        if (geminiApiKey.isNotBlank()) {
+            val candidateModels = getAvailableCandidateModels()
+            totalAiCandidatesTried = candidateModels.size
+            val geminiGuess = guessWithGemini(rawTitle)
+            if (geminiGuess != null) {
+                val a = postClean(geminiGuess.artist)
+                val t = ensureTitleOnly(a, postClean(geminiGuess.title))
+                val attemptsStr = if (geminiGuess.attemptsCount == 1) "1 attempt" else "${geminiGuess.attemptsCount} attempts"
+                val source = "gemini: ${geminiGuess.modelUsed} ($attemptsStr)"
+                return CleanMetadataResult(a, t, source)
+            }
         }
 
         // 2. Try fetching high-quality metadata from YouTube
@@ -260,7 +409,7 @@ class YoutubeDLRepository(private val context: Context) {
                 if (!ytArtist.isNullOrBlank() && !ytTrack.isNullOrBlank()) {
                     val a = postClean(ytArtist)
                     val t = ensureTitleOnly(a, postClean(ytTrack))
-                    return a to t
+                    return CleanMetadataResult(a, t, "yt-dlp")
                 }
             } catch (e: Exception) {
                 Napier.w("yt-dlp metadata fetch failed: ${e.message}", tag = "DEBUG_METADATA")
@@ -271,9 +420,14 @@ class YoutubeDLRepository(private val context: Context) {
         val regexResult = cleanTitleAndArtistRegex(rawTitle, uploader)
         val a = postClean(regexResult.first)
         val t = ensureTitleOnly(a, postClean(regexResult.second))
-        val finalResult = a to t
+        val source = if (totalAiCandidatesTried > 0) {
+            "regex (tried $totalAiCandidatesTried AI ${if (totalAiCandidatesTried == 1) "model" else "models"})"
+        } else {
+            "regex"
+        }
+        val finalResult = CleanMetadataResult(a, t, source)
         
-        Napier.i("Final result: ${finalResult.first} - ${finalResult.second}", tag = "DEBUG_METADATA")
+        Napier.i("Final result: ${finalResult.artist} - ${finalResult.title} (source: $source)", tag = "DEBUG_METADATA")
         return finalResult
     }
 

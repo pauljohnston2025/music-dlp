@@ -20,8 +20,10 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.example.musicdlp.MusicDLPApplication
+import com.example.musicdlp.data.AlternateVersion
 import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.YoutubeDLRepository
+import kotlinx.serialization.json.Json
 import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -58,11 +60,51 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 Napier.e("ExoPlayer error: ${error.message}", tag = "DEBUG_METADATA")
                 _errorMessage.value = "Playback error: ${error.message}"
             }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_ENDED) {
+                    val currentSong = _songsToSwipe.value.firstOrNull()
+                    if (currentSong != null && _currentlyPlayingId.value == currentSong.id) {
+                        Napier.d("Song playback ended automatically. Skipping to next song.", tag = "DEBUG_METADATA")
+                        skipSong(currentSong)
+                    }
+                }
+            }
         })
     }
 
     private val _songsToSwipe = MutableStateFlow<List<Song>>(emptyList())
     val songsToSwipe: StateFlow<List<Song>> = _songsToSwipe
+
+    private val _playlistLikedSongs = MutableStateFlow<List<Song>>(emptyList())
+    val playlistLikedSongs: StateFlow<List<Song>> = _playlistLikedSongs
+
+    private val _playlistDislikedSongs = MutableStateFlow<List<Song>>(emptyList())
+    val playlistDislikedSongs: StateFlow<List<Song>> = _playlistDislikedSongs
+
+    private fun addPlaylistLikedSong(song: Song) {
+        val current = _playlistLikedSongs.value.toMutableList()
+        current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
+        current.add(song)
+        _playlistLikedSongs.value = current
+    }
+
+    private fun addPlaylistDislikedSong(song: Song) {
+        val current = _playlistDislikedSongs.value.toMutableList()
+        current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
+        current.add(song)
+        _playlistDislikedSongs.value = current
+    }
+
+    private fun removePlaylistDislikedSong(song: Song) {
+        val current = _playlistDislikedSongs.value.toMutableList()
+        current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
+        _playlistDislikedSongs.value = current
+    }
+
+    private val skippedHistory = mutableListOf<Song>()
+    private val _canGoBack = MutableStateFlow(false)
+    val canGoBack: StateFlow<Boolean> = _canGoBack
 
     private val pendingBufferQueue = mutableListOf<Song>()
     private val queueMutex = Mutex()
@@ -138,9 +180,21 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateSongNameAndArtist(song: Song, newTitle: String, newArtist: String) {
-        val updatedSong = song.copy(title = newTitle.trim(), artist = newArtist.trim(), isMetadataCleaned = true)
+        val updatedSong = song.copy(
+            title = newTitle.trim(),
+            artist = newArtist.trim(),
+            metadataSource = "manual edit",
+            isMetadataCleaned = true
+        )
         _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) updatedSong else it }
         _promptForSongName.value = null
+    }
+
+    val lastWorkingModel: String?
+        get() = repository.lastWorkingModel
+
+    fun clearGeminiModelCache() {
+        repository.clearModelCache()
     }
 
     fun setGeminiApiKey(key: String) {
@@ -187,10 +241,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     } else null
                 } ?: break
                 
-                // 1. FAST ID CHECK - Skip already in library immediately
+                // 1. FAST ID & URL CHECK - Skip if youtubeUrl or ID is already known
                 val allSongs = songDao.getAllSongs()
-                if (allSongs.any { it.id == song.id }) {
-                    Napier.d("Skipping song already in library (ID match): ${song.id}", tag = "DEBUG_METADATA")
+                val existingByIdOrUrl = allSongs.firstOrNull { it.containsYoutubeUrlOrId(song.id) || it.containsYoutubeUrlOrId(song.youtubeUrl) }
+                if (existingByIdOrUrl != null) {
+                    Napier.d("Skipping song already in library (ID/URL match): ${song.id}", tag = "DEBUG_METADATA")
+                    if (existingByIdOrUrl.isLiked) addPlaylistLikedSong(existingByIdOrUrl)
+                    if (existingByIdOrUrl.isDisliked) addPlaylistDislikedSong(existingByIdOrUrl)
+                    processedCount++
+                    _playlistIndex.value = processedCount + 1
                     continue
                 }
 
@@ -198,21 +257,43 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 var workingSong = song
                 if (song.isMetadataCleaned != true) {
                     try {
-                        val (cleanArtist, cleanTitle) = repository.cleanTitleAndArtist(song.title, song.artist, song.isrc, song.youtubeUrl)
-                        workingSong = song.copy(artist = cleanArtist, title = cleanTitle, isMetadataCleaned = true)
+                        val cleanResult = repository.cleanTitleAndArtist(song.title, song.artist, song.isrc, song.youtubeUrl)
+                        workingSong = song.copy(
+                            artist = cleanResult.artist,
+                            title = cleanResult.title,
+                            metadataSource = cleanResult.source,
+                            isMetadataCleaned = true
+                        )
                     } catch (e: Exception) {}
                 }
 
-                // Check again with cleaned title
-                if (allSongs.any { it.title.lowercase().trim() == workingSong.title.lowercase().trim() }) {
-                    Napier.d("Skipping song already in library (Title match): ${workingSong.title}", tag = "DEBUG_METADATA")
+                // 2. CHECK IF NAME MATCHES AN EXISTING SONG IN DB
+                val matchingExistingSong = allSongs.firstOrNull {
+                    it.title.equals(workingSong.title, ignoreCase = true) &&
+                    (it.artist.equals(workingSong.artist, ignoreCase = true) || workingSong.artist == "Unknown" || it.artist == "Unknown")
+                }
+
+                if (matchingExistingSong != null) {
+                    Napier.d("Found new YouTube ID for existing song in DB: '${workingSong.title}'. Adding as alternate version.", tag = "DEBUG_METADATA")
+                    val updatedExistingSong = matchingExistingSong.addAlternateVersion(
+                        AlternateVersion(
+                            youtubeUrl = workingSong.youtubeUrl,
+                            rawTitle = workingSong.rawTitle ?: workingSong.title,
+                            thumbnailUrl = workingSong.thumbnailUrl
+                        )
+                    )
+                    songDao.insertSong(updatedExistingSong)
+                    if (updatedExistingSong.isLiked) addPlaylistLikedSong(updatedExistingSong)
+                    if (updatedExistingSong.isDisliked) addPlaylistDislikedSong(updatedExistingSong)
+                    processedCount++
+                    _playlistIndex.value = processedCount + 1
                     continue
                 }
 
-                // 2. Add to UI immediately so user can see it
+                // 3. Add to UI immediately so user can see it
                 _songsToSwipe.value = _songsToSwipe.value + workingSong
                 
-                // 3. Pre-fetch stream URL in background
+                // 4. Pre-fetch stream URL in background
                 try {
                     val url = repository.getStreamUrl(workingSong.youtubeUrl)
                     if (url != null) bufferedStreamUrls[workingSong.id] = url
@@ -234,8 +315,36 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun skipSong(song: Song) {
         viewModelScope.launch {
-            songDao.insertSong(song.copy(isDisliked = true, dislikedAt = System.currentTimeMillis()))
+            val disliked = song.copy(isDisliked = true, dislikedAt = System.currentTimeMillis())
+            songDao.insertSong(disliked)
+            addPlaylistDislikedSong(disliked)
+            skippedHistory.add(song)
+            _canGoBack.value = skippedHistory.isNotEmpty()
             advanceList()
+        }
+    }
+
+    fun goBackToPreviousSong() {
+        viewModelScope.launch {
+            if (skippedHistory.isNotEmpty()) {
+                val previousSong = skippedHistory.removeAt(skippedHistory.lastIndex)
+                _canGoBack.value = skippedHistory.isNotEmpty()
+
+                try {
+                    val dbSong = songDao.getSongById(previousSong.id)
+                    if (dbSong != null && dbSong.isDisliked) {
+                        songDao.deleteSongById(previousSong.id)
+                    }
+                } catch (e: Exception) {}
+
+                removePlaylistDislikedSong(previousSong)
+
+                _songsToSwipe.value = listOf(previousSong) + _songsToSwipe.value
+                if (processedCount > 0) processedCount--
+                _playlistIndex.value = (processedCount + 1).coerceAtLeast(1)
+
+                playPreview(previousSong)
+            }
         }
     }
 
@@ -258,7 +367,30 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun likeSong(song: Song) {
         viewModelScope.launch {
-            saveLikedSong(song.copy(likedAt = System.currentTimeMillis()))
+            val allSongs = songDao.getAllSongs()
+            val existingLiked = allSongs.firstOrNull {
+                it.isLiked &&
+                it.title.equals(song.title, ignoreCase = true) &&
+                (it.artist.equals(song.artist, ignoreCase = true) || song.artist == "Unknown" || it.artist == "Unknown")
+            }
+
+            val likedToRecord = if (existingLiked != null) {
+                val updated = existingLiked.addAlternateVersion(
+                    AlternateVersion(
+                        youtubeUrl = song.youtubeUrl,
+                        rawTitle = song.rawTitle ?: song.title,
+                        thumbnailUrl = song.thumbnailUrl
+                    )
+                )
+                songDao.insertSong(updated)
+                updated
+            } else {
+                val newLiked = song.copy(isLiked = true, likedAt = System.currentTimeMillis())
+                saveLikedSong(newLiked)
+                newLiked
+            }
+
+            addPlaylistLikedSong(likedToRecord)
             advanceList()
         }
     }
@@ -333,6 +465,86 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { saveLikedSong(song) }
     }
 
+    fun replaceLikedSongWithAlternateVersion(
+        targetSong: Song,
+        selectedVersion: AlternateVersion
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _isSongLoading.value = true
+            _errorMessage.value = "Downloading alternate version for ${targetSong.title}..."
+            try {
+                val safeArtist = targetSong.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                val safeTitle = targetSong.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                val finalFileName = "$safeArtist - $safeTitle.mp3"
+
+                val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                val downloadDir = File(publicMusicDir, "MusicDLP")
+                if (!downloadDir.exists()) downloadDir.mkdirs()
+                val targetFile = File(downloadDir, finalFileName)
+
+                if (targetFile.exists()) {
+                    targetFile.delete()
+                }
+
+                val tempDir = File(app.cacheDir, "downloads")
+                if (!tempDir.exists()) tempDir.mkdirs()
+
+                val tempSong = targetSong.copy(youtubeUrl = selectedVersion.youtubeUrl)
+                val downloadedPath = repository.downloadSong(tempSong, tempDir) { progress ->
+                    _downloadProgress.value = _downloadProgress.value + (targetSong.id to progress)
+                }
+
+                val fileToInsert = File(downloadedPath)
+                val resolver = app.contentResolver
+                val audioCollection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY) else MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                val details = ContentValues().apply {
+                    put(MediaStore.Audio.Media.DISPLAY_NAME, finalFileName)
+                    put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
+                    put(MediaStore.Audio.Media.ARTIST, targetSong.artist)
+                    put(MediaStore.Audio.Media.TITLE, targetSong.title)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/MusicDLP")
+                        put(MediaStore.Audio.Media.IS_PENDING, 1)
+                    }
+                }
+                val uri = resolver.insert(audioCollection, details) ?: throw IOException("Failed to create MediaStore entry")
+                resolver.openOutputStream(uri)?.use { outputStream -> fileToInsert.inputStream().use { input -> input.copyTo(outputStream) } }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    details.clear()
+                    details.put(MediaStore.Audio.Media.IS_PENDING, 0)
+                    resolver.update(uri, details, null, null)
+                }
+                if (fileToInsert.parentFile?.name == "downloads" || fileToInsert.parentFile?.absolutePath == app.cacheDir.absolutePath) fileToInsert.delete()
+
+                val currentAlternates = targetSong.getAlternateVersionsList().toMutableList()
+                currentAlternates.removeAll { it.youtubeUrl == selectedVersion.youtubeUrl }
+                currentAlternates.add(
+                    AlternateVersion(
+                        youtubeUrl = targetSong.youtubeUrl,
+                        rawTitle = targetSong.rawTitle ?: targetSong.title,
+                        thumbnailUrl = targetSong.thumbnailUrl
+                    )
+                )
+
+                val updatedSong = targetSong.copy(
+                    youtubeUrl = selectedVersion.youtubeUrl,
+                    rawTitle = selectedVersion.rawTitle ?: targetSong.rawTitle,
+                    thumbnailUrl = selectedVersion.thumbnailUrl ?: targetSong.thumbnailUrl,
+                    alternateYoutubeUrls = Json.encodeToString(currentAlternates)
+                )
+
+                songDao.insertSong(updatedSong)
+                _errorMessage.value = "Replaced ${targetSong.title} with alternate version!"
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _errorMessage.value = "Failed to replace alternate version: ${e.message}"
+            } finally {
+                _downloadProgress.value = _downloadProgress.value - targetSong.id
+                _isSongLoading.value = false
+            }
+        }
+    }
+
     fun playLikedSong(song: Song, onNotDownloaded: () -> Unit) {
         viewModelScope.launch {
             val safeArtist = song.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
@@ -359,8 +571,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             if (song.isMetadataCleaned != true) {
                 try {
-                    val (cleanArtist, cleanTitle) = repository.cleanTitleAndArtist(song.title, song.artist, song.isrc, song.youtubeUrl)
-                    val cleanedSong = song.copy(artist = cleanArtist, title = cleanTitle, isMetadataCleaned = true)
+                    val cleanResult = repository.cleanTitleAndArtist(song.title, song.artist, song.isrc, song.youtubeUrl)
+                    val cleanedSong = song.copy(
+                        artist = cleanResult.artist,
+                        title = cleanResult.title,
+                        metadataSource = cleanResult.source,
+                        isMetadataCleaned = true
+                    )
                     _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) cleanedSong else it }
                 } catch (e: Exception) {}
             }
@@ -400,6 +617,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             _isPlaylistLoading.value = true
             bufferedStreamUrls.clear()
             _songsToSwipe.value = emptyList()
+            _playlistLikedSongs.value = emptyList()
+            _playlistDislikedSongs.value = emptyList()
             queueMutex.withLock { pendingBufferQueue.clear() }
             try {
                 val results = repository.searchSongsOrPlaylists(query)
@@ -428,6 +647,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             _isPlaylistLoading.value = true
             bufferedStreamUrls.clear()
             _songsToSwipe.value = emptyList()
+            _playlistLikedSongs.value = emptyList()
+            _playlistDislikedSongs.value = emptyList()
             queueMutex.withLock { pendingBufferQueue.clear() }
             try {
                 val playlistSongs = repository.getPlaylistSongs(url)
@@ -448,6 +669,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             _isPlaylistLoading.value = true
             bufferedStreamUrls.clear()
             _songsToSwipe.value = emptyList()
+            _playlistLikedSongs.value = emptyList()
+            _playlistDislikedSongs.value = emptyList()
             queueMutex.withLock { pendingBufferQueue.clear() }
             try {
                 try { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}

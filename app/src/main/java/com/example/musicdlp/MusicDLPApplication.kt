@@ -22,7 +22,7 @@ class MusicDLPApplication : Application() {
         database = Room.databaseBuilder(
             applicationContext,
             AppDatabase::class.java, "musicdlp-database"
-        ).build()
+        ).fallbackToDestructiveMigration(true).build()
 
         try {
             YoutubeDL.getInstance().init(this)
