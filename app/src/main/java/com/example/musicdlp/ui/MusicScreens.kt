@@ -309,17 +309,6 @@ fun SwipingScreen(viewModel: MusicViewModel) {
                 Text("No more songs to swipe!")
             }
         }
-
-        // 5. Player Controls Below the Swipable Card
-        val currentSong = songs.firstOrNull()
-        val canGoBack by viewModel.canGoBack.collectAsState()
-        PlayerControls(
-            viewModel = viewModel,
-            onPrevious = { viewModel.goBackToPreviousSong() },
-            onNext = { currentSong?.let { viewModel.skipSong(it) } },
-            canGoPrevious = canGoBack,
-            canGoNext = currentSong != null
-        )
     }
 }
 
@@ -437,10 +426,10 @@ fun TinderCard(
                 Spacer(modifier = Modifier.height(4.dp))
 
                 Text(
-                    text = "YouTube: ${song.rawTitle ?: "Unknown"}",
+                    text = "YouTube: ${song.rawTitle?.ifBlank { null } ?: song.title.ifBlank { "Unknown" }}",
                     style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                    modifier = Modifier.alpha(0.7f)
+                    maxLines = 3,
+                    modifier = Modifier.alpha(0.7f).fillMaxWidth()
                 )
                 if (!song.metadataSource.isNullOrBlank()) {
                     Text(
@@ -573,11 +562,12 @@ fun PlayerControls(
     var progress by remember { mutableStateOf(0f) }
 
     LaunchedEffect(player) {
+        if (player == null) return@LaunchedEffect
         while (true) {
+            isPlaying = player.isPlaying
             if (player.duration > 0) {
                 progress = player.currentPosition.toFloat() / player.duration.toFloat()
             }
-            isPlaying = player.isPlaying
             delay(500)
         }
     }
@@ -586,8 +576,10 @@ fun PlayerControls(
         Slider(
             value = progress,
             onValueChange = {
-                val seekPos = (it * player.duration).toLong()
-                player.seekTo(seekPos)
+                player?.let { p ->
+                    val seekPos = (it * p.duration).toLong()
+                    p.seekTo(seekPos)
+                }
             },
             modifier = Modifier.fillMaxWidth()
         )
@@ -613,13 +605,15 @@ fun PlayerControls(
 
             IconButton(
                 onClick = {
-                    if (isPlaying) {
-                        player.pause()
-                    } else {
-                        if (player.playerError != null || player.playbackState == Player.STATE_IDLE || player.mediaItemCount == 0) {
-                            currentSong?.let { viewModel.playPreview(it, forceRefreshSource = true) }
+                    player?.let { p ->
+                        if (isPlaying) {
+                            p.pause()
                         } else {
-                            player.play()
+                            if (p.playbackState == Player.STATE_IDLE || p.playbackState == Player.STATE_ENDED || p.mediaItemCount == 0) {
+                                currentSong?.let { viewModel.playPreview(it, forceRefreshSource = true) }
+                            } else {
+                                p.play()
+                            }
                         }
                     }
                 },
@@ -707,8 +701,6 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
             }
         }
 
-        val playingIndex = filteredLikedList.indexOfFirst { it.id == currentlyPlayingId }
-
         LazyColumn(modifier = Modifier.weight(1f)) {
             items(filteredLikedList) { song ->
                 val isDownloading = downloadProgress.containsKey(song.id)
@@ -723,9 +715,7 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
                         .fillMaxWidth()
                         .padding(vertical = 4.dp)
                         .clickable {
-                            viewModel.playLikedSong(song) {
-                                songToPrompt = song
-                            }
+                            viewModel.playSongInContext(song, filteredLikedList)
                         }
                 ) {
                     ListItem(
@@ -799,36 +789,6 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
                                 }
                             }
                         }
-                    )
-                }
-            }
-        }
-
-        if (playingIndex != -1) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp)
-            ) {
-                Column(modifier = Modifier.padding(8.dp)) {
-                    PlayerControls(
-                        viewModel = viewModel,
-                        onPrevious = if (playingIndex > 0) {
-                            {
-                                val prev = filteredLikedList[playingIndex - 1]
-                                viewModel.playLikedSong(prev) { viewModel.playPreview(prev) }
-                            }
-                        } else null,
-                        onNext = if (playingIndex < filteredLikedList.lastIndex) {
-                            {
-                                val next = filteredLikedList[playingIndex + 1]
-                                viewModel.playLikedSong(next) { viewModel.playPreview(next) }
-                            }
-                        } else null,
-                        canGoPrevious = playingIndex > 0,
-                        canGoNext = playingIndex < filteredLikedList.lastIndex
                     )
                 }
             }
@@ -1123,7 +1083,7 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
                         .fillMaxWidth()
                         .padding(vertical = 4.dp)
                         .clickable {
-                            viewModel.playPreview(song)
+                            viewModel.playSongInContext(song, filteredDislikedList)
                         }
                 ) {
                     ListItem(
@@ -1172,25 +1132,6 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
             }
         }
 
-        if (playingIndex != -1) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp)
-            ) {
-                Column(modifier = Modifier.padding(8.dp)) {
-                    PlayerControls(
-                        viewModel = viewModel,
-                        onPrevious = if (playingIndex > 0) { { viewModel.playPreview(filteredDislikedList[playingIndex - 1]) } } else null,
-                        onNext = if (playingIndex < filteredDislikedList.lastIndex) { { viewModel.playPreview(filteredDislikedList[playingIndex + 1]) } } else null,
-                        canGoPrevious = playingIndex > 0,
-                        canGoNext = playingIndex < filteredDislikedList.lastIndex
-                    )
-                }
-            }
-        }
     }
 }
 

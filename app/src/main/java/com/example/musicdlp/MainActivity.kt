@@ -42,6 +42,7 @@ import com.example.musicdlp.ui.DislikedSongsScreen
 import coil.compose.AsyncImage
 import com.example.musicdlp.ui.SettingsScreen
 import io.github.aakira.napier.Napier
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -103,90 +104,19 @@ fun MainScreen() {
         bottomBar = {
             val navBackStackEntry by navController.currentBackStackEntryAsState()
             val currentDestination = navBackStackEntry?.destination?.route
-            val showBottomFloatingBar = currentDestination != "swipe" && currentPlayingSong != null
 
             Column {
-                // Floating Now Playing Notification Banner (Hidden on "swipe" screen)
-                if (showBottomFloatingBar) {
-                    val song = currentPlayingSong!!
-                    Surface(
-                        color = MaterialTheme.colorScheme.primaryContainer,
-                        tonalElevation = 8.dp,
-                        shadowElevation = 8.dp,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
+                if (currentPlayingSong != null) {
+                    BottomPlayerBar(
+                        viewModel = viewModel,
+                        onNavigateToSwipe = {
+                            if (currentDestination != "swipe") {
                                 navController.navigate("swipe") {
                                     popUpTo("swipe") { inclusive = true }
                                 }
-                                viewModel.resumeSwiping()
-                            }
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
-                                val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
-                                "https://i.ytimg.com/vi/$id/hqdefault.jpg"
-                            } else {
-                                song.thumbnailUrl
-                            }
-
-                            if (effectiveThumbnail.isNotBlank()) {
-                                AsyncImage(
-                                    model = effectiveThumbnail,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(40.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                            } else {
-                                Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(28.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
-                            }
-
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = song.title,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1
-                                )
-                                Text(
-                                    text = "Tap to resume swiping • ${song.artist.ifBlank { song.rawTitle ?: "Now Playing" }}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 1
-                                )
-                            }
-
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    onClick = { viewModel.goBackToPreviousSong() },
-                                    enabled = canGoBack
-                                ) {
-                                    Icon(Icons.Default.SkipPrevious, contentDescription = "Previous")
-                                }
-
-                                IconButton(onClick = { viewModel.togglePlayPause() }) {
-                                    Icon(
-                                        imageVector = if (viewModel.exoPlayer.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                        contentDescription = "Play/Pause"
-                                    )
-                                }
-
-                                IconButton(
-                                    onClick = {
-                                        val active = viewModel.currentPlayingSong.value ?: viewModel.songsToSwipe.value.firstOrNull()
-                                        active?.let { viewModel.skipSong(it) }
-                                    }
-                                ) {
-                                    Icon(Icons.Default.SkipNext, contentDescription = "Next")
-                                }
                             }
                         }
-                    }
+                    )
                 }
 
                 NavigationBar {
@@ -195,10 +125,11 @@ fun MainScreen() {
                         label = { Text("Swipe") },
                         selected = currentDestination == "swipe",
                         onClick = {
-                            navController.navigate("swipe") {
-                                popUpTo("swipe") { inclusive = true }
+                            if (currentDestination != "swipe") {
+                                navController.navigate("swipe") {
+                                    popUpTo("swipe") { inclusive = true }
+                                }
                             }
-                            viewModel.resumeSwiping()
                         }
                     )
                     NavigationBarItem(
@@ -232,6 +163,121 @@ fun MainScreen() {
             composable("liked") { LikedSongsScreen(viewModel) }
             composable("disliked") { DislikedSongsScreen(viewModel) }
             composable("settings") { SettingsScreen(viewModel) }
+        }
+    }
+}
+
+@Composable
+fun BottomPlayerBar(
+    viewModel: MusicViewModel,
+    onNavigateToSwipe: () -> Unit
+) {
+    val currentPlayingSong by viewModel.currentPlayingSong.collectAsState()
+    val canGoPrevious by viewModel.canGoPreviousInContext.collectAsState()
+    val canGoNext by viewModel.canGoNextInContext.collectAsState()
+    val song = currentPlayingSong ?: return
+
+    val player = viewModel.exoPlayer
+    var isPlaying by remember { mutableStateOf(false) }
+    var progress by remember { mutableStateOf(0f) }
+
+    LaunchedEffect(player) {
+        if (player == null) return@LaunchedEffect
+        while (true) {
+            isPlaying = player.isPlaying
+            if (player.duration > 0) {
+                progress = (player.currentPosition.toFloat() / player.duration.toFloat()).coerceIn(0f, 1f)
+            }
+            delay(500)
+        }
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.primaryContainer,
+        tonalElevation = 8.dp,
+        shadowElevation = 8.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Slider(
+                value = progress,
+                onValueChange = { newProgress ->
+                    progress = newProgress
+                    player?.let { p ->
+                        if (p.duration > 0) {
+                            p.seekTo((newProgress * p.duration).toLong())
+                        }
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(20.dp)
+                    .padding(horizontal = 8.dp)
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, end = 12.dp, bottom = 6.dp)
+                    .clickable { onNavigateToSwipe() },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
+                    val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+                    "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                } else {
+                    song.thumbnailUrl
+                }
+
+                if (effectiveThumbnail.isNotBlank()) {
+                    AsyncImage(
+                        model = effectiveThumbnail,
+                        contentDescription = null,
+                        modifier = Modifier.size(40.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                } else {
+                    Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(28.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = song.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = song.artist.ifBlank { song.rawTitle ?: "Now Playing" },
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = { viewModel.playPreviousInContext() },
+                        enabled = canGoPrevious
+                    ) {
+                        Icon(Icons.Default.SkipPrevious, contentDescription = "Previous")
+                    }
+
+                    IconButton(onClick = { viewModel.togglePlayPause() }) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = "Play/Pause"
+                        )
+                    }
+
+                    IconButton(
+                        onClick = { viewModel.playNextInContext() },
+                        enabled = canGoNext
+                    ) {
+                        Icon(Icons.Default.SkipNext, contentDescription = "Next")
+                    }
+                }
+            }
         }
     }
 }

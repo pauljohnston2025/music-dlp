@@ -46,7 +46,9 @@ data class GeminiModelInfo(
 data class CleanMetadataResult(
     val artist: String,
     val title: String,
-    val source: String
+    val source: String,
+    val score: Int = 0,
+    val recoveredRawTitle: String? = null
 )
 
 data class GeminiGuessResult(
@@ -364,8 +366,91 @@ class YoutubeDLRepository(private val context: Context) {
         return artist to title.ifBlank { rawTitle }
     }
 
+    private var lastMusicBrainzRequestTime = 0L
+
+    suspend fun verifyWithMusicBrainz(artist: String, title: String): Boolean = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val waitTime = 1000L - (now - lastMusicBrainzRequestTime)
+        if (waitTime > 0) delay(waitTime)
+        
+        lastMusicBrainzRequestTime = System.currentTimeMillis()
+        
+        try {
+            val query = URLEncoder.encode("artist:\"$artist\" AND recording:\"$title\"", "UTF-8")
+            val url = "https://musicbrainz.org/ws/2/recording?query=$query&fmt=json"
+            val response: String = client.get(url) {
+                header("User-Agent", "MusicDLP/1.0 ( musicdlp@example.com )")
+            }.body()
+            
+            val jsonResponse = json.parseToJsonElement(response).jsonObject
+            val count = jsonResponse["count"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
+            return@withContext count > 0
+        } catch (e: Exception) {
+            Napier.w("MusicBrainz verification failed: ${e.message}", tag = "DEBUG_METADATA")
+            false
+        }
+    }
+
+    private fun scoreMetadata(artist: String, title: String): Int {
+        var score = 100
+        val noiseWords = listOf("official", "video", "lyrics", "hd", "hq", "audio", "remastered", "4k")
+        
+        noiseWords.forEach { word ->
+            if (artist.contains(word, ignoreCase = true)) score -= 20
+            if (title.contains(word, ignoreCase = true)) score -= 20
+        }
+        
+        if (artist == "Unknown" || artist.isBlank()) score -= 50
+        if (title.isBlank()) score -= 50
+        
+        if (artist.length > 50) score -= 30
+        if (title.length > 80) score -= 30
+        
+        return score.coerceAtLeast(0)
+    }
+
     suspend fun cleanTitleAndArtist(rawTitle: String, uploader: String?, isrc: String? = null, youtubeUrl: String? = null): CleanMetadataResult {
-        Napier.d("cleanTitleAndArtist START - rawTitle: $rawTitle", tag = "DEBUG_METADATA")
+        Napier.d("cleanTitleAndArtist START - rawTitle: $rawTitle, uploader: $uploader, url: $youtubeUrl", tag = "DEBUG_METADATA")
+
+        var effectiveRawTitle = rawTitle.trim()
+        var effectiveUploader = uploader?.trim()
+        var recoveredRawTitle: String? = null
+
+        fun isPlaceholderTitle(t: String) = t.isBlank() ||
+                t.equals("Loading...", ignoreCase = true) ||
+                t.equals("Loading", ignoreCase = true) ||
+                t.equals("Please wait", ignoreCase = true) ||
+                t.equals("Preview", ignoreCase = true) ||
+                t.equals("Unknown", ignoreCase = true) ||
+                t.equals("Unknown Title", ignoreCase = true)
+
+        fun isPlaceholderUploader(u: String?) = u.isNullOrBlank() ||
+                u.equals("Please wait", ignoreCase = true) ||
+                u.equals("Loading...", ignoreCase = true) ||
+                u.equals("Unknown", ignoreCase = true) ||
+                u.equals("Unknown Artist", ignoreCase = true)
+
+        if ((isPlaceholderTitle(effectiveRawTitle) || isPlaceholderUploader(effectiveUploader)) && !youtubeUrl.isNullOrBlank() && youtubeUrl.startsWith("http")) {
+            Napier.i("Placeholder/invalid metadata detected ($effectiveRawTitle / $effectiveUploader), fetching from YouTube...", tag = "DEBUG_METADATA")
+            try {
+                val fetched = getPlaylistSongs(youtubeUrl).firstOrNull()
+                if (fetched != null) {
+                    if (isPlaceholderTitle(effectiveRawTitle) && !fetched.rawTitle.isNullOrBlank() && !isPlaceholderTitle(fetched.rawTitle)) {
+                        effectiveRawTitle = fetched.rawTitle
+                        recoveredRawTitle = fetched.rawTitle
+                    } else if (isPlaceholderTitle(effectiveRawTitle) && fetched.title.isNotBlank() && !isPlaceholderTitle(fetched.title)) {
+                        effectiveRawTitle = fetched.title
+                        recoveredRawTitle = fetched.title
+                    }
+                    if (isPlaceholderUploader(effectiveUploader) && fetched.artist.isNotBlank() && !isPlaceholderUploader(fetched.artist)) {
+                        effectiveUploader = fetched.artist
+                    }
+                    Napier.i("Recovered metadata from YouTube: rawTitle='$effectiveRawTitle', uploader='$effectiveUploader'", tag = "DEBUG_METADATA")
+                }
+            } catch (e: Exception) {
+                Napier.w("Failed to recover metadata from YouTube for $youtubeUrl: ${e.message}", tag = "DEBUG_METADATA")
+            }
+        }
         
         fun postClean(text: String) = text.trim().removePrefix("-").removeSuffix("-").trim()
         
@@ -378,60 +463,35 @@ class YoutubeDLRepository(private val context: Context) {
             return t
         }
 
-        var totalAiCandidatesTried = 0
+        // 1. Try Regex first
+        val regexResult = cleanTitleAndArtistRegex(effectiveRawTitle, effectiveUploader)
+        val regA = postClean(regexResult.first)
+        val regT = ensureTitleOnly(regA, postClean(regexResult.second))
+        val regScore = scoreMetadata(regA, regT)
 
-        // 1. Try Gemini first if API key is available
-        if (geminiApiKey.isNotBlank()) {
-            val candidateModels = getAvailableCandidateModels()
-            totalAiCandidatesTried = candidateModels.size
-            val geminiGuess = guessWithGemini(rawTitle)
+        if (regScore >= 80) {
+            // Verify with MusicBrainz if score is high enough to be worth it but not certain
+            if (verifyWithMusicBrainz(regA, regT)) {
+                return CleanMetadataResult(regA, regT, "regex + musicbrainz (verified)", regScore + 20, recoveredRawTitle)
+            }
+        }
+
+        // 2. Try Gemini if score is low or MB failed
+        if (geminiApiKey.isNotBlank() && regScore < 90) {
+            val geminiGuess = guessWithGemini(effectiveRawTitle)
             if (geminiGuess != null) {
                 val a = postClean(geminiGuess.artist)
                 val t = ensureTitleOnly(a, postClean(geminiGuess.title))
-                val attemptsStr = if (geminiGuess.attemptsCount == 1) "1 attempt" else "${geminiGuess.attemptsCount} attempts"
-                val source = "gemini: ${geminiGuess.modelUsed} ($attemptsStr)"
-                return CleanMetadataResult(a, t, source)
+                val source = "gemini: ${geminiGuess.modelUsed}"
+                return CleanMetadataResult(a, t, source, 100, recoveredRawTitle)
             }
         }
 
-        // 2. Try fetching high-quality metadata from YouTube
-        if (!youtubeUrl.isNullOrBlank() && !youtubeUrl.startsWith("content://") && !youtubeUrl.startsWith("/")) {
-            try {
-                val request = YoutubeDLRequest(youtubeUrl)
-                request.addOption("--dump-json")
-                val response = withContext(Dispatchers.IO) {
-                    YoutubeDL.getInstance().execute(request)
-                }
-                val entry = json.decodeFromString<YtDlpEntry>(response.out)
-                val ytArtist = (entry.artist ?: entry.creator ?: entry.channel ?: entry.uploader)
-                    ?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim()
-                val ytTrack = entry.track
-                if (!ytArtist.isNullOrBlank() && !ytTrack.isNullOrBlank()) {
-                    val a = postClean(ytArtist)
-                    val t = ensureTitleOnly(a, postClean(ytTrack))
-                    return CleanMetadataResult(a, t, "yt-dlp")
-                }
-            } catch (e: Exception) {
-                Napier.w("yt-dlp metadata fetch failed: ${e.message}", tag = "DEBUG_METADATA")
-            }
-        }
-
-        // 3. Fallback to Regex
-        val regexResult = cleanTitleAndArtistRegex(rawTitle, uploader)
-        val a = postClean(regexResult.first)
-        val t = ensureTitleOnly(a, postClean(regexResult.second))
-        val source = if (totalAiCandidatesTried > 0) {
-            "regex (tried $totalAiCandidatesTried AI ${if (totalAiCandidatesTried == 1) "model" else "models"})"
-        } else {
-            "regex"
-        }
-        val finalResult = CleanMetadataResult(a, t, source)
-        
-        Napier.i("Final result: ${finalResult.artist} - ${finalResult.title} (source: $source)", tag = "DEBUG_METADATA")
-        return finalResult
+        // 3. Fallback to Regex result
+        return CleanMetadataResult(regA, regT, "regex (guess)", regScore, recoveredRawTitle)
     }
 
-    suspend fun searchSongsOrPlaylists(query: String): List<String> = withContext(Dispatchers.IO) {
+    suspend fun searchSongsOrPlaylists(query: String): List<Song> = withContext(Dispatchers.IO) {
         val searchUrl = "ytsearch15:$query"
         Napier.d("Searching with query: $query (URL: $searchUrl)", tag = "DEBUG_METADATA")
         val request = YoutubeDLRequest(searchUrl)
@@ -441,31 +501,52 @@ class YoutubeDLRepository(private val context: Context) {
             val response = YoutubeDL.getInstance().execute(request)
             val jsonString = response.out
             val trimmed = jsonString.trim()
-            val urls = mutableListOf<String>()
+            val songs = mutableListOf<Song>()
             
             Napier.d("Search response length: ${jsonString.length}", tag = "DEBUG_METADATA")
 
             if (trimmed.startsWith("{")) {
                 val jsonNode = json.decodeFromString<JsonElement>(trimmed).jsonObject
                 
-                // If it's a search result with entries
-                if (jsonNode.containsKey("entries")) {
-                    val playlist = json.decodeFromString<YtDlpPlaylist>(trimmed)
-                    playlist.entries?.forEach { entry ->
-                        val id = entry.id
-                        if (!id.isNullOrBlank()) {
-                            if (id.startsWith("PL") || id.startsWith("RD") || id.startsWith("OLAK")) {
-                                urls.add("https://www.youtube.com/playlist?list=$id")
-                            } else {
-                                urls.add("https://www.youtube.com/watch?v=$id")
-                            }
-                        }
-                    }
+                val rawEntries = if (jsonNode.containsKey("entries")) {
+                    json.decodeFromString<YtDlpPlaylist>(trimmed).entries ?: emptyList()
                 } else {
-                    // Single result
-                    val id = jsonNode["id"]?.jsonPrimitive?.content
-                    if (!id.isNullOrBlank()) {
-                        urls.add("https://www.youtube.com/watch?v=$id")
+                    listOf(json.decodeFromString<YtDlpEntry>(trimmed))
+                }
+
+                for (entry in rawEntries) {
+                    val rawTitle = entry.title ?: ""
+                    val artist = entry.uploader?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim() ?: "Unknown"
+                    val thumbnail = if (!entry.thumbnail.isNullOrBlank()) {
+                        entry.thumbnail
+                    } else if (!entry.id.isNullOrBlank()) {
+                        "https://i.ytimg.com/vi/${entry.id}/hqdefault.jpg"
+                    } else {
+                        ""
+                    }
+                    val id = entry.id
+                    val videoOrPlaylistUrl = if (id?.startsWith("PL") == true || id?.startsWith("RD") == true || id?.startsWith("OLAK") == true) {
+                        "https://www.youtube.com/playlist?list=$id"
+                    } else if (!id.isNullOrBlank()) {
+                        "https://www.youtube.com/watch?v=$id"
+                    } else {
+                        ""
+                    }
+                    if (videoOrPlaylistUrl.isNotBlank()) {
+                        songs.add(
+                            Song(
+                                id = id ?: "search_${videoOrPlaylistUrl.hashCode()}",
+                                title = rawTitle.ifBlank { "Unknown Title" },
+                                artist = artist.ifBlank { "Unknown" },
+                                thumbnailUrl = thumbnail,
+                                youtubeUrl = videoOrPlaylistUrl,
+                                isLiked = false,
+                                isDisliked = false,
+                                isrc = entry.isrc,
+                                rawTitle = rawTitle.ifBlank { "Unknown Title" },
+                                isMetadataCleaned = false
+                            )
+                        )
                     }
                 }
             } else {
@@ -474,13 +555,23 @@ class YoutubeDLRepository(private val context: Context) {
                     if (line.contains("watch?v=")) {
                         val videoId = line.substringAfter("watch?v=").substringBefore("&").trim()
                         if (videoId.isNotBlank()) {
-                            urls.add("https://www.youtube.com/watch?v=$videoId")
+                            songs.add(
+                                Song(
+                                    id = videoId,
+                                    title = "Unknown Title",
+                                    artist = "Unknown",
+                                    thumbnailUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg",
+                                    youtubeUrl = "https://www.youtube.com/watch?v=$videoId",
+                                    rawTitle = "Unknown Title",
+                                    isMetadataCleaned = false
+                                )
+                            )
                         }
                     }
                 }
             }
-            Napier.i("Search returned ${urls.size} results", tag = "DEBUG_METADATA")
-            urls
+            Napier.i("Search returned ${songs.size} results", tag = "DEBUG_METADATA")
+            songs
         } catch (e: Exception) {
             Napier.e("Search failed: ${e.message}", tag = "DEBUG_METADATA")
             e.printStackTrace()
