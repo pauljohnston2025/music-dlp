@@ -77,18 +77,14 @@ class MusicLibraryService : MediaLibraryService() {
 
             override fun getAvailableCommands(): Player.Commands {
                 val builder = super.getAvailableCommands().buildUpon()
-                if (hasNextMediaItem()) {
-                    builder.add(COMMAND_SEEK_TO_NEXT).add(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
-                } else {
-                    builder.remove(COMMAND_SEEK_TO_NEXT).remove(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
-                }
-                if (hasPreviousMediaItem()) {
-                    builder.add(COMMAND_SEEK_TO_PREVIOUS).add(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
-                } else {
-                    builder.remove(COMMAND_SEEK_TO_PREVIOUS).remove(
-                        COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM
-                    )
-                }
+                // do not dynamically remove them or else the order changes uncontrollably, and we get no choice in the matter
+                // ie orderring becomes
+                // with net and prev  |LIKE   |PREV|PAUSE|NEXT|DISLIKE|
+                // no next            |DISLIKE|PREV|PAUSE|LIKE|
+                // note: how the like/dilike order changes unexpectedly
+                builder.add(COMMAND_SEEK_TO_NEXT).add(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+                builder.add(COMMAND_SEEK_TO_PREVIOUS).add(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+
                 return builder.build()
             }
 
