@@ -1,13 +1,7 @@
 package com.example.musicdlp.ui
 
 import android.app.Application
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import androidx.core.app.NotificationCompat
-import com.example.musicdlp.MainActivity
 import android.content.BroadcastReceiver
-import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -26,14 +20,8 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.example.musicdlp.MusicDLPApplication
-import com.example.musicdlp.R
 import com.example.musicdlp.data.AlternateVersion
-import com.example.musicdlp.data.PlaybackStateHolder
 import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.YoutubeDLRepository
 import kotlinx.serialization.json.Json
@@ -763,36 +751,50 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun updatePlayingSongWithDbState(song: Song): Song {
+        val liked = _playlistLikedSongs.value.any {
+            it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true))
+        }
+        val disliked = _playlistDislikedSongs.value.any {
+            it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true))
+        }
+        return song.copy(isLiked = liked, isDisliked = disliked)
+    }
+
     private fun buildMediaItem(song: Song, uriString: String): MediaItem {
-        val artworkUriString = if (song.thumbnailUrl.isNotBlank()) {
-            song.thumbnailUrl
-        } else if (song.youtubeUrl.contains("watch?v=")) {
-            val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+        val songWithState = updatePlayingSongWithDbState(song)
+
+        val artworkUriString = if (songWithState.thumbnailUrl.isNotBlank()) {
+            songWithState.thumbnailUrl
+        } else if (songWithState.youtubeUrl.contains("watch?v=")) {
+            val id = songWithState.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
             "https://i.ytimg.com/vi/$id/hqdefault.jpg"
         } else {
             null
         }
 
         val list = _activePlayingList.value
-        val index = list.indexOfFirst { it.id == song.id }
+        val index = list.indexOfFirst { it.id == songWithState.id }
         val canPrev = if (index > 0) true else _canGoBack.value
         val canNext = if (index != -1 && index < list.lastIndex) true else _songsToSwipe.value.size > 1
 
         val extras = Bundle().apply {
             putBoolean("canGoPrevious", canPrev)
             putBoolean("canGoNext", canNext)
+            putBoolean("isLiked", songWithState.isLiked)
+            putBoolean("isDisliked", songWithState.isDisliked)
         }
 
         val metadata = MediaMetadata.Builder()
-            .setTitle(song.title.ifBlank { "Unknown Title" })
-            .setArtist(song.artist.ifBlank { "MusicDLP" })
+            .setTitle(songWithState.title.ifBlank { "Unknown Title" })
+            .setArtist(songWithState.artist.ifBlank { "MusicDLP" })
             .setArtworkUri(artworkUriString?.let { Uri.parse(it) })
             .setExtras(extras)
             .build()
 
         return MediaItem.Builder()
             .setUri(Uri.parse(uriString))
-            .setMediaId(song.id)
+            .setMediaId(songWithState.id)
             .setMediaMetadata(metadata)
             .build()
     }
@@ -837,13 +839,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val targetFile = File(downloadDir, finalFileName)
 
             if (targetFile.exists()) {
-                _currentlyPlayingId.value = song.id
-                _currentPlayingSong.value = song
-                showPlaybackNotification(song)
+                val songWithState = updatePlayingSongWithDbState(song)
+                _currentlyPlayingId.value = songWithState.id
+                _currentPlayingSong.value = songWithState
+                showPlaybackNotification(songWithState)
                 val p = exoPlayer ?: return@launch
                 p.stop()
                 p.clearMediaItems()
-                p.setMediaItem(buildMediaItem(song, targetFile.absolutePath))
+                p.setMediaItem(buildMediaItem(songWithState, targetFile.absolutePath))
                 p.prepare()
                 p.play()
             } else {
@@ -888,32 +891,33 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             if (_activePlayingList.value.isEmpty()) {
                 _activePlayingList.value = _songsToSwipe.value
             }
-            _currentlyPlayingId.value = workingSong.id
-            _currentPlayingSong.value = workingSong
-            showPlaybackNotification(workingSong)
+            val songWithState = updatePlayingSongWithDbState(workingSong)
+            _currentlyPlayingId.value = songWithState.id
+            _currentPlayingSong.value = songWithState
+            showPlaybackNotification(songWithState)
             _isSongLoading.value = true
             val p = exoPlayer ?: return@launch
             p.stop()
             p.clearMediaItems()
             try {
                 if (forceRefreshSource) {
-                    bufferedStreamUrls.remove(workingSong.id)
+                    bufferedStreamUrls.remove(songWithState.id)
                 }
-                var streamUrl = bufferedStreamUrls[workingSong.id]
+                var streamUrl = bufferedStreamUrls[songWithState.id]
                 if (streamUrl == null) {
-                    streamUrl = repository.getStreamUrl(workingSong.youtubeUrl)
-                    if (streamUrl != null) bufferedStreamUrls[workingSong.id] = streamUrl
+                    streamUrl = repository.getStreamUrl(songWithState.youtubeUrl)
+                    if (streamUrl != null) bufferedStreamUrls[songWithState.id] = streamUrl
                 }
                 if (!coroutineContext.isActive) return@launch
                 if (streamUrl != null) {
                     _errorMessage.value = null
                     p.stop()
                     p.clearMediaItems()
-                    p.setMediaItem(buildMediaItem(workingSong, streamUrl))
+                    p.setMediaItem(buildMediaItem(songWithState, streamUrl))
                     p.prepare()
                     p.play()
                 } else {
-                    _errorMessage.value = "Could not fetch stream URL for ${workingSong.title}"
+                    _errorMessage.value = "Could not fetch stream URL for ${songWithState.title}"
                 }
             } catch (e: Exception) {
                 _errorMessage.value = "Playback error: ${e.message}"
@@ -1090,8 +1094,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             combine(canGoPreviousInContext, canGoNextInContext) { prev, next ->
                 Pair(prev, next)
             }.collect { (prev, next) ->
-                PlaybackStateHolder.canGoPrevious = prev
-                PlaybackStateHolder.canGoNext = next
+                // todo need to update extras here
             }
         }
 

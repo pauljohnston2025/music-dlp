@@ -19,7 +19,6 @@ import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
 import com.example.musicdlp.MusicDLPApplication
 import com.example.musicdlp.R
-import com.example.musicdlp.data.PlaybackStateHolder
 import com.example.musicdlp.data.Song
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
@@ -85,11 +84,13 @@ class MusicLibraryService : MediaLibraryService() {
             }
 
             override fun hasNextMediaItem(): Boolean {
-                return PlaybackStateHolder.canGoNext
+                val extras = currentMediaItem?.mediaMetadata?.extras
+                return extras?.getBoolean("canGoNext", false) ?: false
             }
 
             override fun hasPreviousMediaItem(): Boolean {
-                return PlaybackStateHolder.canGoPrevious
+                val extras = currentMediaItem?.mediaMetadata?.extras
+                return extras?.getBoolean("canGoPrevious", false) ?: false
             }
 
             override fun seekToNext() {
