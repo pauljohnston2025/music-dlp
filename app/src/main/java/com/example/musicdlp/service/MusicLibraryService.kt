@@ -40,6 +40,8 @@ class MusicLibraryService : MediaLibraryService() {
     private val customCommandLike = SessionCommand(CUSTOM_ACTION_LIKE, Bundle.EMPTY)
     private val customCommandDislike = SessionCommand(CUSTOM_ACTION_DISLIKE, Bundle.EMPTY)
 
+    private val playerListeners = mutableSetOf<Player.Listener>()
+
     @OptIn(UnstableApi::class)
     override fun onCreate() {
         super.onCreate()
@@ -53,9 +55,26 @@ class MusicLibraryService : MediaLibraryService() {
             override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
                 updateNotificationLayout(exoPlayer.currentMediaItem)
             }
+
+            override fun onEvents(player: Player, events: Player.Events) {
+                if (events.contains(Player.EVENT_MEDIA_METADATA_CHANGED) ||
+                    events.contains(Player.EVENT_TIMELINE_CHANGED)) {
+                    updateNotificationLayout(player.currentMediaItem)
+                }
+            }
         })
 
         forwardingPlayer = object : ForwardingPlayer(exoPlayer) {
+            override fun addListener(listener: Player.Listener) {
+                super.addListener(listener)
+                playerListeners.add(listener)
+            }
+
+            override fun removeListener(listener: Player.Listener) {
+                super.removeListener(listener)
+                playerListeners.remove(listener)
+            }
+
             override fun getAvailableCommands(): Player.Commands {
                 val builder = super.getAvailableCommands().buildUpon()
                 if (hasNextMediaItem()) {
@@ -154,7 +173,23 @@ class MusicLibraryService : MediaLibraryService() {
     }
 
     private fun updateNotificationLayout(mediaItem: MediaItem?) {
-        mediaSession?.setCustomLayout(buildCustomLayout(mediaItem))
+        val session = mediaSession ?: return
+
+        // 1. Refresh custom action buttons (Like / Dislike)
+        session.setCustomLayout(buildCustomLayout(mediaItem))
+
+        // 2. Force Media3 to refresh available commands on all connected controllers (including System UI)
+        val updatedCommands = forwardingPlayer.availableCommands
+        for (controller in session.connectedControllers) {
+            session.setAvailableCommands(
+                controller,
+                MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+                    .add(customCommandLike)
+                    .add(customCommandDislike)
+                    .build(),
+                updatedCommands
+            )
+        }
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {

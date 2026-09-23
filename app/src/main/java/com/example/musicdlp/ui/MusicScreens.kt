@@ -42,6 +42,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -61,6 +63,8 @@ fun SwipingScreen(viewModel: MusicViewModel) {
     val playlistLikedSongs by viewModel.playlistLikedSongs.collectAsState()
     val playlistDislikedSongs by viewModel.playlistDislikedSongs.collectAsState()
     val playlistNewSongs by viewModel.playlistNewSongs.collectAsState()
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
 
     val uniqueLiked = remember(playlistLikedSongs) {
         playlistLikedSongs.distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
@@ -172,6 +176,11 @@ fun SwipingScreen(viewModel: MusicViewModel) {
     fun performSearchOrLoad() {
         val query = searchOrUrlInput.trim()
         if (query.isBlank()) return
+
+        // Dismiss the software keyboard and drop cursor focus
+        keyboardController?.hide()
+        focusManager.clearFocus()
+
         if (query.startsWith("http://", true) ||
             query.startsWith("https://", true) ||
             query.contains("youtube.com", true) ||
