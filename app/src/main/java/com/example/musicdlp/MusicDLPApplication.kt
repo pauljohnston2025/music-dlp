@@ -2,6 +2,7 @@ package com.example.musicdlp
 
 import android.app.Application
 import com.example.musicdlp.data.AppDatabase
+import com.example.musicdlp.data.Song
 import androidx.room.Room
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLException
@@ -14,11 +15,14 @@ class MusicDLPApplication : Application() {
     lateinit var database: AppDatabase
         private set
 
+    @Volatile
+    var currentQueue: List<Song> = emptyList()
+
     override fun onCreate() {
         super.onCreate()
 
         Napier.base(DebugAntilog())
-        
+
         database = Room.databaseBuilder(
             applicationContext,
             AppDatabase::class.java, "musicdlp-database"

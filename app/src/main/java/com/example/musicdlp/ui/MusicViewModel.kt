@@ -97,8 +97,37 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }, MoreExecutors.directExecutor())
     }
 
+    private fun updateAppQueue() {
+        val allSongs = (playlistLikedSongs.value + playlistDislikedSongs.value + playlistNewSongs.value + songsToSwipe.value).distinctBy { it.id }
+        app.currentQueue = allSongs
+        val intent = Intent("com.example.musicdlp.ACTION_QUEUE_CHANGED").apply { setPackage(app.packageName) }
+        app.sendBroadcast(intent)
+    }
+
     private fun setupControllerListener() {
         controller?.addListener(object : Player.Listener {
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                val mediaId = mediaItem?.mediaId ?: return
+                if (mediaId == "no_more_songs" || mediaId == "ROOT") return
+
+                if (_currentlyPlayingId.value == mediaId) return
+
+                viewModelScope.launch(Dispatchers.IO) {
+                    val song = songDao.getSongById(mediaId)
+                        ?: app.currentQueue.firstOrNull { it.id == mediaId }
+                        ?: _songsToSwipe.value.firstOrNull { it.id == mediaId }
+
+                    if (song != null) {
+                        val songWithState = updatePlayingSongWithDbState(song)
+                        withContext(Dispatchers.Main) {
+                            _currentlyPlayingId.value = songWithState.id
+                            _currentPlayingSong.value = songWithState
+                            jumpToSongInSwipeList(songWithState)
+                        }
+                    }
+                }
+            }
+
             override fun onPlayerError(error: PlaybackException) {
                 Napier.e("Player error: ${error.message}", tag = "DEBUG_METADATA")
                 val currentSong = _currentPlayingSong.value
@@ -156,12 +185,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
         current.add(song)
         _playlistLikedSongs.value = current
+        updateAppQueue()
     }
 
     private fun removePlaylistLikedSong(song: Song) {
         val current = _playlistLikedSongs.value.toMutableList()
         current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
         _playlistLikedSongs.value = current
+        updateAppQueue()
     }
 
     private fun addPlaylistDislikedSong(song: Song) {
@@ -169,12 +200,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
         current.add(song)
         _playlistDislikedSongs.value = current
+        updateAppQueue()
     }
 
     private fun removePlaylistDislikedSong(song: Song) {
         val current = _playlistDislikedSongs.value.toMutableList()
         current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
         _playlistDislikedSongs.value = current
+        updateAppQueue()
     }
 
     private fun addPlaylistNewSong(song: Song) {
@@ -182,12 +215,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
         current.add(song)
         _playlistNewSongs.value = current
+        updateAppQueue()
     }
 
     private fun removePlaylistNewSong(song: Song) {
         val current = _playlistNewSongs.value.toMutableList()
         current.removeAll { it.id == song.id || (it.title.equals(song.title, ignoreCase = true) && it.artist.equals(song.artist, ignoreCase = true)) }
         _playlistNewSongs.value = current
+        updateAppQueue()
     }
 
     private suspend fun prescanAndCategorize(rawSongs: List<Song>) = withContext(Dispatchers.IO) {
@@ -220,6 +255,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         _playlistLikedSongs.value = liked.distinctBy { it.id }
         _playlistDislikedSongs.value = disliked.distinctBy { it.id }
         _playlistNewSongs.value = newSongs.distinctBy { it.id }
+        updateAppQueue()
     }
 
     private val skippedHistory = mutableListOf<Song>()
@@ -456,6 +492,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) updatedSong else it }
+                updateAppQueue()
                 _promptForSongName.value = null
             }
         }
@@ -517,6 +554,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     if (nextFromQueue != null) {
                         _songsToSwipe.value = workingSongs + nextFromQueue
+                        updateAppQueue()
                         continue
                     }
                 }
@@ -580,6 +618,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     }
 
                     _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == songToProcess.id) cleanedSong else it }
+                    updateAppQueue()
 
                     if (_currentlyPlayingId.value == null && _songsToSwipe.value.firstOrNull()?.id == cleanedSong.id) {
                         playPreview(cleanedSong)
@@ -642,11 +681,47 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 removePlaylistDislikedSong(previousSong)
 
                 _songsToSwipe.value = listOf(previousSong) + _songsToSwipe.value
+                updateAppQueue()
                 if (processedCount > 0) processedCount--
                 _playlistIndex.value = (processedCount + 1).coerceAtLeast(1)
 
                 playPreview(previousSong)
             }
+        }
+    }
+
+    fun jumpToSongInSwipeList(targetSong: Song) {
+        viewModelScope.launch {
+            controller?.pause()
+            val currentDeck = _songsToSwipe.value
+            val index = currentDeck.indexOfFirst { song ->
+                song.id == targetSong.id ||
+                song.containsYoutubeUrlOrId(targetSong.id) ||
+                song.containsYoutubeUrlOrId(targetSong.youtubeUrl) ||
+                (song.title.equals(targetSong.title, ignoreCase = true) && song.artist.equals(targetSong.artist, ignoreCase = true))
+            }
+
+            if (index > 0) {
+                val skipped = currentDeck.take(index)
+                skippedHistory.addAll(skipped)
+                _canGoBack.value = skippedHistory.isNotEmpty()
+                processedCount += index
+                _playlistIndex.value = (processedCount + 1).coerceAtLeast(1)
+
+                val newDeck = currentDeck.drop(index)
+                _songsToSwipe.value = newDeck
+                updateAppQueue()
+                val match = newDeck.firstOrNull() ?: targetSong
+                playPreview(match)
+            } else if (index == 0) {
+                val match = currentDeck.first()
+                playPreview(match)
+            } else {
+                _songsToSwipe.value = listOf(targetSong) + currentDeck
+                updateAppQueue()
+                playPreview(targetSong)
+            }
+            processQueue()
         }
     }
 
@@ -667,6 +742,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val currentList = _songsToSwipe.value
         if (currentList.isNotEmpty()) {
             _songsToSwipe.value = currentList.drop(1)
+            updateAppQueue()
             processedCount++
             _playlistIndex.value = processedCount + 1
         }
@@ -1074,7 +1150,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     _currentPlayingSong.value = songWithState
                     showPlaybackNotification(songWithState)
                     val p = getMediaController() ?: return@launch
-                    p.stop()
                     p.setMediaItem(buildMediaItem(songWithState, localFile.absolutePath))
                     p.prepare()
                     p.play()
@@ -1084,7 +1159,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     _currentPlayingSong.value = songWithState
                     showPlaybackNotification(songWithState)
                     val p = getMediaController() ?: return@launch
-                    p.stop()
                     p.setMediaItem(buildMediaItem(songWithState, song.youtubeUrl))
                     p.prepare()
                     p.play()
@@ -1131,6 +1205,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         isMetadataCleaned = true
                     )
                     _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) workingSong else it }
+                    updateAppQueue()
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {}
@@ -1146,7 +1221,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
             val pInitial = getMediaController()
             if (pInitial != null) {
-                pInitial.stop()
                 pInitial.setMediaItem(buildMediaItem(songWithState, "http://dummy"))
             }
 
@@ -1207,6 +1281,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         _playlistLikedSongs.value = emptyList()
         _playlistDislikedSongs.value = emptyList()
         _playlistNewSongs.value = emptyList()
+        updateAppQueue()
     }
 
     fun searchPlaylists(query: String) {

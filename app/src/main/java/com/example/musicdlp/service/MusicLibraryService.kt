@@ -1,10 +1,14 @@
 package com.example.musicdlp.service
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import androidx.annotation.OptIn
+import androidx.core.content.ContextCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
@@ -48,6 +52,76 @@ class MusicLibraryService : MediaLibraryService() {
     private val customCommandDislike = SessionCommand(CUSTOM_ACTION_DISLIKE, Bundle.EMPTY)
 
     private val playerListeners = mutableSetOf<Player.Listener>()
+
+    @Volatile
+    private var lastNowPlayingParams: LibraryParams? = null
+    @Volatile
+    private var lastRootParams: LibraryParams? = null
+    @Volatile
+    private var lastLikedParams: LibraryParams? = null
+    @Volatile
+    private var lastDislikedParams: LibraryParams? = null
+
+    private val queueReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "com.example.musicdlp.ACTION_QUEUE_CHANGED") {
+                val app = application as? MusicDLPApplication ?: return
+                val queue = app.currentQueue
+                val queueCount = queue.size
+                Napier.d("queueReceiver ACTION_QUEUE_CHANGED received, queueCount=$queueCount", tag = "DEBUG_METADATA")
+
+                val session = mediaSession ?: return
+                val connected = session.connectedControllers
+
+                fun notifyTarget(target: String, count: Int, savedParams: LibraryParams?) {
+                    try {
+                        if (savedParams != null) {
+                            for (controller in connected) {
+                                session.notifyChildrenChanged(controller, target, count, savedParams)
+                            }
+                            session.notifyChildrenChanged(target, count, savedParams)
+                        }
+
+                        for (controller in connected) {
+                            session.notifyChildrenChanged(controller, target, count, null)
+                        }
+                        session.notifyChildrenChanged(target, count, null)
+                    } catch (e: Exception) {
+                        Napier.w("notifyChildrenChanged failed for $target: ${e.message}", tag = "DEBUG_METADATA")
+                    }
+                }
+
+                notifyTarget("NOW_PLAYING", queueCount, lastNowPlayingParams)
+                notifyTarget("now_playing", queueCount, lastNowPlayingParams)
+                notifyTarget("ROOT", 3, lastRootParams)
+                notifyTarget("root", 3, lastRootParams)
+                notifyTarget("LIKED", 0, lastLikedParams)
+                notifyTarget("DISLIKED", 0, lastDislikedParams)
+
+                if (queue.isNotEmpty()) {
+                    serviceScope.launch(Dispatchers.Main) {
+                        try {
+                            val mediaItems = queue.map { it.toMediaItem() }
+                            val currentMediaId = exoPlayer.currentMediaItem?.mediaId
+                            val targetIndex = if (currentMediaId != null) {
+                                mediaItems.indexOfFirst { it.mediaId == currentMediaId }.coerceAtLeast(0)
+                            } else 0
+
+                            val isPlaying = exoPlayer.isPlaying
+                            val currentPos = exoPlayer.currentPosition
+
+                            exoPlayer.setMediaItems(mediaItems, targetIndex, currentPos)
+                            if (isPlaying) {
+                                exoPlayer.play()
+                            }
+                        } catch (e: Exception) {
+                            Napier.w("Failed to update exoPlayer queue timeline: ${e.message}", tag = "DEBUG_METADATA")
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     @OptIn(UnstableApi::class)
     override fun onCreate() {
@@ -147,6 +221,9 @@ class MusicLibraryService : MediaLibraryService() {
                 .setChannelName(R.string.app_name)
                 .build()
         )
+
+        val filter = IntentFilter("com.example.musicdlp.ACTION_QUEUE_CHANGED")
+        ContextCompat.registerReceiver(this, queueReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 
     private fun buildCustomLayout(mediaItem: MediaItem?): ImmutableList<CommandButton> {
@@ -159,16 +236,18 @@ class MusicLibraryService : MediaLibraryService() {
 
         @Suppress("DEPRECATION")
         val likeBtn = CommandButton.Builder()
-            .setDisplayName("Like")
+            .setDisplayName(if (isLiked) "Liked" else "Like")
             .setIconResId(likeIcon)
             .setSessionCommand(customCommandLike)
+            .setEnabled(true)
             .build()
 
         @Suppress("DEPRECATION")
         val dislikeBtn = CommandButton.Builder()
-            .setDisplayName("Dislike")
+            .setDisplayName(if (isDisliked) "Disliked" else "Dislike")
             .setIconResId(dislikeIcon)
             .setSessionCommand(customCommandDislike)
+            .setEnabled(true)
             .build()
 
         return ImmutableList.of(likeBtn, dislikeBtn)
@@ -196,6 +275,7 @@ class MusicLibraryService : MediaLibraryService() {
     }
 
     override fun onDestroy() {
+        try { unregisterReceiver(queueReceiver) } catch (e: Exception) {}
         mediaSession?.run {
             player.release()
             release()
@@ -212,6 +292,11 @@ class MusicLibraryService : MediaLibraryService() {
             session: MediaSession,
             controller: MediaSession.ControllerInfo
         ): MediaSession.ConnectionResult {
+            Napier.d(
+                "Connection request from ${controller.packageName} (isPackageNameVerified=${controller.isPackageNameVerified}) (isTrusted=${controller.isTrusted})",
+                tag = "DEBUG_METADATA"
+            )
+
             val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
                 .add(customCommandLike)
                 .add(customCommandDislike)
@@ -222,7 +307,6 @@ class MusicLibraryService : MediaLibraryService() {
 
             @Suppress("DEPRECATION")
             return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
-                .setAvailableSessionCommands(sessionCommands)
                 .setAvailablePlayerCommands(playerCommands)
                 .setCustomLayout(layout)
                 .build()
@@ -254,6 +338,10 @@ class MusicLibraryService : MediaLibraryService() {
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<MediaItem>> {
             Napier.d("onGetLibraryRoot called by ${browser.packageName}", tag = "DEBUG_METADATA")
+
+            if (params != null) {
+                lastRootParams = params
+            }
 
             val rootExtras = Bundle().apply {
                 putBoolean("android.media.browse.SEARCH_SUPPORTED", true)
@@ -300,22 +388,31 @@ class MusicLibraryService : MediaLibraryService() {
                 try {
                     val app = application as MusicDLPApplication
                     val children = when (parentId.uppercase()) {
-                        "ROOT", "/", "MEDIA_ROOT" -> listOf(
-                            createBrowsableItem("NOW_PLAYING", "Now Playing / Queue"),
-                            createBrowsableItem("LIKED", "Liked Songs"),
-                            createBrowsableItem("DISLIKED", "Disliked Songs")
-                        )
+                        "ROOT", "/", "MEDIA_ROOT" -> {
+                            if (params != null) lastRootParams = params
+                            listOf(
+                                createBrowsableItem("NOW_PLAYING", "Now Playing / Queue"),
+                                createBrowsableItem("LIKED", "Liked Songs"),
+                                createBrowsableItem("DISLIKED", "Disliked Songs")
+                            )
+                        }
                         "NOW_PLAYING" -> {
-                            val liked = app.database.songDao().getLikedSongsList()
-                            val all = app.database.songDao().getAllSongs()
-                            val items = (if (liked.isNotEmpty()) liked else all).map { it.toMediaItem() }
-                            items
+                            if (params != null) lastNowPlayingParams = params
+                            val queue = app.currentQueue
+                            if (queue.isNotEmpty()) {
+                                queue.map { it.toMediaItem() }
+                            } else {
+                                val liked = app.database.songDao().getLikedSongsList()
+                                liked.map { it.toMediaItem() }
+                            }
                         }
                         "LIKED" -> {
+                            if (params != null) lastLikedParams = params
                             val liked = app.database.songDao().getLikedSongsList()
                             liked.map { it.toMediaItem() }
                         }
                         "DISLIKED" -> {
+                            if (params != null) lastDislikedParams = params
                             val disliked = app.database.songDao().getDislikedSongsList()
                             disliked.map { it.toMediaItem() }
                         }
@@ -353,7 +450,7 @@ class MusicLibraryService : MediaLibraryService() {
 
                     for (item in mediaItems) {
                         val mediaId = item.mediaId
-                        val dbSong = app.database.songDao().getSongById(mediaId)
+                        val dbSong = app.database.songDao().getSongById(mediaId) ?: app.currentQueue.firstOrNull { it.id == mediaId }
 
                         val playableUriStr: String? = if (dbSong != null) {
                             val safeArtist = dbSong.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
@@ -418,7 +515,7 @@ class MusicLibraryService : MediaLibraryService() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val app = application as MusicDLPApplication
-                    val song = app.database.songDao().getSongById(mediaId)
+                    val song = app.database.songDao().getSongById(mediaId) ?: app.currentQueue.firstOrNull { it.id == mediaId }
                     if (song != null) {
                         settableFuture.set(LibraryResult.ofItem(song.toMediaItem(), null))
                     } else {

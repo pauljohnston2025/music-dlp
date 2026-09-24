@@ -40,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
@@ -75,10 +76,14 @@ fun SwipingScreen(viewModel: MusicViewModel) {
     val uniqueNew = remember(playlistNewSongs) {
         playlistNewSongs.distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
     }
+    val uniqueAll = remember(uniqueLiked, uniqueDisliked, uniqueNew, songs) {
+        (uniqueLiked + uniqueDisliked + uniqueNew + songs).distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
+    }
 
     var showLikedPlaylistDialog by remember { mutableStateOf(false) }
     var showDislikedPlaylistDialog by remember { mutableStateOf(false) }
     var showNewPlaylistDialog by remember { mutableStateOf(false) }
+    var showAllPlaylistDialog by remember { mutableStateOf(false) }
 
     if (showLikedPlaylistDialog) {
         FilteredSongsDialog(
@@ -104,6 +109,15 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             songs = uniqueNew,
             viewModel = viewModel,
             onDismiss = { showNewPlaylistDialog = false }
+        )
+    }
+
+    if (showAllPlaylistDialog) {
+        FilteredSongsDialog(
+            title = "All Songs in Playlist",
+            songs = uniqueAll,
+            viewModel = viewModel,
+            onDismiss = { showAllPlaylistDialog = false }
         )
     }
 
@@ -243,53 +257,50 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             }
         }
 
-        // 3. Static Chips Row: Liked, Disliked, New
-        if (playlistTotal > 0 || uniqueLiked.isNotEmpty() || uniqueDisliked.isNotEmpty() || uniqueNew.isNotEmpty()) {
+        // 3. Static Chips Row: Liked, Disliked, New, All
+        if (playlistTotal > 0 || uniqueLiked.isNotEmpty() || uniqueDisliked.isNotEmpty() || uniqueNew.isNotEmpty() || uniqueAll.isNotEmpty()) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(vertical = 4.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                AssistChip(
-                    onClick = { showLikedPlaylistDialog = true },
+                CompactCategoryChip(
+                    count = uniqueLiked.size,
+                    label = "liked",
+                    icon = Icons.Default.Favorite,
+                    iconColor = if (uniqueLiked.isNotEmpty()) Color.Red else Color.Gray,
                     enabled = uniqueLiked.isNotEmpty(),
-                    label = { Text("${uniqueLiked.size} liked") },
-                    leadingIcon = {
-                        Icon(
-                            imageVector = Icons.Default.Favorite,
-                            contentDescription = null,
-                            tint = if (uniqueLiked.isNotEmpty()) Color.Red else Color.Gray,
-                            modifier = Modifier.size(14.dp)
-                        )
-                    }
+                    onClick = { showLikedPlaylistDialog = true },
+                    modifier = Modifier.weight(1f)
                 )
-                AssistChip(
-                    onClick = { showDislikedPlaylistDialog = true },
+                CompactCategoryChip(
+                    count = uniqueDisliked.size,
+                    label = "disliked",
+                    icon = Icons.Default.Close,
+                    iconColor = Color.Gray,
                     enabled = uniqueDisliked.isNotEmpty(),
-                    label = { Text("${uniqueDisliked.size} disliked") },
-                    leadingIcon = {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = null,
-                            tint = Color.Gray,
-                            modifier = Modifier.size(14.dp)
-                        )
-                    }
+                    onClick = { showDislikedPlaylistDialog = true },
+                    modifier = Modifier.weight(1f)
                 )
-                AssistChip(
-                    onClick = { showNewPlaylistDialog = true },
+                CompactCategoryChip(
+                    count = uniqueNew.size,
+                    label = "new",
+                    icon = Icons.Default.MusicNote,
+                    iconColor = MaterialTheme.colorScheme.primary,
                     enabled = uniqueNew.isNotEmpty(),
-                    label = { Text("${uniqueNew.size} new") },
-                    leadingIcon = {
-                        Icon(
-                            imageVector = Icons.Default.MusicNote,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(14.dp)
-                        )
-                    }
+                    onClick = { showNewPlaylistDialog = true },
+                    modifier = Modifier.weight(1f)
+                )
+                CompactCategoryChip(
+                    count = uniqueAll.size,
+                    label = "all",
+                    icon = Icons.Default.Layers,
+                    iconColor = MaterialTheme.colorScheme.secondary,
+                    enabled = uniqueAll.isNotEmpty(),
+                    onClick = { showAllPlaylistDialog = true },
+                    modifier = Modifier.weight(1f)
                 )
             }
             Spacer(modifier = Modifier.height(4.dp))
@@ -1222,9 +1233,8 @@ fun FilteredSongsDialog(
                                     .fillMaxWidth()
                                     .padding(vertical = 4.dp)
                                     .clickable {
-                                        viewModel.playLikedSong(song) {
-                                            viewModel.playPreview(song)
-                                        }
+                                        onDismiss()
+                                        viewModel.jumpToSongInSwipeList(song)
                                     }
                             ) {
                                 Row(
@@ -1306,4 +1316,44 @@ fun FilteredSongsDialog(
             }
         }
     )
+}
+
+@Composable
+fun CompactCategoryChip(
+    count: Int,
+    label: String,
+    icon: ImageVector,
+    iconColor: Color,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (enabled) 0.85f else 0.35f),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (enabled) iconColor else Color.Gray,
+                modifier = Modifier.size(13.dp)
+            )
+            Spacer(modifier = Modifier.width(3.dp))
+            Text(
+                text = "$count $label",
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
+            )
+        }
+    }
 }
