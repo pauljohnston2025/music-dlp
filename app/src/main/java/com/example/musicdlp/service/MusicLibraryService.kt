@@ -53,95 +53,18 @@ class MusicLibraryService : MediaLibraryService() {
 
     private val playerListeners = mutableSetOf<Player.Listener>()
 
-    @Volatile
-    private var lastNowPlayingParams: LibraryParams? = null
-    @Volatile
-    private var lastRootParams: LibraryParams? = null
-    @Volatile
-    private var lastLikedParams: LibraryParams? = null
-    @Volatile
-    private var lastDislikedParams: LibraryParams? = null
-
-    private var queueNotifyJob: Job? = null
-
     private val queueReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.example.musicdlp.ACTION_QUEUE_CHANGED") {
-                queueNotifyJob?.cancel()
-                queueNotifyJob = serviceScope.launch(Dispatchers.Main) {
-                    delay(300)
-                    val app = application as? MusicDLPApplication ?: return@launch
-                    val queue = app.currentQueue
-                    val queueCount = queue.size
-                    Napier.d("Consolidated queue notification sending, queueCount=$queueCount", tag = "DEBUG_METADATA")
+                val app = application as? MusicDLPApplication ?: return
+                val queue = app.currentQueue
+                val queueCount = queue.size
+                val session = mediaSession ?: return
 
-                    val session = mediaSession ?: return@launch
-
-                    // Extract all ExoPlayer properties on Dispatchers.Main
-                    val currentMediaId = exoPlayer.currentMediaItem?.mediaId
-                    val currentMediaUriStr = exoPlayer.currentMediaItem?.localConfiguration?.uri?.toString()
-                    val isPlaying = exoPlayer.isPlaying
-                    val currentPos = exoPlayer.currentPosition
-
-                    if (queue.isNotEmpty()) {
-                        val resolvedItems = withContext(Dispatchers.IO) {
-                            try {
-                                queue.map { song ->
-                                    val safeArtist = song.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
-                                    val safeTitle = song.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
-                                    val finalFileName = "$safeArtist - $safeTitle.mp3"
-                                    val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
-                                    val downloadDir = File(publicMusicDir, "MusicDLP")
-                                    val targetFile = File(downloadDir, finalFileName)
-
-                                    val playablePath = if (targetFile.exists()) {
-                                        targetFile.absolutePath
-                                    } else if (song.youtubeUrl.startsWith("content://") || song.youtubeUrl.startsWith("file://") || song.youtubeUrl.startsWith("/")) {
-                                        song.youtubeUrl
-                                    } else if (song.id == currentMediaId && currentMediaUriStr != null) {
-                                        currentMediaUriStr
-                                    } else {
-                                        "http://dummy"
-                                    }
-
-                                    song.toMediaItem().buildUpon()
-                                        .setUri(if (playablePath.startsWith("/")) Uri.fromFile(File(playablePath)) else Uri.parse(playablePath))
-                                        .build()
-                                }
-                            } catch (e: Exception) {
-                                emptyList()
-                            }
-                        }
-
-                        if (resolvedItems.isNotEmpty()) {
-                            try {
-                                val targetIndex = if (currentMediaId != null) {
-                                    resolvedItems.indexOfFirst { it.mediaId == currentMediaId }.coerceAtLeast(0)
-                                } else 0
-
-                                exoPlayer.setMediaItems(resolvedItems, targetIndex, currentPos)
-                                if (isPlaying) {
-                                    exoPlayer.play()
-                                }
-                            } catch (e: Exception) {
-                                Napier.w("Failed to update exoPlayer queue timeline: ${e.message}", tag = "DEBUG_METADATA")
-                            }
-                        }
-                    }
-
-                    // Cleanly notify MediaSession subcribers that NOW_PLAYING children changed
-                    try {
-                        val params = lastNowPlayingParams
-                        if (params != null) {
-                            session.notifyChildrenChanged("NOW_PLAYING", queueCount, params)
-                        }
-                        session.notifyChildrenChanged("NOW_PLAYING", queueCount, null)
-                    } catch (e: Exception) {
-                        Napier.w("notifyChildrenChanged failed for NOW_PLAYING: ${e.message}", tag = "DEBUG_METADATA")
-                    }
-                }
+                session.notifyChildrenChanged("NOW_PLAYING", queueCount, null)
             }
         }
+
     }
 
     @OptIn(UnstableApi::class)
@@ -359,14 +282,10 @@ class MusicLibraryService : MediaLibraryService() {
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<Void>> {
             Napier.d("onSubscribe called for parentId=$parentId by ${browser.packageName}", tag = "DEBUG_METADATA")
-            if (params != null) {
-                when (parentId.uppercase()) {
-                    "NOW_PLAYING" -> lastNowPlayingParams = params
-                    "ROOT", "/", "MEDIA_ROOT" -> lastRootParams = params
-                    "LIKED" -> lastLikedParams = params
-                    "DISLIKED" -> lastDislikedParams = params
-                }
-            }
+            // on subscribe is called with parentId (NOW_PLAYING, LIKED, DISLIKED, ROOT), we
+            // override the default to prevent it calling onGetItem with the parentId
+            // if we do not do this, it defaults to returning ERROR_NOT_SUPPORTED because our
+            // onGetItem returns null when its not a song
             return Futures.immediateFuture(LibraryResult.ofVoid())
         }
 
@@ -377,10 +296,6 @@ class MusicLibraryService : MediaLibraryService() {
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<MediaItem>> {
             Napier.d("onGetLibraryRoot called by ${browser.packageName}", tag = "DEBUG_METADATA")
-
-            if (params != null) {
-                lastRootParams = params
-            }
 
             val rootExtras = Bundle().apply {
                 putBoolean("android.media.browse.SEARCH_SUPPORTED", true)
@@ -428,7 +343,6 @@ class MusicLibraryService : MediaLibraryService() {
                     val app = application as MusicDLPApplication
                     val children = when (parentId.uppercase()) {
                         "ROOT", "/", "MEDIA_ROOT" -> {
-                            if (params != null) lastRootParams = params
                             listOf(
                                 createBrowsableItem("NOW_PLAYING", "Now Playing"),
                                 createBrowsableItem("LIKED", "Liked Songs"),
@@ -436,7 +350,6 @@ class MusicLibraryService : MediaLibraryService() {
                             )
                         }
                         "NOW_PLAYING" -> {
-                            if (params != null) lastNowPlayingParams = params
                             val queue = app.currentQueue
                             if (queue.isNotEmpty()) {
                                 queue.map { it.toMediaItem() }
@@ -446,12 +359,10 @@ class MusicLibraryService : MediaLibraryService() {
                             }
                         }
                         "LIKED" -> {
-                            if (params != null) lastLikedParams = params
                             val liked = app.database.songDao().getLikedSongsList()
                             liked.map { it.toMediaItem() }
                         }
                         "DISLIKED" -> {
-                            if (params != null) lastDislikedParams = params
                             val disliked = app.database.songDao().getDislikedSongsList()
                             disliked.map { it.toMediaItem() }
                         }
