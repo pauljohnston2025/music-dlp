@@ -62,61 +62,82 @@ class MusicLibraryService : MediaLibraryService() {
     @Volatile
     private var lastDislikedParams: LibraryParams? = null
 
+    private var queueNotifyJob: Job? = null
+
     private val queueReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.example.musicdlp.ACTION_QUEUE_CHANGED") {
-                val app = application as? MusicDLPApplication ?: return
-                val queue = app.currentQueue
-                val queueCount = queue.size
-                Napier.d("queueReceiver ACTION_QUEUE_CHANGED received, queueCount=$queueCount", tag = "DEBUG_METADATA")
+                queueNotifyJob?.cancel()
+                queueNotifyJob = serviceScope.launch(Dispatchers.Main) {
+                    delay(300)
+                    val app = application as? MusicDLPApplication ?: return@launch
+                    val queue = app.currentQueue
+                    val queueCount = queue.size
+                    Napier.d("Consolidated queue notification sending, queueCount=$queueCount", tag = "DEBUG_METADATA")
 
-                val session = mediaSession ?: return
-                val connected = session.connectedControllers
+                    val session = mediaSession ?: return@launch
 
-                fun notifyTarget(target: String, count: Int, savedParams: LibraryParams?) {
-                    try {
-                        if (savedParams != null) {
-                            for (controller in connected) {
-                                session.notifyChildrenChanged(controller, target, count, savedParams)
+                    // Extract all ExoPlayer properties on Dispatchers.Main
+                    val currentMediaId = exoPlayer.currentMediaItem?.mediaId
+                    val currentMediaUriStr = exoPlayer.currentMediaItem?.localConfiguration?.uri?.toString()
+                    val isPlaying = exoPlayer.isPlaying
+                    val currentPos = exoPlayer.currentPosition
+
+                    if (queue.isNotEmpty()) {
+                        val resolvedItems = withContext(Dispatchers.IO) {
+                            try {
+                                queue.map { song ->
+                                    val safeArtist = song.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                                    val safeTitle = song.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                                    val finalFileName = "$safeArtist - $safeTitle.mp3"
+                                    val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                                    val downloadDir = File(publicMusicDir, "MusicDLP")
+                                    val targetFile = File(downloadDir, finalFileName)
+
+                                    val playablePath = if (targetFile.exists()) {
+                                        targetFile.absolutePath
+                                    } else if (song.youtubeUrl.startsWith("content://") || song.youtubeUrl.startsWith("file://") || song.youtubeUrl.startsWith("/")) {
+                                        song.youtubeUrl
+                                    } else if (song.id == currentMediaId && currentMediaUriStr != null) {
+                                        currentMediaUriStr
+                                    } else {
+                                        "http://dummy"
+                                    }
+
+                                    song.toMediaItem().buildUpon()
+                                        .setUri(if (playablePath.startsWith("/")) Uri.fromFile(File(playablePath)) else Uri.parse(playablePath))
+                                        .build()
+                                }
+                            } catch (e: Exception) {
+                                emptyList()
                             }
-                            session.notifyChildrenChanged(target, count, savedParams)
                         }
 
-                        for (controller in connected) {
-                            session.notifyChildrenChanged(controller, target, count, null)
+                        if (resolvedItems.isNotEmpty()) {
+                            try {
+                                val targetIndex = if (currentMediaId != null) {
+                                    resolvedItems.indexOfFirst { it.mediaId == currentMediaId }.coerceAtLeast(0)
+                                } else 0
+
+                                exoPlayer.setMediaItems(resolvedItems, targetIndex, currentPos)
+                                if (isPlaying) {
+                                    exoPlayer.play()
+                                }
+                            } catch (e: Exception) {
+                                Napier.w("Failed to update exoPlayer queue timeline: ${e.message}", tag = "DEBUG_METADATA")
+                            }
                         }
-                        session.notifyChildrenChanged(target, count, null)
-                    } catch (e: Exception) {
-                        Napier.w("notifyChildrenChanged failed for $target: ${e.message}", tag = "DEBUG_METADATA")
                     }
-                }
 
-                notifyTarget("NOW_PLAYING", queueCount, lastNowPlayingParams)
-                notifyTarget("now_playing", queueCount, lastNowPlayingParams)
-                notifyTarget("ROOT", 3, lastRootParams)
-                notifyTarget("root", 3, lastRootParams)
-                notifyTarget("LIKED", 0, lastLikedParams)
-                notifyTarget("DISLIKED", 0, lastDislikedParams)
-
-                if (queue.isNotEmpty()) {
-                    serviceScope.launch(Dispatchers.Main) {
-                        try {
-                            val mediaItems = queue.map { it.toMediaItem() }
-                            val currentMediaId = exoPlayer.currentMediaItem?.mediaId
-                            val targetIndex = if (currentMediaId != null) {
-                                mediaItems.indexOfFirst { it.mediaId == currentMediaId }.coerceAtLeast(0)
-                            } else 0
-
-                            val isPlaying = exoPlayer.isPlaying
-                            val currentPos = exoPlayer.currentPosition
-
-                            exoPlayer.setMediaItems(mediaItems, targetIndex, currentPos)
-                            if (isPlaying) {
-                                exoPlayer.play()
-                            }
-                        } catch (e: Exception) {
-                            Napier.w("Failed to update exoPlayer queue timeline: ${e.message}", tag = "DEBUG_METADATA")
+                    // Cleanly notify MediaSession subcribers that NOW_PLAYING children changed
+                    try {
+                        val params = lastNowPlayingParams
+                        if (params != null) {
+                            session.notifyChildrenChanged("NOW_PLAYING", queueCount, params)
                         }
+                        session.notifyChildrenChanged("NOW_PLAYING", queueCount, null)
+                    } catch (e: Exception) {
+                        Napier.w("notifyChildrenChanged failed for NOW_PLAYING: ${e.message}", tag = "DEBUG_METADATA")
                     }
                 }
             }
@@ -331,6 +352,24 @@ class MusicLibraryService : MediaLibraryService() {
             return super.onCustomCommand(session, controller, customCommand, args)
         }
 
+        override fun onSubscribe(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            params: LibraryParams?
+        ): ListenableFuture<LibraryResult<Void>> {
+            Napier.d("onSubscribe called for parentId=$parentId by ${browser.packageName}", tag = "DEBUG_METADATA")
+            if (params != null) {
+                when (parentId.uppercase()) {
+                    "NOW_PLAYING" -> lastNowPlayingParams = params
+                    "ROOT", "/", "MEDIA_ROOT" -> lastRootParams = params
+                    "LIKED" -> lastLikedParams = params
+                    "DISLIKED" -> lastDislikedParams = params
+                }
+            }
+            return Futures.immediateFuture(LibraryResult.ofVoid())
+        }
+
         @Suppress("DEPRECATION")
         override fun onGetLibraryRoot(
             session: MediaLibrarySession,
@@ -391,7 +430,7 @@ class MusicLibraryService : MediaLibraryService() {
                         "ROOT", "/", "MEDIA_ROOT" -> {
                             if (params != null) lastRootParams = params
                             listOf(
-                                createBrowsableItem("NOW_PLAYING", "Now Playing / Queue"),
+                                createBrowsableItem("NOW_PLAYING", "Now Playing"),
                                 createBrowsableItem("LIKED", "Liked Songs"),
                                 createBrowsableItem("DISLIKED", "Disliked Songs")
                             )
@@ -419,12 +458,14 @@ class MusicLibraryService : MediaLibraryService() {
                         else -> emptyList()
                     }
 
-                    val itemExtras = Bundle().apply {
-                        putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
-                        putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
-                    }
-                    val resParams = LibraryParams.Builder().setExtras(itemExtras).build()
-                    settableFuture.set(LibraryResult.ofItemList(ImmutableList.copyOf(children), resParams))
+                    val returnParams = params ?: LibraryParams.Builder().setExtras(
+                        Bundle().apply {
+                            putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
+                            putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
+                        }
+                    ).build()
+
+                    settableFuture.set(LibraryResult.ofItemList(ImmutableList.copyOf(children), returnParams))
                 } catch (t: Throwable) {
                     Napier.e("onGetChildren failed for parentId=$parentId: ${t.message}", t, tag = "DEBUG_METADATA")
                     settableFuture.set(LibraryResult.ofItemList(ImmutableList.of(), params))
