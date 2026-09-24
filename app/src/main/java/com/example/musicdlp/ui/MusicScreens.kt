@@ -434,12 +434,35 @@ fun TinderCard(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
+                val isLocalFile = song.youtubeUrl.startsWith("content://") ||
+                                  song.youtubeUrl.startsWith("file://") ||
+                                  song.youtubeUrl.startsWith("/") ||
+                                  song.id.startsWith("local_")
+
+                val labelPrefix = if (isLocalFile) "File Name: " else "YouTube: "
+
                 Text(
-                    text = "YouTube: ${song.rawTitle?.ifBlank { null } ?: song.title.ifBlank { "Unknown" }}",
+                    text = "$labelPrefix${song.rawTitle?.ifBlank { null } ?: song.title.ifBlank { "Unknown" }}",
                     style = MaterialTheme.typography.bodySmall,
                     maxLines = 3,
                     modifier = Modifier.alpha(0.7f).fillMaxWidth()
                 )
+                if (song.isLiked || song.isDisliked) {
+                    AssistChip(
+                        onClick = { },
+                        enabled = false,
+                        label = { Text(if (song.isLiked) "Already Liked" else "Already Disliked") },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = if (song.isLiked) Icons.Default.Favorite else Icons.Default.Close,
+                                contentDescription = null,
+                                tint = if (song.isLiked) Color.Red else Color.Gray,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        },
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    )
+                }
                 if (!song.metadataSource.isNullOrBlank()) {
                     Text(
                         text = "Cleaned by: ${song.metadataSource}",
@@ -459,13 +482,21 @@ fun TinderCard(
                     editableArtist = song.artist
                 }
 
+                val isCleaned = song.isMetadataCleaned == true
+
                 OutlinedTextField(
                     value = editableTitle,
                     onValueChange = {
                         editableTitle = it
                         viewModel.updateSongNameAndArtist(song, it, editableArtist)
                     },
-                    label = { Text("Song Name") },
+                    enabled = isCleaned,
+                    label = { Text(if (isCleaned) "Song Name" else "Song Name (Cleaning...)") },
+                    trailingIcon = {
+                        if (!isCleaned) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        }
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -475,7 +506,13 @@ fun TinderCard(
                         editableArtist = it
                         viewModel.updateSongNameAndArtist(song, editableTitle, it)
                     },
-                    label = { Text("Artist Name") },
+                    enabled = isCleaned,
+                    label = { Text(if (isCleaned) "Artist Name" else "Artist Name (Cleaning...)") },
+                    trailingIcon = {
+                        if (!isCleaned) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        }
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
