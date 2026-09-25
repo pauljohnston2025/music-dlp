@@ -122,7 +122,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         withContext(Dispatchers.Main) {
                             _currentlyPlayingId.value = songWithState.id
                             _currentPlayingSong.value = songWithState
-                            jumpToSongInSwipeList(songWithState)
+
+                            val deck = _songsToSwipe.value
+                            val deckIndex = deck.indexOfFirst { it.id == songWithState.id }
+                            if (deckIndex > 0) {
+                                _songsToSwipe.value = deck.drop(deckIndex)
+                                updateAppQueue()
+                            }
+                            triggerProactivePrebuffering()
                         }
                     }
                 }
@@ -255,7 +262,81 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         _playlistLikedSongs.value = liked.distinctBy { it.id }
         _playlistDislikedSongs.value = disliked.distinctBy { it.id }
         _playlistNewSongs.value = newSongs.distinctBy { it.id }
+        updateSwipingDeck()
+    }
+
+    enum class SwipingMode(val displayName: String) {
+        ONLY_NEW("Only Categorise New"),
+        NEW_AND_LIKED("New and Liked"),
+        PLAY_ALL_RECATEGORISE("Play All / Recategorise")
+    }
+
+    private val _swipingMode = MutableStateFlow(SwipingMode.ONLY_NEW)
+    val swipingMode: StateFlow<SwipingMode> = _swipingMode
+
+    fun cycleSwipingMode() {
+        val nextMode = when (_swipingMode.value) {
+            SwipingMode.ONLY_NEW -> SwipingMode.NEW_AND_LIKED
+            SwipingMode.NEW_AND_LIKED -> SwipingMode.PLAY_ALL_RECATEGORISE
+            SwipingMode.PLAY_ALL_RECATEGORISE -> SwipingMode.ONLY_NEW
+        }
+        setSwipingMode(nextMode)
+    }
+
+    fun setSwipingMode(mode: SwipingMode) {
+        _swipingMode.value = mode
+        updateSwipingDeck()
+    }
+
+    private var prebufferJob: Job? = null
+
+    private fun triggerProactivePrebuffering() {
+        prebufferJob?.cancel()
+        prebufferJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(1000)
+            val queue = if (_activePlayingList.value.isNotEmpty()) _activePlayingList.value else _songsToSwipe.value
+            val currentId = _currentlyPlayingId.value
+            val currentIndex = queue.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+            val upcoming = queue.drop(currentIndex + 1).take(2)
+
+            for (song in upcoming) {
+                if (!isActive) break
+                if (repository.isRateLimited()) break
+                if (bufferedStreamUrls[song.id] == null &&
+                    !song.youtubeUrl.startsWith("content://") &&
+                    !song.youtubeUrl.startsWith("file://") &&
+                    !song.youtubeUrl.startsWith("/")) {
+                    try {
+                        Napier.d("Pre-buffering stream URL for: ${song.title}", tag = "DEBUG_METADATA")
+                        val url = repository.getStreamUrl(song.youtubeUrl)
+                        if (url != null) {
+                            bufferedStreamUrls[song.id] = url
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Napier.w("Failed to pre-buffer stream URL for ${song.title}: ${e.message}", tag = "DEBUG_METADATA")
+                    }
+                }
+                delay(1500)
+            }
+        }
+    }
+
+    fun updateSwipingDeck() {
+        val newSongs = _playlistNewSongs.value
+        val likedSongs = _playlistLikedSongs.value
+        val dislikedSongs = _playlistDislikedSongs.value
+
+        val deck = when (_swipingMode.value) {
+            SwipingMode.ONLY_NEW -> newSongs
+            SwipingMode.NEW_AND_LIKED -> (newSongs + likedSongs).distinctBy { it.id }
+            SwipingMode.PLAY_ALL_RECATEGORISE -> (newSongs + likedSongs + dislikedSongs).distinctBy { it.id }
+        }
+
+        _songsToSwipe.value = deck
         updateAppQueue()
+        triggerProactivePrebuffering()
     }
 
     private val skippedHistory = mutableListOf<Song>()
@@ -333,7 +414,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 "com.example.musicdlp.ACTION_DISLIKE" -> {
                     val song = _currentPlayingSong.value ?: _songsToSwipe.value.firstOrNull()
-                    song?.let { dislikeSong(it) }
+                    song?.let { dislikeSong(it, true) }
+                }
+                "com.example.musicdlp.ACTION_CYCLE_MODE" -> {
+                    cycleSwipingMode()
+                }
+                "com.example.musicdlp.ACTION_SET_MODE" -> {
+                    val modeStr = intent.getStringExtra("mode") ?: ""
+                    val mode = try { SwipingMode.valueOf(modeStr) } catch (e: Exception) { SwipingMode.ONLY_NEW }
+                    setSwipingMode(mode)
                 }
                 "com.example.musicdlp.ACTION_SEARCH_VOICE" -> {
                     val query = intent.getStringExtra("query") ?: ""
@@ -348,6 +437,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleVoiceSearch(query: String) {
+        setSwipingMode(SwipingMode.NEW_AND_LIKED)
         if (query.isBlank()) return
         val likedMatches = dbLikedSongsFlow.value.filter { song ->
             song.title.contains(query, ignoreCase = true) || song.artist.contains(query, ignoreCase = true)
@@ -469,6 +559,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 )
                 songDao.insertSong(updatedLiked)
+            } else if (matchingDisliked != null) {
+                val updatedDisliked = matchingDisliked.addAlternateVersion(
+                    AlternateVersion(
+                        youtubeUrl = song.youtubeUrl,
+                        rawTitle = song.rawTitle ?: song.title,
+                        thumbnailUrl = song.thumbnailUrl
+                    )
+                )
+                songDao.insertSong(updatedDisliked)
             }
 
             val updatedSong = song.copy(
@@ -492,6 +591,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) updatedSong else it }
+                val current = _currentPlayingSong.value
+                if (current != null && (current.id == song.id || current.title.equals(song.title, ignoreCase = true))) {
+                    _currentPlayingSong.value = updatedSong
+                }
                 updateAppQueue()
                 _promptForSongName.value = null
             }
@@ -595,6 +698,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                             )
                         )
                         songDao.insertSong(updatedLiked)
+                    } else if (matchingExistingDisliked != null) {
+                        val updatedDisliked = matchingExistingDisliked.addAlternateVersion(
+                            AlternateVersion(
+                                youtubeUrl = songToProcess.youtubeUrl,
+                                rawTitle = songToProcess.rawTitle ?: songToProcess.title,
+                                thumbnailUrl = songToProcess.thumbnailUrl
+                            )
+                        )
+                        songDao.insertSong(updatedDisliked)
                     }
 
                     val cleanedSong = songToProcess.copy(
@@ -630,26 +742,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 delay(100)
-            }
-
-            // Pre-buffer stream URLs for top 5 upcoming songs in the background
-            val upcoming = _songsToSwipe.value.take(5)
-            for (song in upcoming) {
-                if (bufferedStreamUrls[song.id] == null &&
-                    !song.youtubeUrl.startsWith("content://") &&
-                    !song.youtubeUrl.startsWith("file://") &&
-                    !song.youtubeUrl.startsWith("/")) {
-                    try {
-                        val url = repository.getStreamUrl(song.youtubeUrl)
-                        if (url != null) {
-                            bufferedStreamUrls[song.id] = url
-                        }
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        Napier.w("Failed to pre-buffer stream URL for ${song.title}: ${e.message}", tag = "DEBUG_METADATA")
-                    }
-                }
             }
         } finally {
             _isBuffering.value = false
@@ -727,12 +819,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun showNoMoreSongsPlaceholder() {
         viewModelScope.launch {
-            _currentlyPlayingId.value = null
-            _currentPlayingSong.value = null
+            _currentlyPlayingId.value = "no_more_songs"
+            val placeholderSong = Song(
+                id = "no_more_songs",
+                title = "No more songs to swipe",
+                artist = "MusicDLP",
+                thumbnailUrl = "",
+                youtubeUrl = ""
+            )
+            _currentPlayingSong.value = placeholderSong
             val p = getMediaController()
             if (p != null) {
-                p.stop()
-                p.clearMediaItems()
+                p.setMediaItem(buildMediaItem(placeholderSong, "http://dummy"))
+                p.prepare()
+                p.pause()
             }
         }
     }
@@ -755,7 +855,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { processQueue() }
     }
 
-    fun likeSong(song: Song) {
+    fun likeSong(song: Song, advance: Boolean = false) {
         viewModelScope.launch {
             val allSongs = songDao.getAllSongs()
 
@@ -793,21 +893,22 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             addPlaylistLikedSong(likedToRecord)
             removePlaylistNewSong(song)
 
-            val isTopSwipeCard = _songsToSwipe.value.firstOrNull()?.id == song.id
+            val updatedSong = song.copy(isLiked = true, isDisliked = false)
+            _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) updatedSong else it }
 
-            if (isTopSwipeCard) {
-                advanceList()
-            } else {
-                val current = _currentPlayingSong.value
-                if (current != null && (current.id == song.id || (current.title.equals(song.title, ignoreCase = true) && current.artist.equals(song.artist, ignoreCase = true)))) {
-                    val updatedCurrent = current.copy(isLiked = true, isDisliked = false)
-                    _currentPlayingSong.value = updatedCurrent
-                    val p = getMediaController()
-                    if (p != null) {
-                        val streamOrPath = bufferedStreamUrls[updatedCurrent.id] ?: updatedCurrent.youtubeUrl
-                        p.setMediaItem(buildMediaItem(updatedCurrent, streamOrPath))
-                    }
+            val current = _currentPlayingSong.value
+            if (current != null && (current.id == song.id || (current.title.equals(song.title, ignoreCase = true) && current.artist.equals(song.artist, ignoreCase = true)))) {
+                val updatedCurrent = current.copy(isLiked = true, isDisliked = false)
+                _currentPlayingSong.value = updatedCurrent
+                val p = getMediaController()
+                if (p != null) {
+                    val streamOrPath = bufferedStreamUrls[updatedCurrent.id] ?: updatedCurrent.youtubeUrl
+                    p.setMediaItem(buildMediaItem(updatedCurrent, streamOrPath))
                 }
+            }
+
+            if (advance && _songsToSwipe.value.firstOrNull()?.id == song.id) {
+                advanceList()
             }
         }
     }
@@ -883,7 +984,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun dislikeSong(song: Song) {
+    fun dislikeSong(song: Song, advance: Boolean = false) {
         viewModelScope.launch {
             val allSongs = songDao.getAllSongs()
 
@@ -904,26 +1005,47 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 removePlaylistLikedSong(liked)
             }
 
-            val disliked = song.copy(isLiked = false, isDisliked = true, dislikedAt = System.currentTimeMillis())
-            songDao.insertSong(disliked)
-            addPlaylistDislikedSong(disliked)
+            val existingDisliked = allSongs.firstOrNull {
+                it.isDisliked &&
+                it.title.equals(song.title, ignoreCase = true) &&
+                (it.artist.equals(song.artist, ignoreCase = true) || song.artist == "Unknown" || it.artist == "Unknown")
+            }
+
+            val dislikedToRecord = if (existingDisliked != null) {
+                val updated = existingDisliked.addAlternateVersion(
+                    AlternateVersion(
+                        youtubeUrl = song.youtubeUrl,
+                        rawTitle = song.rawTitle ?: song.title,
+                        thumbnailUrl = song.thumbnailUrl
+                    )
+                )
+                songDao.insertSong(updated)
+                updated
+            } else {
+                val newDisliked = song.copy(isLiked = false, isDisliked = true, dislikedAt = System.currentTimeMillis())
+                songDao.insertSong(newDisliked)
+                newDisliked
+            }
+
+            addPlaylistDislikedSong(dislikedToRecord)
             removePlaylistNewSong(song)
 
-            val isTopSwipeCard = _songsToSwipe.value.firstOrNull()?.id == song.id
+            val updatedSong = song.copy(isLiked = false, isDisliked = true)
+            _songsToSwipe.value = _songsToSwipe.value.map { if (it.id == song.id) updatedSong else it }
 
-            if (isTopSwipeCard) {
-                advanceList()
-            } else {
-                val current = _currentPlayingSong.value
-                if (current != null && (current.id == song.id || (current.title.equals(song.title, ignoreCase = true) && current.artist.equals(song.artist, ignoreCase = true)))) {
-                    val updatedCurrent = current.copy(isLiked = false, isDisliked = true)
-                    _currentPlayingSong.value = updatedCurrent
-                    val p = getMediaController()
-                    if (p != null) {
-                        val streamOrPath = bufferedStreamUrls[updatedCurrent.id] ?: updatedCurrent.youtubeUrl
-                        p.setMediaItem(buildMediaItem(updatedCurrent, streamOrPath))
-                    }
+            val current = _currentPlayingSong.value
+            if (current != null && (current.id == song.id || (current.title.equals(song.title, ignoreCase = true) && current.artist.equals(song.artist, ignoreCase = true)))) {
+                val updatedCurrent = current.copy(isLiked = false, isDisliked = true)
+                _currentPlayingSong.value = updatedCurrent
+                val p = getMediaController()
+                if (p != null) {
+                    val streamOrPath = bufferedStreamUrls[updatedCurrent.id] ?: updatedCurrent.youtubeUrl
+                    p.setMediaItem(buildMediaItem(updatedCurrent, streamOrPath))
                 }
+            }
+
+            if (advance && _songsToSwipe.value.firstOrNull()?.id == song.id) {
+                advanceList()
             }
         }
     }
@@ -1069,6 +1191,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             putBoolean("canGoNext", canNext)
             putBoolean("isLiked", songWithState.isLiked)
             putBoolean("isDisliked", songWithState.isDisliked)
+            putString("swipingMode", _swipingMode.value.name)
         }
 
         val metadata = MediaMetadata.Builder()
@@ -1091,7 +1214,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             .build()
     }
 
-    fun playSongInContext(song: Song, contextList: List<Song>) {
+    fun playSongInContext(song: Song, contextList: List<Song>, isFromLikedOrDisliked: Boolean = false) {
+        if (isFromLikedOrDisliked) {
+            _songsToSwipe.value = emptyList()
+            setSwipingMode(SwipingMode.PLAY_ALL_RECATEGORISE)
+        }
         _activePlayingList.value = contextList
         playLikedSong(song) { playPreview(song) }
     }
@@ -1150,7 +1277,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     _currentPlayingSong.value = songWithState
                     showPlaybackNotification(songWithState)
                     val p = getMediaController() ?: return@launch
-                    p.setMediaItem(buildMediaItem(songWithState, localFile.absolutePath))
+
+                    val queueList = if (_activePlayingList.value.isNotEmpty()) _activePlayingList.value else _songsToSwipe.value
+                    val startIndex = queueList.indexOfFirst { it.id == songWithState.id }.coerceAtLeast(0)
+                    val mediaItems = queueList.map { buildMediaItem(it, if (it.id == songWithState.id) localFile.absolutePath else (bufferedStreamUrls[it.id] ?: it.youtubeUrl)) }
+
+                    p.setMediaItems(mediaItems, startIndex, 0L)
                     p.prepare()
                     p.play()
                 } else if (song.youtubeUrl.startsWith("content://") || song.youtubeUrl.startsWith("file://")) {
@@ -1159,7 +1291,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     _currentPlayingSong.value = songWithState
                     showPlaybackNotification(songWithState)
                     val p = getMediaController() ?: return@launch
-                    p.setMediaItem(buildMediaItem(songWithState, song.youtubeUrl))
+
+                    val queueList = if (_activePlayingList.value.isNotEmpty()) _activePlayingList.value else _songsToSwipe.value
+                    val startIndex = queueList.indexOfFirst { it.id == songWithState.id }.coerceAtLeast(0)
+                    val mediaItems = queueList.map { buildMediaItem(it, it.youtubeUrl) }
+
+                    p.setMediaItems(mediaItems, startIndex, 0L)
                     p.prepare()
                     p.play()
                 } else {
@@ -1210,9 +1347,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     throw e
                 } catch (e: Exception) {}
             }
-            if (_activePlayingList.value.isEmpty()) {
-                _activePlayingList.value = _songsToSwipe.value
-            }
             val songWithState = updatePlayingSongWithDbState(workingSong)
             _currentlyPlayingId.value = songWithState.id
             _currentPlayingSong.value = songWithState
@@ -1231,7 +1365,23 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 var streamUrl = bufferedStreamUrls[songWithState.id] ?: bufferedStreamUrls[song.id]
                 if (streamUrl == null) {
-                    streamUrl = repository.getStreamUrl(songWithState.youtubeUrl)
+                    var attempts = 0
+                    while (attempts < 3 && streamUrl == null && coroutineContext.isActive) {
+                        if (repository.isRateLimited()) {
+                            val remainingSec = ((repository.rateLimitCooldownUntilMs - System.currentTimeMillis()) / 1000).coerceAtLeast(1)
+                            _errorMessage.value = "Rate limited by YouTube (HTTP 429). Retrying in ${remainingSec}s..."
+                            _isSongLoading.value = true
+                            delay(remainingSec * 1000L)
+                        }
+                        streamUrl = repository.getStreamUrl(songWithState.youtubeUrl)
+                        if (streamUrl == null) {
+                            attempts++
+                            if (attempts < 3 && coroutineContext.isActive && !repository.isRateLimited()) {
+                                _errorMessage.value = "Fetching stream URL... (attempt ${attempts + 1}/3)"
+                                delay(1500L * attempts)
+                            }
+                        }
+                    }
                     if (streamUrl != null) {
                         bufferedStreamUrls[songWithState.id] = streamUrl
                         bufferedStreamUrls[song.id] = streamUrl
@@ -1241,7 +1391,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 val p = getMediaController()
                 if (streamUrl != null && p != null) {
                     _errorMessage.value = null
-                    p.setMediaItem(buildMediaItem(songWithState, streamUrl))
+                    if (songWithState.id.startsWith("preview_")) {
+                        p.setMediaItem(buildMediaItem(songWithState, streamUrl))
+                    } else {
+                        val queueList = if (_activePlayingList.value.isNotEmpty()) _activePlayingList.value else _songsToSwipe.value
+                        val startIndex = queueList.indexOfFirst { it.id == songWithState.id }.coerceAtLeast(0)
+                        val mediaItems = queueList.map { buildMediaItem(it, if (it.id == songWithState.id) streamUrl else (bufferedStreamUrls[it.id] ?: it.youtubeUrl)) }
+                        p.setMediaItems(mediaItems, startIndex, seekToMs)
+                    }
                     if (seekToMs > 0) {
                         p.seekTo(seekToMs)
                     }
@@ -1249,8 +1406,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     p.play()
                 } else if (p == null) {
                     _errorMessage.value = "Playback controller not ready"
+                } else if (repository.isRateLimited()) {
+                    _errorMessage.value = "Rate limited by YouTube (HTTP 429). Please wait a moment before retrying."
                 } else {
-                    _errorMessage.value = "Could not fetch stream URL for ${songWithState.title}"
+                    _errorMessage.value = "Could not fetch stream URL for ${songWithState.title}. Format or sign-in issue."
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -1281,6 +1440,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         _playlistLikedSongs.value = emptyList()
         _playlistDislikedSongs.value = emptyList()
         _playlistNewSongs.value = emptyList()
+        _activePlayingList.value = emptyList()
         updateAppQueue()
     }
 
@@ -1389,16 +1549,18 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     val localSongs = audioFiles.map { file ->
                         val fileName = file.name ?: "Unknown"
                         val nameWithoutExt = fileName.substringBeforeLast(".")
+                        val (extractedYtId, cleanedTitle) = repository.extractYoutubeIdAndCleanName(nameWithoutExt)
                         val uriString = file.uri.toString()
-                        val deterministicId = "local_${fileName.lowercase().trim().hashCode()}_${nameWithoutExt.lowercase().trim()}"
+                        val deterministicId = if (!extractedYtId.isNullOrBlank()) extractedYtId else "local_${fileName.lowercase().trim().hashCode()}_${cleanedTitle.lowercase().trim()}"
+                        val thumbnail = if (!extractedYtId.isNullOrBlank()) "https://i.ytimg.com/vi/$extractedYtId/hqdefault.jpg" else ""
 
                         Song(
                             id = deterministicId,
-                            title = nameWithoutExt,
+                            title = cleanedTitle,
                             artist = "Unknown",
-                            thumbnailUrl = "",
+                            thumbnailUrl = thumbnail,
                             youtubeUrl = uriString,
-                            rawTitle = fileName,
+                            rawTitle = cleanedTitle,
                             isMetadataCleaned = false
                         )
                     }
@@ -1475,6 +1637,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             addAction("com.example.musicdlp.ACTION_PREVIOUS")
             addAction("com.example.musicdlp.ACTION_LIKE")
             addAction("com.example.musicdlp.ACTION_DISLIKE")
+            addAction("com.example.musicdlp.ACTION_CYCLE_MODE")
+            addAction("com.example.musicdlp.ACTION_SET_MODE")
             addAction("com.example.musicdlp.ACTION_SEARCH_VOICE")
             addAction("com.example.musicdlp.ACTION_PLAY_MEDIA_ID")
         }

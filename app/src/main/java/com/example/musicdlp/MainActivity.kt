@@ -10,10 +10,16 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AllInclusive
+import androidx.compose.material.icons.filled.FiberNew
+import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
@@ -25,13 +31,20 @@ import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material.icons.outlined.ThumbDown
 import androidx.compose.material.icons.outlined.ThumbUp
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -124,35 +137,41 @@ fun MainScreen() {
                 }
 
                 NavigationBar {
+                    fun navigateTab(route: String) {
+                        if (currentDestination != route) {
+                            navController.navigate(route) {
+                                popUpTo(navController.graph.startDestinationId) {
+                                    saveState = true
+                                }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        }
+                    }
+
                     NavigationBarItem(
                         icon = { Icon(Icons.Default.Home, contentDescription = "Swipe") },
                         label = { Text("Swipe") },
                         selected = currentDestination == "swipe",
-                        onClick = {
-                            if (currentDestination != "swipe") {
-                                navController.navigate("swipe") {
-                                    popUpTo("swipe") { inclusive = true }
-                                }
-                            }
-                        }
+                        onClick = { navigateTab("swipe") }
                     )
                     NavigationBarItem(
                         icon = { Icon(Icons.Default.Favorite, contentDescription = "Liked") },
                         label = { Text("Liked") },
                         selected = currentDestination == "liked",
-                        onClick = { navController.navigate("liked") }
+                        onClick = { navigateTab("liked") }
                     )
                     NavigationBarItem(
                         icon = { Icon(Icons.Default.List, contentDescription = "Disliked") },
                         label = { Text("Disliked") },
                         selected = currentDestination == "disliked",
-                        onClick = { navController.navigate("disliked") }
+                        onClick = { navigateTab("disliked") }
                     )
                     NavigationBarItem(
                         icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
                         label = { Text("Settings") },
                         selected = currentDestination == "settings",
-                        onClick = { navController.navigate("settings") }
+                        onClick = { navigateTab("settings") }
                     )
                 }
             }
@@ -179,51 +198,67 @@ fun BottomPlayerBar(
     val currentPlayingSong by viewModel.currentPlayingSong.collectAsState()
     val canGoPrevious by viewModel.canGoPreviousInContext.collectAsState()
     val canGoNext by viewModel.canGoNextInContext.collectAsState()
+    val swipingMode by viewModel.swipingMode.collectAsState()
     val song = currentPlayingSong ?: return
 
     val player = viewModel.exoPlayer
     var isPlaying by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf(0f) }
+    var progress by remember { mutableFloatStateOf(0f) }
+    var isUserSeeking by remember { mutableStateOf(false) }
+
+    LaunchedEffect(song.id) {
+        progress = 0f
+    }
 
     LaunchedEffect(player) {
         if (player == null) return@LaunchedEffect
         while (true) {
             isPlaying = player.isPlaying
-            if (player.duration > 0) {
+            if (!isUserSeeking && player.duration > 0) {
                 progress = (player.currentPosition.toFloat() / player.duration.toFloat()).coerceIn(0f, 1f)
             }
-            delay(500)
+            delay(300)
         }
     }
 
     Surface(
-        color = MaterialTheme.colorScheme.primaryContainer,
+        color = MaterialTheme.colorScheme.surfaceColorAtElevation(4.dp),
+        shape = RectangleShape,
         tonalElevation = 8.dp,
-        shadowElevation = 8.dp,
+        shadowElevation = 10.dp,
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
+            // Interactive, scrollable / seekable progress slider
             Slider(
                 value = progress,
-                onValueChange = { newProgress ->
-                    progress = newProgress
+                onValueChange = { newValue ->
+                    isUserSeeking = true
+                    progress = newValue
+                },
+                onValueChangeFinished = {
                     player?.let { p ->
                         if (p.duration > 0) {
-                            p.seekTo((newProgress * p.duration).toLong())
+                            val seekPos = (progress * p.duration).toLong()
+                            p.seekTo(seekPos)
                         }
                     }
+                    isUserSeeking = false
                 },
+                colors = SliderDefaults.colors(
+                    thumbColor = MaterialTheme.colorScheme.onSurface,
+                    activeTrackColor = MaterialTheme.colorScheme.onSurface,
+                    inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                ),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(20.dp)
-                    .padding(horizontal = 8.dp)
+                    .height(18.dp)
             )
 
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 12.dp, end = 12.dp, bottom = 6.dp)
-                    .clickable { onNavigateToSwipe() },
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
@@ -233,68 +268,132 @@ fun BottomPlayerBar(
                     song.thumbnailUrl
                 }
 
-                if (effectiveThumbnail.isNotBlank()) {
-                    AsyncImage(
-                        model = effectiveThumbnail,
-                        contentDescription = null,
-                        modifier = Modifier.size(40.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                } else {
-                    Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(28.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onNavigateToSwipe() },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (effectiveThumbnail.isNotBlank()) {
+                        AsyncImage(
+                            model = effectiveThumbnail,
+                            contentDescription = null,
+                            modifier = Modifier
+                                .size(56.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .size(56.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(28.dp))
+                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = song.title,
+                            style = MaterialTheme.typography.titleSmall.copy(fontSize = 15.sp),
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            lineHeight = 18.sp
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = song.artist.ifBlank { song.rawTitle ?: "Now Playing" },
+                            style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
 
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = song.title,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1
-                    )
-                    Text(
-                        text = song.artist.ifBlank { song.rawTitle ?: "Now Playing" },
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1
-                    )
-                }
+                Spacer(modifier = Modifier.width(6.dp))
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { viewModel.likeSong(song) }) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(0.dp)
+                ) {
+                    IconButton(
+                        onClick = { viewModel.cycleSwipingMode() },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        val modeIcon = when (swipingMode) {
+                            MusicViewModel.SwipingMode.ONLY_NEW -> Icons.Default.FiberNew
+                            MusicViewModel.SwipingMode.NEW_AND_LIKED -> Icons.Default.LibraryMusic
+                            MusicViewModel.SwipingMode.PLAY_ALL_RECATEGORISE -> Icons.Default.AllInclusive
+                        }
+                        val modeTint = when (swipingMode) {
+                            MusicViewModel.SwipingMode.ONLY_NEW -> MaterialTheme.colorScheme.primary
+                            MusicViewModel.SwipingMode.NEW_AND_LIKED -> MaterialTheme.colorScheme.primary
+                            MusicViewModel.SwipingMode.PLAY_ALL_RECATEGORISE -> MaterialTheme.colorScheme.secondary
+                        }
                         Icon(
-                            imageVector = if (song.isLiked) Icons.Default.ThumbUp else Icons.Outlined.ThumbUp,
-                            contentDescription = "Like",
-                            tint = if (song.isLiked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            imageVector = modeIcon,
+                            contentDescription = swipingMode.displayName,
+                            tint = modeTint,
+                            modifier = Modifier.size(20.dp)
                         )
                     }
 
-                    IconButton(onClick = { viewModel.dislikeSong(song) }) {
+                    IconButton(
+                        onClick = { viewModel.likeSong(song, advance = false) },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (song.isLiked) Icons.Default.ThumbUp else Icons.Outlined.ThumbUp,
+                            contentDescription = "Like",
+                            tint = if (song.isLiked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    IconButton(
+                        onClick = { viewModel.dislikeSong(song, advance = false) },
+                        modifier = Modifier.size(32.dp)
+                    ) {
                         Icon(
                             imageVector = if (song.isDisliked) Icons.Default.ThumbDown else Icons.Outlined.ThumbDown,
                             contentDescription = "Dislike",
-                            tint = if (song.isDisliked) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                            tint = if (song.isDisliked) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
                         )
                     }
 
                     IconButton(
                         onClick = { viewModel.playPreviousInContext() },
-                        enabled = canGoPrevious
+                        enabled = canGoPrevious,
+                        modifier = Modifier.size(32.dp)
                     ) {
-                        Icon(Icons.Default.SkipPrevious, contentDescription = "Previous")
+                        Icon(Icons.Default.SkipPrevious, contentDescription = "Previous", modifier = Modifier.size(20.dp))
                     }
 
-                    IconButton(onClick = { viewModel.togglePlayPause() }) {
+                    IconButton(
+                        onClick = { viewModel.togglePlayPause() },
+                        modifier = Modifier.size(34.dp)
+                    ) {
                         Icon(
                             imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = "Play/Pause"
+                            contentDescription = if (isPlaying) "Pause" else "Play",
+                            modifier = Modifier.size(26.dp)
                         )
                     }
 
                     IconButton(
                         onClick = { viewModel.playNextInContext() },
-                        enabled = canGoNext
+                        enabled = canGoNext,
+                        modifier = Modifier.size(32.dp)
                     ) {
-                        Icon(Icons.Default.SkipNext, contentDescription = "Next")
+                        Icon(Icons.Default.SkipNext, contentDescription = "Next", modifier = Modifier.size(20.dp))
                     }
                 }
             }

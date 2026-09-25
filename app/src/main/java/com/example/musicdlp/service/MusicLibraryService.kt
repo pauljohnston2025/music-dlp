@@ -39,6 +39,7 @@ import java.io.File
 
 private const val CUSTOM_ACTION_LIKE = "com.example.musicdlp.COMMAND_LIKE"
 private const val CUSTOM_ACTION_DISLIKE = "com.example.musicdlp.COMMAND_DISLIKE"
+private const val CUSTOM_ACTION_CYCLE_MODE = "com.example.musicdlp.COMMAND_CYCLE_MODE"
 
 @OptIn(UnstableApi::class)
 class MusicLibraryService : MediaLibraryService() {
@@ -50,8 +51,10 @@ class MusicLibraryService : MediaLibraryService() {
 
     private val customCommandLike = SessionCommand(CUSTOM_ACTION_LIKE, Bundle.EMPTY)
     private val customCommandDislike = SessionCommand(CUSTOM_ACTION_DISLIKE, Bundle.EMPTY)
+    private val customCommandCycleMode = SessionCommand(CUSTOM_ACTION_CYCLE_MODE, Bundle.EMPTY)
 
     private val playerListeners = mutableSetOf<Player.Listener>()
+    private val searchResultsCache = mutableMapOf<String, List<MediaItem>>()
 
     private val queueReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -64,7 +67,6 @@ class MusicLibraryService : MediaLibraryService() {
                 session.notifyChildrenChanged("NOW_PLAYING", queueCount, null)
             }
         }
-
     }
 
     @OptIn(UnstableApi::class)
@@ -119,7 +121,7 @@ class MusicLibraryService : MediaLibraryService() {
             override fun isCommandAvailable(command: Int): Boolean {
                 return when (command) {
                     COMMAND_SEEK_TO_NEXT,
-                    COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> hasNextMediaItem()
+                    COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> true
                     COMMAND_SEEK_TO_PREVIOUS,
                     COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> hasPreviousMediaItem()
                     else -> super.isCommandAvailable(command)
@@ -127,8 +129,7 @@ class MusicLibraryService : MediaLibraryService() {
             }
 
             override fun hasNextMediaItem(): Boolean {
-                val extras = currentMediaItem?.mediaMetadata?.extras
-                return extras?.getBoolean("canGoNext", false) ?: false
+                return true
             }
 
             override fun hasPreviousMediaItem(): Boolean {
@@ -174,9 +175,16 @@ class MusicLibraryService : MediaLibraryService() {
         val extras = mediaItem?.mediaMetadata?.extras
         val isLiked = extras?.getBoolean("isLiked", false) ?: false
         val isDisliked = extras?.getBoolean("isDisliked", false) ?: false
+        val swipingMode = extras?.getString("swipingMode") ?: "ONLY_NEW"
 
         val likeIcon = if (isLiked) R.drawable.ic_thumb_up_filled else R.drawable.ic_thumb_up_outlined
         val dislikeIcon = if (isDisliked) R.drawable.ic_thumb_down_filled else R.drawable.ic_thumb_down_outlined
+
+        val (modeIcon, modeName) = when (swipingMode) {
+            "NEW_AND_LIKED" -> R.drawable.baseline_library_music_24 to "Mode: New & Liked"
+            "PLAY_ALL_RECATEGORISE" -> R.drawable.baseline_all_inclusive_24 to "Mode: Play All"
+            else -> R.drawable.baseline_fiber_new_24 to "Mode: Only New"
+        }
 
         @Suppress("DEPRECATION")
         val likeBtn = CommandButton.Builder()
@@ -194,7 +202,15 @@ class MusicLibraryService : MediaLibraryService() {
             .setEnabled(true)
             .build()
 
-        return ImmutableList.of(likeBtn, dislikeBtn)
+        @Suppress("DEPRECATION")
+        val cycleBtn = CommandButton.Builder()
+            .setDisplayName(modeName)
+            .setIconResId(modeIcon)
+            .setSessionCommand(customCommandCycleMode)
+            .setEnabled(true)
+            .build()
+
+        return ImmutableList.of(likeBtn, dislikeBtn, cycleBtn)
     }
 
     private fun updateNotificationLayout(mediaItem: MediaItem?) {
@@ -208,6 +224,7 @@ class MusicLibraryService : MediaLibraryService() {
                 MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
                     .add(customCommandLike)
                     .add(customCommandDislike)
+                    .add(customCommandCycleMode)
                     .build(),
                 updatedCommands
             )
@@ -244,6 +261,7 @@ class MusicLibraryService : MediaLibraryService() {
             val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
                 .add(customCommandLike)
                 .add(customCommandDislike)
+                .add(customCommandCycleMode)
                 .build()
 
             val playerCommands = session.player.availableCommands
@@ -271,22 +289,12 @@ class MusicLibraryService : MediaLibraryService() {
                 val intent = Intent("com.example.musicdlp.ACTION_DISLIKE").apply { setPackage(packageName) }
                 sendBroadcast(intent)
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            } else if (customCommand.customAction == CUSTOM_ACTION_CYCLE_MODE) {
+                val intent = Intent("com.example.musicdlp.ACTION_CYCLE_MODE").apply { setPackage(packageName) }
+                sendBroadcast(intent)
+                return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             }
             return super.onCustomCommand(session, controller, customCommand, args)
-        }
-
-        override fun onSubscribe(
-            session: MediaLibrarySession,
-            browser: MediaSession.ControllerInfo,
-            parentId: String,
-            params: LibraryParams?
-        ): ListenableFuture<LibraryResult<Void>> {
-            Napier.d("onSubscribe called for parentId=$parentId by ${browser.packageName}", tag = "DEBUG_METADATA")
-            // on subscribe is called with parentId (NOW_PLAYING, LIKED, DISLIKED, ROOT), we
-            // override the default to prevent it calling onGetItem with the parentId
-            // if we do not do this, it defaults to returning ERROR_NOT_SUPPORTED because our
-            // onGetItem returns null when its not a song
-            return Futures.immediateFuture(LibraryResult.ofVoid())
         }
 
         @Suppress("DEPRECATION")
@@ -346,7 +354,15 @@ class MusicLibraryService : MediaLibraryService() {
                             listOf(
                                 createBrowsableItem("NOW_PLAYING", "Now Playing"),
                                 createBrowsableItem("LIKED", "Liked Songs"),
-                                createBrowsableItem("DISLIKED", "Disliked Songs")
+                                createBrowsableItem("DISLIKED", "Disliked Songs"),
+                                createBrowsableItem("SETTINGS", "Settings / Playback Mode")
+                            )
+                        }
+                        "SETTINGS" -> {
+                            listOf(
+                                createPlayableSettingItem("MODE_ONLY_NEW", "Mode: Only Categorise New"),
+                                createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: New and Liked"),
+                                createPlayableSettingItem("MODE_PLAY_ALL", "Mode: Play All / Recategorise")
                             )
                         }
                         "NOW_PLAYING" -> {
@@ -402,6 +418,20 @@ class MusicLibraryService : MediaLibraryService() {
 
                     for (item in mediaItems) {
                         val mediaId = item.mediaId
+                        if (mediaId.startsWith("MODE_")) {
+                            val modeStr = when (mediaId) {
+                                "MODE_NEW_AND_LIKED" -> "NEW_AND_LIKED"
+                                "MODE_PLAY_ALL" -> "PLAY_ALL_RECATEGORISE"
+                                else -> "ONLY_NEW"
+                            }
+                            val intent = Intent("com.example.musicdlp.ACTION_SET_MODE").apply {
+                                setPackage(packageName)
+                                putExtra("mode", modeStr)
+                            }
+                            sendBroadcast(intent)
+                            continue
+                        }
+
                         val dbSong = app.database.songDao().getSongById(mediaId) ?: app.currentQueue.firstOrNull { it.id == mediaId }
 
                         val playableUriStr: String? = if (dbSong != null) {
@@ -417,10 +447,10 @@ class MusicLibraryService : MediaLibraryService() {
                             } else if (dbSong.youtubeUrl.startsWith("content://") || dbSong.youtubeUrl.startsWith("file://") || dbSong.youtubeUrl.startsWith("/")) {
                                 dbSong.youtubeUrl
                             } else {
-                                repository.getStreamUrl(dbSong.youtubeUrl)
+                                null // repository.getStreamUrl(dbSong.youtubeUrl)
                             }
                         } else if (item.requestMetadata.mediaUri != null && item.requestMetadata.mediaUri.toString().startsWith("http")) {
-                            repository.getStreamUrl(item.requestMetadata.mediaUri.toString())
+                            null // repository.getStreamUrl(item.requestMetadata.mediaUri.toString())
                         } else null
 
                         if (!playableUriStr.isNullOrBlank()) {
@@ -467,6 +497,23 @@ class MusicLibraryService : MediaLibraryService() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val app = application as MusicDLPApplication
+                    val browsableItem = when (mediaId.uppercase()) {
+                        "ROOT", "/", "MEDIA_ROOT" -> createBrowsableItem("ROOT", "MusicDLP")
+                        "NOW_PLAYING" -> createBrowsableItem("NOW_PLAYING", "Now Playing")
+                        "LIKED" -> createBrowsableItem("LIKED", "Liked Songs")
+                        "DISLIKED" -> createBrowsableItem("DISLIKED", "Disliked Songs")
+                        "SETTINGS" -> createBrowsableItem("SETTINGS", "Settings / Playback Mode")
+                        "MODE_ONLY_NEW" -> createPlayableSettingItem("MODE_ONLY_NEW", "Mode: Only Categorise New")
+                        "MODE_NEW_AND_LIKED" -> createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: New and Liked")
+                        "MODE_PLAY_ALL" -> createPlayableSettingItem("MODE_PLAY_ALL", "Mode: Play All / Recategorise")
+                        else -> null
+                    }
+
+                    if (browsableItem != null) {
+                        settableFuture.set(LibraryResult.ofItem(browsableItem, null))
+                        return@launch
+                    }
+
                     val song = app.database.songDao().getSongById(mediaId) ?: app.currentQueue.firstOrNull { it.id == mediaId }
                     if (song != null) {
                         settableFuture.set(LibraryResult.ofItem(song.toMediaItem(), null))
@@ -488,12 +535,52 @@ class MusicLibraryService : MediaLibraryService() {
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<Void>> {
             Napier.d("onSearch called for query: $query", tag = "DEBUG_METADATA")
-            val intent = Intent("com.example.musicdlp.ACTION_SEARCH_VOICE").apply {
-                setPackage(packageName)
-                putExtra("query", query)
+            serviceScope.launch(Dispatchers.IO) {
+                try {
+                    val app = application as MusicDLPApplication
+                    val dbSongs = app.database.songDao().getAllSongs()
+                    var matches = dbSongs.filter {
+                        it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true)
+                    }.map { it.toMediaItem() }
+
+                    if (matches.isEmpty()) {
+                        val repo = YoutubeDLRepository(app)
+                        val searchResults = repo.searchSongsOrPlaylists(query)
+                        matches = searchResults.map { it.toMediaItem() }
+                    }
+
+                    searchResultsCache[query] = matches
+                    session.notifySearchResultChanged(browser, query, matches.size, params)
+
+                    val intent = Intent("com.example.musicdlp.ACTION_SEARCH_VOICE").apply {
+                        setPackage(packageName)
+                        putExtra("query", query)
+                    }
+                    sendBroadcast(intent)
+                } catch (e: Exception) {
+                    Napier.e("onSearch failed: ${e.message}", e, tag = "DEBUG_METADATA")
+                }
             }
-            sendBroadcast(intent)
             return Futures.immediateFuture(LibraryResult.ofVoid())
+        }
+
+        override fun onGetSearchResult(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+            Napier.d("onGetSearchResult called for query: $query", tag = "DEBUG_METADATA")
+            val results = searchResultsCache[query] ?: emptyList()
+            val returnParams = params ?: LibraryParams.Builder().setExtras(
+                Bundle().apply {
+                    putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
+                    putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
+                }
+            ).build()
+            return Futures.immediateFuture(LibraryResult.ofItemList(ImmutableList.copyOf(results), returnParams))
         }
 
         @Suppress("DEPRECATION")
@@ -508,6 +595,26 @@ class MusicLibraryService : MediaLibraryService() {
                         .setIsBrowsable(true)
                         .setIsPlayable(false)
                         .setFolderType(MediaMetadata.FOLDER_TYPE_MIXED)
+                        .setTitle(title)
+                        .setExtras(itemExtras)
+                        .build()
+                )
+                .build()
+        }
+
+        @Suppress("DEPRECATION")
+        private fun createPlayableSettingItem(id: String, title: String): MediaItem {
+            val itemExtras = Bundle().apply {
+                putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
+            }
+            return MediaItem.Builder()
+                .setMediaId(id)
+                .setUri(Uri.parse("http://dummy_setting"))
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setIsBrowsable(false)
+                        .setIsPlayable(true)
+                        .setFolderType(MediaMetadata.FOLDER_TYPE_NONE)
                         .setTitle(title)
                         .setExtras(itemExtras)
                         .build()

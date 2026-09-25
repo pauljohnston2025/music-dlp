@@ -292,16 +292,30 @@ class YoutubeDLRepository(private val context: Context) {
         return null
     }
 
+    fun extractYoutubeIdAndCleanName(rawName: String): Pair<String?, String> {
+        val ytIdRegex = Regex("""[\s\-_\[(]+([a-zA-Z0-9_\-]{10,12})[\])]?$""")
+        val match = ytIdRegex.find(rawName.trim())
+        return if (match != null) {
+            val ytId = match.groupValues[1]
+            val cleanedName = rawName.substring(0, match.range.first).trim()
+            Pair(ytId, cleanedName.ifBlank { rawName })
+        } else {
+            Pair(null, rawName)
+        }
+    }
+
     fun cleanTitleAndArtistRegex(rawTitle: String, uploader: String?): Pair<String, String> {
-        Napier.d("cleanTitleAndArtistRegex input: $rawTitle, uploader: $uploader", tag = "DEBUG_METADATA")
+        val (extractedId, titleWithoutId) = extractYoutubeIdAndCleanName(rawTitle)
+        val workingTitle = titleWithoutId.ifBlank { rawTitle }
+        Napier.d("cleanTitleAndArtistRegex input: $rawTitle (workingTitle: $workingTitle, extractedId: $extractedId), uploader: $uploader", tag = "DEBUG_METADATA")
         
         // 1. Split by common separators (dash, colon, pipe)
-        val parts = rawTitle.split(Regex("""\s*[-–—:|]\s*"""), limit = 2)
+        val parts = workingTitle.split(Regex("""\s*[-–—:|]\s*"""), limit = 2)
         val noiseKeywords = "official|lyric|video|hd|hq|4k|audio|remastered|visualizer|live|concert|full audio|high quality"
         val noisePattern = Regex("""[\(\[\{].*?($noiseKeywords).*?[\)\]\}]""", RegexOption.IGNORE_CASE)
 
         var artist = uploader ?: "Unknown"
-        var title = rawTitle
+        var title = workingTitle
 
         if (parts.size == 2) {
             val p0 = parts[0].trim()
@@ -641,9 +655,25 @@ class YoutubeDLRepository(private val context: Context) {
 
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+    var rateLimitCooldownUntilMs: Long = 0L
+        private set
+
+    fun isRateLimited(): Boolean {
+        return System.currentTimeMillis() < rateLimitCooldownUntilMs
+    }
+
+    fun setRateLimitedCooldown(seconds: Long = 20) {
+        rateLimitCooldownUntilMs = System.currentTimeMillis() + (seconds * 1000L)
+    }
+
     suspend fun getStreamUrl(youtubeUrl: String): String? = withContext(Dispatchers.IO) {
         if (youtubeUrl.startsWith("content://") || youtubeUrl.startsWith("file://") || youtubeUrl.startsWith("/")) {
             return@withContext youtubeUrl
+        }
+        if (isRateLimited()) {
+            val remainingSec = ((rateLimitCooldownUntilMs - System.currentTimeMillis()) / 1000).coerceAtLeast(1)
+            Napier.w("Rate limited. Waiting ${remainingSec}s before fetching stream URL.", tag = "DEBUG_METADATA")
+            return@withContext null
         }
         val request = YoutubeDLRequest(youtubeUrl)
         request.addOption("-f", "bestaudio")
@@ -662,7 +692,12 @@ class YoutubeDLRepository(private val context: Context) {
                 null
             }
         } catch (e: Exception) {
-            Napier.e("Failed to fetch stream URL: ${e.message}", tag = "DEBUG_METADATA")
+            val msg = e.message ?: ""
+            Napier.e("Failed to fetch stream URL: $msg", tag = "DEBUG_METADATA")
+            if (msg.contains("429") || msg.contains("Too Many Requests", ignoreCase = true) || msg.contains("bot", ignoreCase = true) || msg.contains("Sign in", ignoreCase = true)) {
+                setRateLimitedCooldown(25)
+                Napier.w("Set rate limit / bot check cooldown for 25s", tag = "DEBUG_METADATA")
+            }
             null
         }
     }
