@@ -17,6 +17,10 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.drm.DrmSessionManagerProvider
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
@@ -40,6 +44,92 @@ import java.io.File
 private const val CUSTOM_ACTION_LIKE = "com.example.musicdlp.COMMAND_LIKE"
 private const val CUSTOM_ACTION_DISLIKE = "com.example.musicdlp.COMMAND_DISLIKE"
 private const val CUSTOM_ACTION_CYCLE_MODE = "com.example.musicdlp.COMMAND_CYCLE_MODE"
+
+@UnstableApi
+class CustomMediaSourceFactory(
+    context: Context,
+    private var app : MusicDLPApplication,
+    private val repository : YoutubeDLRepository
+) : MediaSource.Factory by DefaultMediaSourceFactory(context) {
+
+    private val defaultFactory = DefaultMediaSourceFactory(context)
+
+    override fun createMediaSource(item: MediaItem): MediaSource {
+        // Check if the URI is already resolved
+        if (item.localConfiguration?.uri != null) {
+            return defaultFactory.createMediaSource(item)
+        }
+
+        // Defer stream resolution until ExoPlayer prepares/plays this item
+        val mediaId = item.mediaId
+        val resolvedItem = runBlocking(Dispatchers.IO) {
+            val dbSong = app.database.songDao().getSongById(mediaId)
+                ?: app.currentQueue.firstOrNull { it.id == mediaId }
+            var resolved = item
+            if (dbSong != null) {
+                val repository = YoutubeDLRepository(app)
+
+                resolved = dbSong.toMediaItem()
+
+                val playableUriStr: String? = if (dbSong != null) {
+                    val safeArtist = dbSong.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                    val safeTitle = dbSong.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                    val finalFileName = "$safeArtist - $safeTitle.mp3"
+                    val publicMusicDir =
+                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                    val downloadDir = File(publicMusicDir, "MusicDLP")
+                    val targetFile = File(downloadDir, finalFileName)
+
+                    if (targetFile.exists()) {
+                        targetFile.absolutePath
+                    } else if (dbSong.youtubeUrl.startsWith("content://") || dbSong.youtubeUrl.startsWith(
+                            "file://"
+                        ) || dbSong.youtubeUrl.startsWith("/")
+                    ) {
+                        dbSong.youtubeUrl
+                    } else {
+                        repository.getStreamUrl(dbSong.youtubeUrl)
+                    }
+                } else if (item.requestMetadata.mediaUri != null && item.requestMetadata.mediaUri.toString()
+                        .startsWith("http")
+                ) {
+                    repository.getStreamUrl(item.requestMetadata.mediaUri.toString())
+                } else null
+
+                if (!playableUriStr.isNullOrBlank()) {
+                    val parsedUri = if (playableUriStr.startsWith("/")) {
+                        Uri.fromFile(File(playableUriStr))
+                    } else {
+                        Uri.parse(playableUriStr)
+                    }
+
+                    val updatedMetadata = item.mediaMetadata.buildUpon()
+                        .setTitle(
+                            dbSong?.title ?: item.mediaMetadata.title ?: "MusicDLP"
+                        )
+                        .setArtist(
+                            dbSong?.artist ?: item.mediaMetadata.artist ?: "MusicDLP"
+                        )
+                        .setIsBrowsable(false)
+                        .setIsPlayable(true)
+                        .build()
+
+
+                        resolved = item.buildUpon()
+                            .setUri(parsedUri)
+                            .setMediaMetadata(updatedMetadata)
+                            .build()
+                }
+
+                resolved
+            }
+
+            resolved
+        }
+
+        return defaultFactory.createMediaSource(resolvedItem)
+    }
+}
 
 @OptIn(UnstableApi::class)
 class MusicLibraryService : MediaLibraryService() {
@@ -69,6 +159,7 @@ class MusicLibraryService : MediaLibraryService() {
         }
     }
 
+
     @OptIn(UnstableApi::class)
     override fun onCreate() {
         super.onCreate()
@@ -78,9 +169,12 @@ class MusicLibraryService : MediaLibraryService() {
             .setUsage(C.USAGE_MEDIA)
             .build()
 
+        val mediaSourceFactory = CustomMediaSourceFactory(this, application as MusicDLPApplication, YoutubeDLRepository(application as MusicDLPApplication))
+
         exoPlayer = ExoPlayer.Builder(this)
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
+            .setMediaSourceFactory(mediaSourceFactory)
             .build()
 
         exoPlayer.addListener(object : Player.Listener {
@@ -137,23 +231,23 @@ class MusicLibraryService : MediaLibraryService() {
                 return extras?.getBoolean("canGoPrevious", false) ?: false
             }
 
-            override fun seekToNext() {
-                val intent = Intent("com.example.musicdlp.ACTION_NEXT").apply { setPackage(packageName) }
-                sendBroadcast(intent)
-            }
+//            override fun seekToNext() {
+//                val intent = Intent("com.example.musicdlp.ACTION_NEXT").apply { setPackage(packageName) }
+//                sendBroadcast(intent)
+//            }
 
-            override fun seekToNextMediaItem() {
-                seekToNext()
-            }
-
-            override fun seekToPrevious() {
-                val intent = Intent("com.example.musicdlp.ACTION_PREVIOUS").apply { setPackage(packageName) }
-                sendBroadcast(intent)
-            }
-
-            override fun seekToPreviousMediaItem() {
-                seekToPrevious()
-            }
+//            override fun seekToNextMediaItem() {
+//                seekToNext()
+//            }
+//
+//            override fun seekToPrevious() {
+//                val intent = Intent("com.example.musicdlp.ACTION_PREVIOUS").apply { setPackage(packageName) }
+//                sendBroadcast(intent)
+//            }
+//
+//            override fun seekToPreviousMediaItem() {
+//                seekToPrevious()
+//            }
         }
 
         mediaSession = MediaLibrarySession.Builder(this, forwardingPlayer, LibrarySessionCallback())
@@ -413,7 +507,6 @@ class MusicLibraryService : MediaLibraryService() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val app = application as MusicDLPApplication
-                    val repository = YoutubeDLRepository(app)
                     val resolvedItems = mutableListOf<MediaItem>()
 
                     for (item in mediaItems) {
@@ -432,50 +525,7 @@ class MusicLibraryService : MediaLibraryService() {
                             continue
                         }
 
-                        val dbSong = app.database.songDao().getSongById(mediaId) ?: app.currentQueue.firstOrNull { it.id == mediaId }
-
-                        val playableUriStr: String? = if (dbSong != null) {
-                            val safeArtist = dbSong.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
-                            val safeTitle = dbSong.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
-                            val finalFileName = "$safeArtist - $safeTitle.mp3"
-                            val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
-                            val downloadDir = File(publicMusicDir, "MusicDLP")
-                            val targetFile = File(downloadDir, finalFileName)
-
-                            if (targetFile.exists()) {
-                                targetFile.absolutePath
-                            } else if (dbSong.youtubeUrl.startsWith("content://") || dbSong.youtubeUrl.startsWith("file://") || dbSong.youtubeUrl.startsWith("/")) {
-                                dbSong.youtubeUrl
-                            } else {
-                                null // repository.getStreamUrl(dbSong.youtubeUrl)
-                            }
-                        } else if (item.requestMetadata.mediaUri != null && item.requestMetadata.mediaUri.toString().startsWith("http")) {
-                            null // repository.getStreamUrl(item.requestMetadata.mediaUri.toString())
-                        } else null
-
-                        if (!playableUriStr.isNullOrBlank()) {
-                            val parsedUri = if (playableUriStr.startsWith("/")) {
-                                Uri.fromFile(File(playableUriStr))
-                            } else {
-                                Uri.parse(playableUriStr)
-                            }
-
-                            val updatedMetadata = item.mediaMetadata.buildUpon()
-                                .setTitle(dbSong?.title ?: item.mediaMetadata.title ?: "MusicDLP")
-                                .setArtist(dbSong?.artist ?: item.mediaMetadata.artist ?: "MusicDLP")
-                                .setIsBrowsable(false)
-                                .setIsPlayable(true)
-                                .build()
-
-                            val resolvedItem = item.buildUpon()
-                                .setUri(parsedUri)
-                                .setMediaMetadata(updatedMetadata)
-                                .build()
-
-                            resolvedItems.add(resolvedItem)
-                        } else {
-                            resolvedItems.add(item)
-                        }
+                        resolvedItems.add(item)
                     }
 
                     settableFuture.set(MediaSession.MediaItemsWithStartPosition(resolvedItems, startIndex, startPositionMs))
@@ -514,9 +564,10 @@ class MusicLibraryService : MediaLibraryService() {
                         return@launch
                     }
 
-                    val song = app.database.songDao().getSongById(mediaId) ?: app.currentQueue.firstOrNull { it.id == mediaId }
-                    if (song != null) {
-                        settableFuture.set(LibraryResult.ofItem(song.toMediaItem(), null))
+                    val dbSong = app.database.songDao().getSongById(mediaId) ?: app.currentQueue.firstOrNull { it.id == mediaId }
+                    if (dbSong != null) {
+                           var item = dbSong.toMediaItem()
+                        settableFuture.set(LibraryResult.ofItem(item, null))
                     } else {
                         settableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE))
                     }
