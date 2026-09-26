@@ -11,15 +11,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.ChevronLeft
-import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FolderOpen
@@ -33,8 +28,6 @@ import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Swipe
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbUp
-import androidx.compose.ui.text.input.ImeAction
-import androidx.media3.common.Player
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -48,11 +41,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.musicdlp.data.Song
+import androidx.media3.common.Player
 import coil.compose.AsyncImage
+import com.example.musicdlp.data.Song
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -60,7 +55,13 @@ import kotlin.math.roundToInt
 
 @Composable
 fun SwipingScreen(viewModel: MusicViewModel) {
-    val songs by viewModel.songsToSwipe.collectAsState()
+    val activePlayingList by viewModel.activePlayingList.collectAsState()
+    val currentIndex by viewModel.currentIndex.collectAsState()
+
+    val currentSong = remember(activePlayingList, currentIndex) {
+        if (currentIndex in activePlayingList.indices) activePlayingList[currentIndex] else null
+    }
+
     val isPlaylistLoading by viewModel.isPlaylistLoading.collectAsState()
     val isBuffering by viewModel.isBuffering.collectAsState()
     val playlistTotal by viewModel.playlistTotal.collectAsState()
@@ -79,8 +80,8 @@ fun SwipingScreen(viewModel: MusicViewModel) {
     val uniqueNew = remember(playlistNewSongs) {
         playlistNewSongs.distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
     }
-    val uniqueAll = remember(uniqueLiked, uniqueDisliked, uniqueNew, songs) {
-        (uniqueLiked + uniqueDisliked + uniqueNew + songs).distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
+    val uniqueAll = remember(uniqueLiked, uniqueDisliked, uniqueNew, activePlayingList) {
+        (uniqueLiked + uniqueDisliked + uniqueNew + activePlayingList).distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
     }
 
     var showLikedPlaylistDialog by remember { mutableStateOf(false) }
@@ -179,7 +180,7 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             }
         )
     }
-    
+
     var searchOrUrlInput by remember { mutableStateOf("") }
     val context = LocalContext.current
     val directoryPickerLauncher = rememberLauncherForActivityResult(
@@ -194,7 +195,6 @@ fun SwipingScreen(viewModel: MusicViewModel) {
         val query = searchOrUrlInput.trim()
         if (query.isBlank()) return
 
-        // Dismiss the software keyboard and drop cursor focus
         keyboardController?.hide()
         focusManager.clearFocus()
 
@@ -214,7 +214,7 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             .fillMaxSize()
             .padding(12.dp)
     ) {
-        // 1. Static Top Bar (Unified Search / Playlist URL + Folder Scan)
+        // 1. Static Top Bar
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -245,7 +245,7 @@ fun SwipingScreen(viewModel: MusicViewModel) {
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        // 2. Error message box if any
+        // 2. Error Message
         errorMessage?.let { error ->
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
@@ -260,7 +260,7 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             }
         }
 
-        // 3. Mode Selector & Static Chips Row
+        // 3. Mode Selector & Chips Row
         val currentSwipingMode by viewModel.swipingMode.collectAsState()
 
         Row(
@@ -328,23 +328,22 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             Spacer(modifier = Modifier.height(4.dp))
         }
 
-        // 4. Center Area with TinderCard
+        // 4. Swiping Area / TinderCard Deck
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth(),
             contentAlignment = Alignment.Center
         ) {
-            if (songs.isEmpty() && (isPlaylistLoading || isBuffering)) {
+            if (activePlayingList.isEmpty() && (isPlaylistLoading || isBuffering)) {
                 CircularProgressIndicator()
-            } else if (songs.isNotEmpty()) {
-                val currentSong = songs.first()
+            } else if (currentSong != null) {
                 key(currentSong.id) {
                     TinderCard(
                         song = currentSong,
                         viewModel = viewModel,
-                        onSwipedLeft = { viewModel.dislikeSong(currentSong, true) },
-                        onSwipedRight = { viewModel.likeSong(currentSong, true) }
+                        onSwipedLeft = { viewModel.dislikeSong(currentSong, advance = true) },
+                        onSwipedRight = { viewModel.likeSong(currentSong, advance = true) }
                     )
                 }
             } else {
@@ -363,7 +362,7 @@ fun TinderCard(
 ) {
     val currentOnSwipedLeft by rememberUpdatedState(onSwipedLeft)
     val currentOnSwipedRight by rememberUpdatedState(onSwipedRight)
-    
+
     val isSongLoading by viewModel.isSongLoading.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val hasUserSwiped by viewModel.hasUserSwiped.collectAsState()
@@ -476,9 +475,9 @@ fun TinderCard(
                 Spacer(modifier = Modifier.height(4.dp))
 
                 val isLocalFile = song.youtubeUrl.startsWith("content://") ||
-                                  song.youtubeUrl.startsWith("file://") ||
-                                  song.youtubeUrl.startsWith("/") ||
-                                  song.id.startsWith("local_")
+                        song.youtubeUrl.startsWith("file://") ||
+                        song.youtubeUrl.startsWith("/") ||
+                        song.id.startsWith("local_")
 
                 val labelPrefix = if (isLocalFile) "File Name: " else "YouTube: "
 
@@ -703,8 +702,11 @@ fun PlayerControls(
             }
 
             IconButton(
-                onClick = { onPrevious?.invoke() },
-                enabled = onPrevious != null && canGoPrevious,
+                onClick = {
+                    if (onPrevious != null) onPrevious.invoke()
+                    else viewModel.playPreviousInContext()
+                },
+                enabled = canGoPrevious,
                 modifier = Modifier.size(48.dp)
             ) {
                 Icon(
@@ -739,8 +741,11 @@ fun PlayerControls(
             }
 
             IconButton(
-                onClick = { onNext?.invoke() },
-                enabled = onNext != null && canGoNext,
+                onClick = {
+                    if (onNext != null) onNext.invoke()
+                    else viewModel.playNextInContext()
+                },
+                enabled = canGoNext,
                 modifier = Modifier.size(48.dp)
             ) {
                 Icon(
@@ -805,9 +810,9 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
             label = { Text("Search Liked (Artist or Song)") },
             modifier = Modifier.fillMaxWidth()
         )
-        
+
         val filteredLikedList = remember(likedSongs, searchQuery) {
-            likedSongs.filter { 
+            likedSongs.filter {
                 it.title.contains(searchQuery, ignoreCase = true) || it.artist.contains(searchQuery, ignoreCase = true)
             }
         }
@@ -833,7 +838,7 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
                         colors = ListItemDefaults.colors(
                             containerColor = Color.Transparent
                         ),
-                        headlineContent = { 
+                        headlineContent = {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     text = song.title,
@@ -1186,12 +1191,10 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
         Spacer(modifier = Modifier.height(8.dp))
 
         val filteredDislikedList = remember(dislikedSongs, searchQuery) {
-            dislikedSongs.filter { 
+            dislikedSongs.filter {
                 it.title.contains(searchQuery, ignoreCase = true) || it.artist.contains(searchQuery, ignoreCase = true)
             }
         }
-
-        val playingIndex = filteredDislikedList.indexOfFirst { it.id == currentlyPlayingId }
 
         LazyColumn(modifier = Modifier.weight(1f)) {
             items(filteredDislikedList) { song ->
@@ -1213,7 +1216,7 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
                         colors = ListItemDefaults.colors(
                             containerColor = Color.Transparent
                         ),
-                        headlineContent = { 
+                        headlineContent = {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     text = song.title,
@@ -1237,7 +1240,7 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
                                     AssistChip(
                                         onClick = { songForAlternatesDialog = song },
                                         label = { Text("Alternates (${alternates.size})") },
-                                        leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(14.dp)) }
+                                        leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(16.dp)) }
                                     )
                                 }
                             }
@@ -1266,7 +1269,6 @@ fun DislikedSongsScreen(viewModel: MusicViewModel) {
                 }
             }
         }
-
     }
 }
 

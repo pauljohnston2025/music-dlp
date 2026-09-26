@@ -18,12 +18,15 @@ class MusicDLPApplication : Application() {
     @Volatile
     var currentQueue: List<Song> = emptyList()
 
+    // todo remove this, make service do this
     @Volatile
     var playlistLikedSongs: List<Song> = emptyList()
 
+    // todo remove this, make service do this
     @Volatile
     var playlistDislikedSongs: List<Song> = emptyList()
 
+    // todo remove this, make service do this
     @Volatile
     var playlistNewSongs: List<Song> = emptyList()
 

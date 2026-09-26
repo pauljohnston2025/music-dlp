@@ -40,6 +40,7 @@ import com.google.common.util.concurrent.SettableFuture
 import io.github.aakira.napier.Napier
 import kotlinx.coroutines.*
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 private const val CUSTOM_ACTION_LIKE = "com.example.musicdlp.COMMAND_LIKE"
 private const val CUSTOM_ACTION_DISLIKE = "com.example.musicdlp.COMMAND_DISLIKE"
@@ -89,17 +90,12 @@ class MusicLibraryService : MediaLibraryService() {
             .setUsage(C.USAGE_MEDIA)
             .build()
 
-        // 1. Base DataSource Factory (for HTTP and local files)
         val upstreamFactory = DefaultDataSource.Factory(this)
-
-// 2. Wrap it in ResolvingDataSource.Factory to resolve playable URIs lazily
-        // In MusicLibraryService.kt inside onCreate()
 
         val resolvingDataSourceFactory = ResolvingDataSource.Factory(upstreamFactory) { dataSpec ->
             val uri = dataSpec.uri
             val uriStr = uri.toString()
 
-            // Check if URI is already a direct playable stream or file
             val isAlreadyPlayable = (uriStr.startsWith("http") && !uriStr.contains("youtube.com") && !uriStr.contains("dummy")) ||
                     uriStr.startsWith("file://") ||
                     uriStr.startsWith("content://")
@@ -108,7 +104,6 @@ class MusicLibraryService : MediaLibraryService() {
                 return@Factory dataSpec
             }
 
-            // FIX: Extract actual media ID instead of blindly using lastPathSegment ("watch")
             val mediaId = when {
                 uri.host == "dummy.local" -> uri.lastPathSegment ?: ""
                 uriStr.contains("v=") -> uri.getQueryParameter("v") ?: ""
@@ -120,7 +115,6 @@ class MusicLibraryService : MediaLibraryService() {
                 return@Factory dataSpec
             }
 
-            // Synchronously resolve the URI on ExoPlayer's IO thread right before buffer/play
             runBlocking(Dispatchers.IO) {
                 val app = application as MusicDLPApplication
                 val repository = YoutubeDLRepository(app)
@@ -144,7 +138,6 @@ class MusicLibraryService : MediaLibraryService() {
             }
         }
 
-        // 3. Build ExoPlayer using DefaultMediaSourceFactory with the ResolvingDataSource
         val mediaSourceFactory = DefaultMediaSourceFactory(this)
             .setDataSourceFactory(resolvingDataSourceFactory)
 
@@ -159,15 +152,25 @@ class MusicLibraryService : MediaLibraryService() {
                 if (mediaItem != null) {
                     val mediaId = mediaItem.mediaId
                     if (mediaId != "ROOT" && mediaId != "no_more_songs") {
-                        // Pre-buffer next item safely without disrupting current playback
-                        val nextIndex = exoPlayer.currentMediaItemIndex + 1
+                        val currentIndex = exoPlayer.currentMediaItemIndex
+
+                        // Broadcast the index change so the ViewModel / TinderCard can stay in sync
+                        val intent = Intent("com.example.musicdlp.ACTION_QUEUE_CHANGED").apply {
+                            setPackage(packageName)
+                            putExtra(EXTRA_CURRENT_INDEX, currentIndex)
+                            putExtra(EXTRA_SONG_ID, mediaItem.mediaId)
+                        }
+                        sendBroadcast(intent)
+
+                        // Pre-buffering logic...
+                        val nextIndex = currentIndex + 1
                         if (nextIndex < exoPlayer.mediaItemCount) {
                             val app = application as MusicDLPApplication
                             val repository = YoutubeDLRepository(app)
                             val nextItem = exoPlayer.getMediaItemAt(nextIndex)
                             prebufferNextItem(repository, nextItem)
                         }
-                    }
+                        }
                 }
                 updateNotificationLayout(mediaItem)
             }
@@ -185,14 +188,13 @@ class MusicLibraryService : MediaLibraryService() {
         })
 
         forwardingPlayer = object : ForwardingPlayer(exoPlayer) {
+            // FIX 1: Delegate listeners properly to super/exoPlayer so MediaSession receives timeline updates
             override fun addListener(listener: Player.Listener) {
                 super.addListener(listener)
-                playerListeners.add(listener)
             }
 
             override fun removeListener(listener: Player.Listener) {
                 super.removeListener(listener)
-                playerListeners.remove(listener)
             }
 
             override fun getAvailableCommands(): Player.Commands {
@@ -218,7 +220,22 @@ class MusicLibraryService : MediaLibraryService() {
 
             override fun hasPreviousMediaItem(): Boolean {
                 val extras = currentMediaItem?.mediaMetadata?.extras
-                return extras?.getBoolean("canGoPrevious", false) ?: false
+                return extras?.getBoolean("canGoPrevious", false) ?: super.hasPreviousMediaItem()
+            }
+
+            // FIX 2: Explicitly override seek functions for media controller integration
+            override fun seekToNext() {
+                if (super.hasNextMediaItem()) {
+                    super.seekToNext()
+                } else {
+                    seekToNextMediaItem()
+                }
+            }
+
+            override fun seekToNextMediaItem() {
+                if (super.hasNextMediaItem()) {
+                    super.seekToNextMediaItem()
+                }
             }
         }
 
@@ -244,11 +261,9 @@ class MusicLibraryService : MediaLibraryService() {
                 val targetSongId = intent.getStringExtra(EXTRA_SONG_ID)
                 val app = application as? MusicDLPApplication ?: return START_STICKY
 
-                // Read directly from Application state
                 val queue = app.currentQueue
                 val targetIndex = queue.indexOfFirst { it.id == targetSongId }.coerceAtLeast(0)
 
-                // Start playback
                 playQueueIndex(targetIndex)
             }
         }
@@ -263,7 +278,6 @@ class MusicLibraryService : MediaLibraryService() {
         val safeIndex = index.coerceIn(0, queue.size - 1)
         val mediaItems = queue.map { it.toMediaItem() }
 
-        // ExoPlayer handles indexing internally
         exoPlayer.setMediaItems(mediaItems, safeIndex, C.TIME_UNSET)
         exoPlayer.prepare()
         exoPlayer.play()
@@ -283,7 +297,6 @@ class MusicLibraryService : MediaLibraryService() {
         title: String,
         artist: String
     ): String? {
-        // 1. Check local file on disk first
         val safeArtist = artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
         val safeTitle = title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
         if (safeTitle.isNotBlank()) {
@@ -301,13 +314,11 @@ class MusicLibraryService : MediaLibraryService() {
             return youtubeUrl
         }
 
-        // 2. Check stream URL cache
         bufferedStreamUrls[songId]?.let {
             Napier.d("Using cached stream URL for $songId", tag = "DEBUG_METADATA")
             return it
         }
 
-        // 3. Fetch stream URL on demand for this single song
         if (youtubeUrl.startsWith("http://") || youtubeUrl.startsWith("https://")) {
             Napier.d("Fetching stream URL for $title ($youtubeUrl)", tag = "DEBUG_METADATA")
             val url = repository.getStreamUrl(youtubeUrl)
@@ -333,7 +344,6 @@ class MusicLibraryService : MediaLibraryService() {
             val artist = dbSong?.artist ?: item.mediaMetadata.artist?.toString() ?: ""
             val youtubeUrl = dbSong?.youtubeUrl ?: item.requestMetadata.mediaUri?.toString() ?: item.localConfiguration?.uri?.toString() ?: ""
 
-            // Check disk first
             val safeArtist = artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
             val safeTitle = title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
             if (safeTitle.isNotBlank()) {
@@ -424,12 +434,18 @@ class MusicLibraryService : MediaLibraryService() {
 
     override fun onDestroy() {
         try { unregisterReceiver(queueReceiver) } catch (e: Exception) {}
+
+        serviceScope.cancel()
+
         mediaSession?.run {
             player.release()
             release()
             mediaSession = null
         }
-        serviceScope.cancel()
+
+        searchResultsCache.clear()
+        bufferedStreamUrls.clear()
+
         super.onDestroy()
     }
 
@@ -545,9 +561,9 @@ class MusicLibraryService : MediaLibraryService() {
 
                             listOf(
                                 createBrowsableItem("NOW_PLAYING_LIKED", "Liked (${likedList.size})"),
-                            createBrowsableItem("NOW_PLAYING_DISLIKED", "Disliked (${dislikedList.size})"),
-                            createBrowsableItem("NOW_PLAYING_NEW", "New (${newList.size})"),
-                            createBrowsableItem("NOW_PLAYING_ALL", "All Songs (${queue.size})")
+                                createBrowsableItem("NOW_PLAYING_DISLIKED", "Disliked (${dislikedList.size})"),
+                                createBrowsableItem("NOW_PLAYING_NEW", "New (${newList.size})"),
+                                createBrowsableItem("NOW_PLAYING_ALL", "All Songs (${queue.size})")
                             )
                         }
                         "NOW_PLAYING_LIKED" -> {
@@ -622,10 +638,8 @@ class MusicLibraryService : MediaLibraryService() {
 
                     val mediaId = clickedItem.mediaId
 
-                    // Read parentId from extras
                     val parentId = clickedItem.requestMetadata.extras?.getString("parentId")?.uppercase() ?: ""
 
-                    // Handle setting mode toggles
                     if (mediaId.startsWith("MODE_")) {
                         val modeStr = when (mediaId) {
                             "MODE_NEW_AND_LIKED" -> "NEW_AND_LIKED"
@@ -664,7 +678,6 @@ class MusicLibraryService : MediaLibraryService() {
                             playSongInContext(mediaId, list, "ONLY_NEW")
                         }
                         else -> {
-                            // Fallback to active queue or single item lookup
                             val fallbackList = queue.ifEmpty {
                                 app.database.songDao().getSongById(mediaId)?.let { listOf(it) } ?: emptyList()
                             }
@@ -694,7 +707,6 @@ class MusicLibraryService : MediaLibraryService() {
                 try {
                     val app = application as MusicDLPApplication
 
-                    // 1. Handle Navigation and Settings Items Immediately
                     val browsableItem = when (mediaId.uppercase()) {
                         "ROOT", "/", "MEDIA_ROOT" -> createBrowsableItem("ROOT", "MusicDLP")
                         "NOW_PLAYING" -> createBrowsableItem("NOW_PLAYING", "Now Playing")
@@ -715,13 +727,10 @@ class MusicLibraryService : MediaLibraryService() {
                         return@launch
                     }
 
-                    // 2. Fetch Song Metadata from DB or Active Queue
                     val dbSong = app.database.songDao().getSongById(mediaId)
                         ?: app.currentQueue.firstOrNull { it.id == mediaId }
 
                     if (dbSong != null) {
-                        // DO NOT call resolvePlayableUri here!
-                        // Return lightweight MediaItem instantly; ResolvingMediaSource handles stream resolution.
                         val item = dbSong.toMediaItem()
                         settableFuture.set(LibraryResult.ofItem(item, null))
                     } else {
@@ -812,20 +821,16 @@ class MusicLibraryService : MediaLibraryService() {
             contextList: List<Song>,
             swipingMode: String
         ): MediaSession.MediaItemsWithStartPosition {
-            // 1. Find the target index within the context list
             val targetIndex = contextList.indexOfFirst { it.id == targetMediaId }.coerceAtLeast(0)
 
-            // 2. Broadcast mode change to keep ViewModel / UI state synced
             val intent = Intent("com.example.musicdlp.ACTION_SET_MODE").apply {
                 setPackage(packageName)
                 putExtra("mode", swipingMode)
             }
             sendBroadcast(intent)
 
-            // 3. Update application queue context
             (application as MusicDLPApplication).currentQueue = contextList
 
-            // 4. Map songs to lightweight MediaItems for ExoPlayer
             val mediaItems = contextList.map { it.toMediaItem() }
 
             return MediaSession.MediaItemsWithStartPosition(

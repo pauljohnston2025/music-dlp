@@ -80,7 +80,7 @@ fun MainScreen() {
     val snackbarHostState = remember { SnackbarHostState() }
     val errorMessage by viewModel.errorMessage.collectAsState()
     val currentPlayingSong by viewModel.currentPlayingSong.collectAsState()
-    val canGoBack by viewModel.canGoBack.collectAsState()
+    val canGoBack by viewModel.canGoPreviousInContext.collectAsState()
 
     val context = LocalContext.current
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
