@@ -1,9 +1,14 @@
 package com.example.musicdlp.data
 
+import android.net.Uri
+import android.os.Bundle
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import java.io.File
 
 @Serializable
 data class AlternateVersion(
@@ -54,4 +59,58 @@ data class Song(
         val alternates = getAlternateVersionsList(json)
         return alternates.any { it.youtubeUrl.contains(targetUrlOrId) || targetUrlOrId.contains(it.youtubeUrl) }
     }
+}
+
+fun Song.toMediaItem(
+    playableUri: String? = null,
+    canGoPrevious: Boolean = false,
+    canGoNext: Boolean = false,
+    swipingMode: String = "ONLY_NEW"
+): MediaItem {
+    val artworkUri = if (thumbnailUrl.isNotBlank()) {
+        Uri.parse(thumbnailUrl)
+    } else if (youtubeUrl.contains("watch?v=")) {
+        val id = youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+        Uri.parse("https://i.ytimg.com/vi/$id/hqdefault.jpg")
+    } else null
+
+    val safeId = id.ifBlank { "unknown_${youtubeUrl.hashCode()}" }
+
+    val uriToUse: Uri = when {
+        !playableUri.isNullOrBlank() -> if (playableUri.startsWith("/")) Uri.fromFile(File(playableUri)) else Uri.parse(playableUri)
+        youtubeUrl.startsWith("content://") || youtubeUrl.startsWith("file://") || youtubeUrl.startsWith("/") -> {
+            if (youtubeUrl.startsWith("/")) Uri.fromFile(File(youtubeUrl)) else Uri.parse(youtubeUrl)
+        }
+        youtubeUrl.startsWith("http://") || youtubeUrl.startsWith("https://") -> Uri.parse(youtubeUrl)
+        else -> Uri.parse("http://dummy/$safeId")
+    }
+
+    val itemExtras = Bundle().apply {
+        putBoolean("isLiked", isLiked)
+        putBoolean("isDisliked", isDisliked)
+        putBoolean("canGoPrevious", canGoPrevious)
+        putBoolean("canGoNext", canGoNext)
+        putString("swipingMode", swipingMode)
+        putString("songId", id)
+        putString("rawTitle", rawTitle)
+        putString("artist", artist)
+        putString("title", title)
+        putString("youtubeUrl", youtubeUrl)
+    }
+
+    return MediaItem.Builder()
+        .setMediaId(id)
+        .setUri(uriToUse)
+        .setMediaMetadata(
+            MediaMetadata.Builder()
+                .setTitle(title.ifBlank { "Unknown Title" })
+                .setArtist(artist.ifBlank { "MusicDLP" })
+                .setArtworkUri(artworkUri)
+                .setIsBrowsable(false)
+                .setIsPlayable(true)
+                .setFolderType(MediaMetadata.FOLDER_TYPE_NONE)
+                .setExtras(itemExtras)
+                .build()
+        )
+        .build()
 }

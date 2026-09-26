@@ -18,6 +18,15 @@ class MusicDLPApplication : Application() {
     @Volatile
     var currentQueue: List<Song> = emptyList()
 
+    @Volatile
+    var playlistLikedSongs: List<Song> = emptyList()
+
+    @Volatile
+    var playlistDislikedSongs: List<Song> = emptyList()
+
+    @Volatile
+    var playlistNewSongs: List<Song> = emptyList()
+
     override fun onCreate() {
         super.onCreate()
 

@@ -17,10 +17,9 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.drm.DrmSessionManagerProvider
+import androidx.media3.datasource.ResolvingDataSource
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.source.MediaSource
-import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
@@ -31,8 +30,8 @@ import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
 import com.example.musicdlp.MusicDLPApplication
 import com.example.musicdlp.R
-import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.YoutubeDLRepository
+import com.example.musicdlp.data.toMediaItem
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -44,92 +43,6 @@ import java.io.File
 private const val CUSTOM_ACTION_LIKE = "com.example.musicdlp.COMMAND_LIKE"
 private const val CUSTOM_ACTION_DISLIKE = "com.example.musicdlp.COMMAND_DISLIKE"
 private const val CUSTOM_ACTION_CYCLE_MODE = "com.example.musicdlp.COMMAND_CYCLE_MODE"
-
-@UnstableApi
-class CustomMediaSourceFactory(
-    context: Context,
-    private var app : MusicDLPApplication,
-    private val repository : YoutubeDLRepository
-) : MediaSource.Factory by DefaultMediaSourceFactory(context) {
-
-    private val defaultFactory = DefaultMediaSourceFactory(context)
-
-    override fun createMediaSource(item: MediaItem): MediaSource {
-        // Check if the URI is already resolved
-        if (item.localConfiguration?.uri != null) {
-            return defaultFactory.createMediaSource(item)
-        }
-
-        // Defer stream resolution until ExoPlayer prepares/plays this item
-        val mediaId = item.mediaId
-        val resolvedItem = runBlocking(Dispatchers.IO) {
-            val dbSong = app.database.songDao().getSongById(mediaId)
-                ?: app.currentQueue.firstOrNull { it.id == mediaId }
-            var resolved = item
-            if (dbSong != null) {
-                val repository = YoutubeDLRepository(app)
-
-                resolved = dbSong.toMediaItem()
-
-                val playableUriStr: String? = if (dbSong != null) {
-                    val safeArtist = dbSong.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
-                    val safeTitle = dbSong.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
-                    val finalFileName = "$safeArtist - $safeTitle.mp3"
-                    val publicMusicDir =
-                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
-                    val downloadDir = File(publicMusicDir, "MusicDLP")
-                    val targetFile = File(downloadDir, finalFileName)
-
-                    if (targetFile.exists()) {
-                        targetFile.absolutePath
-                    } else if (dbSong.youtubeUrl.startsWith("content://") || dbSong.youtubeUrl.startsWith(
-                            "file://"
-                        ) || dbSong.youtubeUrl.startsWith("/")
-                    ) {
-                        dbSong.youtubeUrl
-                    } else {
-                        repository.getStreamUrl(dbSong.youtubeUrl)
-                    }
-                } else if (item.requestMetadata.mediaUri != null && item.requestMetadata.mediaUri.toString()
-                        .startsWith("http")
-                ) {
-                    repository.getStreamUrl(item.requestMetadata.mediaUri.toString())
-                } else null
-
-                if (!playableUriStr.isNullOrBlank()) {
-                    val parsedUri = if (playableUriStr.startsWith("/")) {
-                        Uri.fromFile(File(playableUriStr))
-                    } else {
-                        Uri.parse(playableUriStr)
-                    }
-
-                    val updatedMetadata = item.mediaMetadata.buildUpon()
-                        .setTitle(
-                            dbSong?.title ?: item.mediaMetadata.title ?: "MusicDLP"
-                        )
-                        .setArtist(
-                            dbSong?.artist ?: item.mediaMetadata.artist ?: "MusicDLP"
-                        )
-                        .setIsBrowsable(false)
-                        .setIsPlayable(true)
-                        .build()
-
-
-                        resolved = item.buildUpon()
-                            .setUri(parsedUri)
-                            .setMediaMetadata(updatedMetadata)
-                            .build()
-                }
-
-                resolved
-            }
-
-            resolved
-        }
-
-        return defaultFactory.createMediaSource(resolvedItem)
-    }
-}
 
 @OptIn(UnstableApi::class)
 class MusicLibraryService : MediaLibraryService() {
@@ -146,21 +59,20 @@ class MusicLibraryService : MediaLibraryService() {
     private val playerListeners = mutableSetOf<Player.Listener>()
     private val searchResultsCache = mutableMapOf<String, List<MediaItem>>()
 
+    // Service-level cache of resolved YouTube audio stream URLs
+    private val bufferedStreamUrls = mutableMapOf<String, String>()
+
     private val queueReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.example.musicdlp.ACTION_QUEUE_CHANGED") {
                 val app = application as? MusicDLPApplication ?: return
                 val queue = app.currentQueue
-                val queueCount = queue.size
                 val session = mediaSession ?: return
-
-                session.notifyChildrenChanged("NOW_PLAYING", queueCount, null)
+                session.notifyChildrenChanged("NOW_PLAYING", queue.size, null)
             }
         }
     }
 
-
-    @OptIn(UnstableApi::class)
     override fun onCreate() {
         super.onCreate()
 
@@ -169,7 +81,57 @@ class MusicLibraryService : MediaLibraryService() {
             .setUsage(C.USAGE_MEDIA)
             .build()
 
-        val mediaSourceFactory = CustomMediaSourceFactory(this, application as MusicDLPApplication, YoutubeDLRepository(application as MusicDLPApplication))
+        // 1. Base DataSource Factory (for HTTP and local files)
+        val upstreamFactory = DefaultDataSource.Factory(this)
+
+// 2. Wrap it in ResolvingDataSource.Factory to resolve playable URIs lazily
+        val resolvingDataSourceFactory = ResolvingDataSource.Factory(upstreamFactory) { dataSpec ->
+            val uri = dataSpec.uri
+            val uriStr = uri.toString()
+
+            // Check if URI is already a direct playable stream/file
+            val isAlreadyPlayable = (uriStr.startsWith("http") && !uriStr.contains("youtube.com") && !uriStr.contains("dummy")) ||
+                    uriStr.startsWith("file://") ||
+                    uriStr.startsWith("content://")
+
+            if (isAlreadyPlayable) {
+                return@Factory dataSpec
+            }
+
+            // Extract mediaId or safe ID from dummy URI or host
+            val mediaId = uri.lastPathSegment ?: ""
+
+            if (mediaId.isBlank() || mediaId.startsWith("MODE_") || mediaId == "no_more_songs") {
+                return@Factory dataSpec
+            }
+
+            // Synchronously resolve the URI on ExoPlayer's IO thread right before buffer/play
+            runBlocking(Dispatchers.IO) {
+                val app = application as MusicDLPApplication
+                val repository = YoutubeDLRepository(app)
+                val dbSong = app.database.songDao().getSongById(mediaId)
+                    ?: app.currentQueue.firstOrNull { it.id == mediaId }
+
+                val title = dbSong?.title ?: ""
+                val artist = dbSong?.artist ?: ""
+                val youtubeUrl = dbSong?.youtubeUrl ?: uriStr
+
+                val playableUri = resolvePlayableUri(app, repository, mediaId, youtubeUrl, title, artist)
+
+                if (!playableUri.isNullOrBlank()) {
+                    val parsedUri = if (playableUri.startsWith("/")) Uri.fromFile(File(playableUri)) else Uri.parse(playableUri)
+                    dataSpec.buildUpon()
+                        .setUri(parsedUri)
+                        .build()
+                } else {
+                    dataSpec
+                }
+            }
+        }
+
+        // 3. Build ExoPlayer using DefaultMediaSourceFactory with the ResolvingDataSource
+        val mediaSourceFactory = DefaultMediaSourceFactory(this)
+            .setDataSourceFactory(resolvingDataSourceFactory)
 
         exoPlayer = ExoPlayer.Builder(this)
             .setAudioAttributes(audioAttributes, true)
@@ -179,6 +141,19 @@ class MusicLibraryService : MediaLibraryService() {
 
         exoPlayer.addListener(object : Player.Listener {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                if (mediaItem != null) {
+                    val mediaId = mediaItem.mediaId
+                    if (mediaId != "ROOT" && mediaId != "no_more_songs") {
+                        // Pre-buffer next item safely without disrupting current playback
+                        val nextIndex = exoPlayer.currentMediaItemIndex + 1
+                        if (nextIndex < exoPlayer.mediaItemCount) {
+                            val app = application as MusicDLPApplication
+                            val repository = YoutubeDLRepository(app)
+                            val nextItem = exoPlayer.getMediaItemAt(nextIndex)
+                            prebufferNextItem(repository, nextItem)
+                        }
+                    }
+                }
                 updateNotificationLayout(mediaItem)
             }
 
@@ -230,24 +205,6 @@ class MusicLibraryService : MediaLibraryService() {
                 val extras = currentMediaItem?.mediaMetadata?.extras
                 return extras?.getBoolean("canGoPrevious", false) ?: false
             }
-
-//            override fun seekToNext() {
-//                val intent = Intent("com.example.musicdlp.ACTION_NEXT").apply { setPackage(packageName) }
-//                sendBroadcast(intent)
-//            }
-
-//            override fun seekToNextMediaItem() {
-//                seekToNext()
-//            }
-//
-//            override fun seekToPrevious() {
-//                val intent = Intent("com.example.musicdlp.ACTION_PREVIOUS").apply { setPackage(packageName) }
-//                sendBroadcast(intent)
-//            }
-//
-//            override fun seekToPreviousMediaItem() {
-//                seekToPrevious()
-//            }
         }
 
         mediaSession = MediaLibrarySession.Builder(this, forwardingPlayer, LibrarySessionCallback())
@@ -263,6 +220,89 @@ class MusicLibraryService : MediaLibraryService() {
 
         val filter = IntentFilter("com.example.musicdlp.ACTION_QUEUE_CHANGED")
         ContextCompat.registerReceiver(this, queueReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+    }
+
+    private suspend fun resolvePlayableUri(
+        app: MusicDLPApplication,
+        repository: YoutubeDLRepository,
+        songId: String,
+        youtubeUrl: String,
+        title: String,
+        artist: String
+    ): String? {
+        // 1. Check local file on disk first
+        val safeArtist = artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+        val safeTitle = title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+        if (safeTitle.isNotBlank()) {
+            val finalFileName = "$safeArtist - $safeTitle.mp3"
+            val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+            val downloadDir = File(publicMusicDir, "MusicDLP")
+            val targetFile = File(downloadDir, finalFileName)
+            if (targetFile.exists()) {
+                Napier.d("Found downloaded file for $artist - $title: ${targetFile.absolutePath}", tag = "DEBUG_METADATA")
+                return targetFile.absolutePath
+            }
+        }
+
+        if (youtubeUrl.startsWith("content://") || youtubeUrl.startsWith("file://") || youtubeUrl.startsWith("/")) {
+            return youtubeUrl
+        }
+
+        // 2. Check stream URL cache
+        bufferedStreamUrls[songId]?.let {
+            Napier.d("Using cached stream URL for $songId", tag = "DEBUG_METADATA")
+            return it
+        }
+
+        // 3. Fetch stream URL on demand for this single song
+        if (youtubeUrl.startsWith("http://") || youtubeUrl.startsWith("https://")) {
+            Napier.d("Fetching stream URL for $title ($youtubeUrl)", tag = "DEBUG_METADATA")
+            val url = repository.getStreamUrl(youtubeUrl)
+            if (url != null) {
+                bufferedStreamUrls[songId] = url
+                return url
+            }
+        }
+
+        return null
+    }
+
+    private fun prebufferNextItem(repository: YoutubeDLRepository, item: MediaItem) {
+        serviceScope.launch(Dispatchers.IO) {
+            val app = application as MusicDLPApplication
+            val mediaId = item.mediaId
+            if (bufferedStreamUrls.containsKey(mediaId)) return@launch
+
+            val dbSong = app.database.songDao().getSongById(mediaId)
+                ?: app.currentQueue.firstOrNull { it.id == mediaId }
+
+            val title = dbSong?.title ?: item.mediaMetadata.title?.toString() ?: ""
+            val artist = dbSong?.artist ?: item.mediaMetadata.artist?.toString() ?: ""
+            val youtubeUrl = dbSong?.youtubeUrl ?: item.requestMetadata.mediaUri?.toString() ?: item.localConfiguration?.uri?.toString() ?: ""
+
+            // Check disk first
+            val safeArtist = artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+            val safeTitle = title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+            if (safeTitle.isNotBlank()) {
+                val targetFile = File(File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "MusicDLP"), "$safeArtist - $safeTitle.mp3")
+                if (targetFile.exists()) return@launch
+            }
+            if (youtubeUrl.startsWith("content://") || youtubeUrl.startsWith("file://") || youtubeUrl.startsWith("/")) {
+                return@launch
+            }
+
+            if (youtubeUrl.startsWith("http://") || youtubeUrl.startsWith("https://")) {
+                try {
+                    Napier.d("Pre-buffering stream URL for next song: $title", tag = "DEBUG_METADATA")
+                    val streamUrl = repository.getStreamUrl(youtubeUrl)
+                    if (streamUrl != null) {
+                        bufferedStreamUrls[mediaId] = streamUrl
+                    }
+                } catch (e: Exception) {
+                    Napier.w("Pre-buffering failed for $title: ${e.message}", tag = "DEBUG_METADATA")
+                }
+            }
+        }
     }
 
     private fun buildCustomLayout(mediaItem: MediaItem?): ImmutableList<CommandButton> {
@@ -347,11 +387,6 @@ class MusicLibraryService : MediaLibraryService() {
             session: MediaSession,
             controller: MediaSession.ControllerInfo
         ): MediaSession.ConnectionResult {
-            Napier.d(
-                "Connection request from ${controller.packageName} (isPackageNameVerified=${controller.isPackageNameVerified}) (isTrusted=${controller.isTrusted})",
-                tag = "DEBUG_METADATA"
-            )
-
             val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
                 .add(customCommandLike)
                 .add(customCommandDislike)
@@ -397,8 +432,6 @@ class MusicLibraryService : MediaLibraryService() {
             browser: MediaSession.ControllerInfo,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<MediaItem>> {
-            Napier.d("onGetLibraryRoot called by ${browser.packageName}", tag = "DEBUG_METADATA")
-
             val rootExtras = Bundle().apply {
                 putBoolean("android.media.browse.SEARCH_SUPPORTED", true)
                 putBoolean("CONTENT_STYLE_SUPPORTED", true)
@@ -438,7 +471,6 @@ class MusicLibraryService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-            Napier.d("onGetChildren called for parentId: $parentId by ${browser.packageName}", tag = "DEBUG_METADATA")
             val settableFuture = SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
             serviceScope.launch(Dispatchers.IO) {
                 try {
@@ -446,11 +478,41 @@ class MusicLibraryService : MediaLibraryService() {
                     val children = when (parentId.uppercase()) {
                         "ROOT", "/", "MEDIA_ROOT" -> {
                             listOf(
-                                createBrowsableItem("NOW_PLAYING", "Now Playing"),
+                                createBrowsableItem("NOW_PLAYING", "Now Playing / Swipe List"),
                                 createBrowsableItem("LIKED", "Liked Songs"),
                                 createBrowsableItem("DISLIKED", "Disliked Songs"),
                                 createBrowsableItem("SETTINGS", "Settings / Playback Mode")
                             )
+                        }
+                        "NOW_PLAYING" -> {
+                            val queue = app.currentQueue
+                            val likedList = queue.filter { it.isLiked }
+                            val dislikedList = queue.filter { it.isDisliked }
+                            val newList = queue.filter { !it.isLiked && !it.isDisliked }
+
+                            listOf(
+                                createBrowsableItem("NOW_PLAYING_LIKED", "Liked (${likedList.size})"),
+                            createBrowsableItem("NOW_PLAYING_DISLIKED", "Disliked (${dislikedList.size})"),
+                            createBrowsableItem("NOW_PLAYING_NEW", "New (${newList.size})"),
+                            createBrowsableItem("NOW_PLAYING_ALL", "All Songs (${queue.size})")
+                            )
+                        }
+                        "NOW_PLAYING_LIKED" -> {
+                            val queue = app.currentQueue
+                            val liked = queue.filter { it.isLiked }
+                            val listToUse = if (liked.isNotEmpty()) liked else app.playlistLikedSongs
+                            listToUse.map { it.toMediaItem() }
+                        }
+                        "NOW_PLAYING_DISLIKED" -> {
+                            val queue = app.currentQueue
+                            val disliked = queue.filter { it.isDisliked }
+                            val listToUse = if (disliked.isNotEmpty()) disliked else app.playlistDislikedSongs
+                            listToUse.map { it.toMediaItem() }
+                        }
+                        "NOW_PLAYING_NEW" -> {
+                            val queue = app.currentQueue
+                            val newSongs = queue.filter { !it.isLiked && !it.isDisliked }
+                            newSongs.map { it.toMediaItem() }
                         }
                         "SETTINGS" -> {
                             listOf(
@@ -458,15 +520,6 @@ class MusicLibraryService : MediaLibraryService() {
                                 createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: New and Liked"),
                                 createPlayableSettingItem("MODE_PLAY_ALL", "Mode: Play All / Recategorise")
                             )
-                        }
-                        "NOW_PLAYING" -> {
-                            val queue = app.currentQueue
-                            if (queue.isNotEmpty()) {
-                                queue.map { it.toMediaItem() }
-                            } else {
-                                val liked = app.database.songDao().getLikedSongsList()
-                                liked.map { it.toMediaItem() }
-                            }
                         }
                         "LIKED" -> {
                             val liked = app.database.songDao().getLikedSongsList()
@@ -525,13 +578,41 @@ class MusicLibraryService : MediaLibraryService() {
                             continue
                         }
 
-                        resolvedItems.add(item)
+                        // Ensure every item returned has a non-null RequestMetadata URI to satisfy DefaultMediaSourceFactory
+                        val safeUri = item.localConfiguration?.uri ?: Uri.parse("https://dummy.local/$mediaId")
+                        val safeItem = item.buildUpon()
+                            .setUri(safeUri)
+                            .setRequestMetadata(
+                                MediaItem.RequestMetadata.Builder()
+                                    .setMediaUri(safeUri)
+                                    .build()
+                            )
+                            .build()
+
+                        resolvedItems.add(safeItem)
                     }
 
-                    settableFuture.set(MediaSession.MediaItemsWithStartPosition(resolvedItems, startIndex, startPositionMs))
+                    // FIX: Handle startIndex = -1 (C.INDEX_UNSET) safely
+                    val actualStartIndex = if (startIndex == C.INDEX_UNSET || startIndex < 0) {
+                        0
+                    } else {
+                        startIndex.coerceIn(0, (resolvedItems.size - 1).coerceAtLeast(0))
+                    }
+
+                    val actualPosition = if (startPositionMs == C.TIME_UNSET) 0L else startPositionMs
+
+                    withContext(Dispatchers.Main) {
+                        settableFuture.set(
+                            MediaSession.MediaItemsWithStartPosition(
+                                resolvedItems,
+                                actualStartIndex,
+                                actualPosition
+                            )
+                        )
+                    }
                 } catch (t: Throwable) {
                     Napier.e("onSetMediaItems failed: ${t.message}", t, tag = "DEBUG_METADATA")
-                    settableFuture.set(MediaSession.MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs))
+                    settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
                 }
             }
             return settableFuture
@@ -547,9 +628,14 @@ class MusicLibraryService : MediaLibraryService() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val app = application as MusicDLPApplication
+
+                    // 1. Handle Navigation and Settings Items Immediately
                     val browsableItem = when (mediaId.uppercase()) {
                         "ROOT", "/", "MEDIA_ROOT" -> createBrowsableItem("ROOT", "MusicDLP")
                         "NOW_PLAYING" -> createBrowsableItem("NOW_PLAYING", "Now Playing")
+                        "NOW_PLAYING_LIKED" -> createBrowsableItem("NOW_PLAYING_LIKED", "Liked Songs")
+                        "NOW_PLAYING_DISLIKED" -> createBrowsableItem("NOW_PLAYING_DISLIKED", "Disliked Songs")
+                        "NOW_PLAYING_NEW" -> createBrowsableItem("NOW_PLAYING_NEW", "New Songs")
                         "LIKED" -> createBrowsableItem("LIKED", "Liked Songs")
                         "DISLIKED" -> createBrowsableItem("DISLIKED", "Disliked Songs")
                         "SETTINGS" -> createBrowsableItem("SETTINGS", "Settings / Playback Mode")
@@ -564,9 +650,14 @@ class MusicLibraryService : MediaLibraryService() {
                         return@launch
                     }
 
-                    val dbSong = app.database.songDao().getSongById(mediaId) ?: app.currentQueue.firstOrNull { it.id == mediaId }
+                    // 2. Fetch Song Metadata from DB or Active Queue
+                    val dbSong = app.database.songDao().getSongById(mediaId)
+                        ?: app.currentQueue.firstOrNull { it.id == mediaId }
+
                     if (dbSong != null) {
-                           var item = dbSong.toMediaItem()
+                        // DO NOT call resolvePlayableUri here!
+                        // Return lightweight MediaItem instantly; ResolvingMediaSource handles stream resolution.
+                        val item = dbSong.toMediaItem()
                         settableFuture.set(LibraryResult.ofItem(item, null))
                     } else {
                         settableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE))
@@ -585,7 +676,6 @@ class MusicLibraryService : MediaLibraryService() {
             query: String,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<Void>> {
-            Napier.d("onSearch called for query: $query", tag = "DEBUG_METADATA")
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val app = application as MusicDLPApplication
@@ -623,7 +713,6 @@ class MusicLibraryService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-            Napier.d("onGetSearchResult called for query: $query", tag = "DEBUG_METADATA")
             val results = searchResultsCache[query] ?: emptyList()
             val returnParams = params ?: LibraryParams.Builder().setExtras(
                 Bundle().apply {
@@ -673,35 +762,4 @@ class MusicLibraryService : MediaLibraryService() {
                 .build()
         }
     }
-}
-
-@Suppress("DEPRECATION")
-fun Song.toMediaItem(): MediaItem {
-    val artworkUri = if (thumbnailUrl.isNotBlank()) {
-        Uri.parse(thumbnailUrl)
-    } else if (youtubeUrl.contains("watch?v=")) {
-        val id = youtubeUrl.substringAfter("watch?v=").substringBefore("&")
-        Uri.parse("https://i.ytimg.com/vi/$id/hqdefault.jpg")
-    } else null
-
-    val itemExtras = Bundle().apply {
-        putBoolean("isLiked", isLiked)
-        putBoolean("isDisliked", isDisliked)
-    }
-
-    return MediaItem.Builder()
-        .setMediaId(id)
-        .setUri(Uri.parse(if (youtubeUrl.isBlank()) "http://dummy" else youtubeUrl))
-        .setMediaMetadata(
-            MediaMetadata.Builder()
-                .setTitle(title.ifBlank { "Unknown Title" })
-                .setArtist(artist.ifBlank { "MusicDLP" })
-                .setArtworkUri(artworkUri)
-                .setIsBrowsable(false)
-                .setIsPlayable(true)
-                .setFolderType(MediaMetadata.FOLDER_TYPE_NONE)
-                .setExtras(itemExtras)
-                .build()
-        )
-        .build()
 }

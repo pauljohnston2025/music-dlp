@@ -223,7 +223,7 @@ fun BottomPlayerBar(
 
     Surface(
         color = MaterialTheme.colorScheme.surfaceColorAtElevation(4.dp),
-        shape = RectangleShape,
+        shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
         tonalElevation = 8.dp,
         shadowElevation = 10.dp,
         modifier = Modifier.fillMaxWidth()
