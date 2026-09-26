@@ -11,12 +11,20 @@ import kotlinx.serialization.json.Json
 import java.io.File
 
 @Serializable
+enum class SwipingMode(val displayName: String) {
+    ONLY_NEW("Only Categorise New"),
+    NEW_AND_LIKED("New and Liked"),
+    PLAY_ALL_RECATEGORISE("Play All / RecATEGORISE")
+}
+
+@Serializable
 data class AlternateVersion(
     val youtubeUrl: String,
     val rawTitle: String? = null,
     val thumbnailUrl: String? = null
 )
 
+@Serializable
 @Entity(tableName = "songs")
 data class Song(
     @PrimaryKey

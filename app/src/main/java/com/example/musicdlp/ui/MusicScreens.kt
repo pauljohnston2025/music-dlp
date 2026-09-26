@@ -1,5 +1,7 @@
 package com.example.musicdlp.ui
 
+import com.example.musicdlp.data.SwipingMode
+
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
@@ -270,7 +272,7 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            MusicViewModel.SwipingMode.values().forEach { mode ->
+            SwipingMode.entries.forEach { mode ->
                 FilterChip(
                     selected = currentSwipingMode == mode,
                     onClick = { viewModel.setSwipingMode(mode) },
@@ -338,7 +340,8 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             if (activePlayingList.isEmpty() && (isPlaylistLoading || isBuffering)) {
                 CircularProgressIndicator()
             } else if (currentSong != null) {
-                key(currentSong.id) {
+                // Change this line in SwipingScreen:
+                key(currentIndex, currentSong.id) {
                     TinderCard(
                         song = currentSong,
                         viewModel = viewModel,
@@ -689,9 +692,9 @@ fun PlayerControls(
         ) {
             IconButton(onClick = { viewModel.cycleSwipingMode() }) {
                 val (modeIcon, modeTint) = when (swipingMode) {
-                    MusicViewModel.SwipingMode.ONLY_NEW -> Icons.Default.MusicNote to MaterialTheme.colorScheme.primary
-                    MusicViewModel.SwipingMode.NEW_AND_LIKED -> Icons.Default.ThumbUp to MaterialTheme.colorScheme.primary
-                    MusicViewModel.SwipingMode.PLAY_ALL_RECATEGORISE -> Icons.Default.Layers to MaterialTheme.colorScheme.secondary
+                    SwipingMode.ONLY_NEW -> Icons.Default.MusicNote to MaterialTheme.colorScheme.primary
+                    SwipingMode.NEW_AND_LIKED -> Icons.Default.ThumbUp to MaterialTheme.colorScheme.primary
+                    SwipingMode.PLAY_ALL_RECATEGORISE -> Icons.Default.Layers to MaterialTheme.colorScheme.secondary
                 }
                 Icon(
                     imageVector = modeIcon,

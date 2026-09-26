@@ -1,5 +1,7 @@
 package com.example.musicdlp
 
+import com.example.musicdlp.data.SwipingMode
+
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
@@ -328,14 +330,14 @@ fun BottomPlayerBar(
                         modifier = Modifier.size(32.dp)
                     ) {
                         val modeIcon = when (swipingMode) {
-                            MusicViewModel.SwipingMode.ONLY_NEW -> Icons.Default.FiberNew
-                            MusicViewModel.SwipingMode.NEW_AND_LIKED -> Icons.Default.LibraryMusic
-                            MusicViewModel.SwipingMode.PLAY_ALL_RECATEGORISE -> Icons.Default.AllInclusive
+                            SwipingMode.ONLY_NEW -> Icons.Default.FiberNew
+                            SwipingMode.NEW_AND_LIKED -> Icons.Default.LibraryMusic
+                            SwipingMode.PLAY_ALL_RECATEGORISE -> Icons.Default.AllInclusive
                         }
                         val modeTint = when (swipingMode) {
-                            MusicViewModel.SwipingMode.ONLY_NEW -> MaterialTheme.colorScheme.primary
-                            MusicViewModel.SwipingMode.NEW_AND_LIKED -> MaterialTheme.colorScheme.primary
-                            MusicViewModel.SwipingMode.PLAY_ALL_RECATEGORISE -> MaterialTheme.colorScheme.secondary
+                            SwipingMode.ONLY_NEW -> MaterialTheme.colorScheme.primary
+                            SwipingMode.NEW_AND_LIKED -> MaterialTheme.colorScheme.primary
+                            SwipingMode.PLAY_ALL_RECATEGORISE -> MaterialTheme.colorScheme.secondary
                         }
                         Icon(
                             imageVector = modeIcon,
