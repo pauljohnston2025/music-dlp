@@ -63,6 +63,7 @@ data class Song(
 
 fun Song.toMediaItem(
     playableUri: String? = null,
+    parentId: String? = null,
     canGoPrevious: Boolean = false,
     canGoNext: Boolean = false,
     swipingMode: String = "ONLY_NEW"
@@ -96,6 +97,9 @@ fun Song.toMediaItem(
         putString("artist", artist)
         putString("title", title)
         putString("youtubeUrl", youtubeUrl)
+        if (!parentId.isNullOrBlank()) {
+            putString("parentId", parentId)
+        }
     }
 
     return MediaItem.Builder()

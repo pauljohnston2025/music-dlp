@@ -30,6 +30,7 @@ import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
 import com.example.musicdlp.MusicDLPApplication
 import com.example.musicdlp.R
+import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.YoutubeDLRepository
 import com.example.musicdlp.data.toMediaItem
 import com.google.common.collect.ImmutableList
@@ -46,6 +47,13 @@ private const val CUSTOM_ACTION_CYCLE_MODE = "com.example.musicdlp.COMMAND_CYCLE
 
 @OptIn(UnstableApi::class)
 class MusicLibraryService : MediaLibraryService() {
+
+    companion object {
+        const val ACTION_PLAY_CONTEXT = "com.example.musicdlp.ACTION_PLAY_CONTEXT"
+        const val EXTRA_SONG_ID = "extra_song_id"
+        const val EXTRA_QUEUE = "extra_queue"
+        const val EXTRA_CURRENT_INDEX = "extra_current_index"
+    }
 
     private var mediaSession: MediaLibrarySession? = null
     private lateinit var exoPlayer: ExoPlayer
@@ -85,11 +93,13 @@ class MusicLibraryService : MediaLibraryService() {
         val upstreamFactory = DefaultDataSource.Factory(this)
 
 // 2. Wrap it in ResolvingDataSource.Factory to resolve playable URIs lazily
+        // In MusicLibraryService.kt inside onCreate()
+
         val resolvingDataSourceFactory = ResolvingDataSource.Factory(upstreamFactory) { dataSpec ->
             val uri = dataSpec.uri
             val uriStr = uri.toString()
 
-            // Check if URI is already a direct playable stream/file
+            // Check if URI is already a direct playable stream or file
             val isAlreadyPlayable = (uriStr.startsWith("http") && !uriStr.contains("youtube.com") && !uriStr.contains("dummy")) ||
                     uriStr.startsWith("file://") ||
                     uriStr.startsWith("content://")
@@ -98,10 +108,15 @@ class MusicLibraryService : MediaLibraryService() {
                 return@Factory dataSpec
             }
 
-            // Extract mediaId or safe ID from dummy URI or host
-            val mediaId = uri.lastPathSegment ?: ""
+            // FIX: Extract actual media ID instead of blindly using lastPathSegment ("watch")
+            val mediaId = when {
+                uri.host == "dummy.local" -> uri.lastPathSegment ?: ""
+                uriStr.contains("v=") -> uri.getQueryParameter("v") ?: ""
+                uriStr.contains("youtu.be/") -> uri.lastPathSegment ?: ""
+                else -> uri.lastPathSegment ?: ""
+            }
 
-            if (mediaId.isBlank() || mediaId.startsWith("MODE_") || mediaId == "no_more_songs") {
+            if (mediaId.isBlank() || mediaId == "watch" || mediaId.startsWith("MODE_") || mediaId == "no_more_songs") {
                 return@Factory dataSpec
             }
 
@@ -220,6 +235,44 @@ class MusicLibraryService : MediaLibraryService() {
 
         val filter = IntentFilter("com.example.musicdlp.ACTION_QUEUE_CHANGED")
         ContextCompat.registerReceiver(this, queueReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        when (intent?.action) {
+            ACTION_PLAY_CONTEXT -> {
+                val targetSongId = intent.getStringExtra(EXTRA_SONG_ID)
+                val app = application as? MusicDLPApplication ?: return START_STICKY
+
+                // Read directly from Application state
+                val queue = app.currentQueue
+                val targetIndex = queue.indexOfFirst { it.id == targetSongId }.coerceAtLeast(0)
+
+                // Start playback
+                playQueueIndex(targetIndex)
+            }
+        }
+        return START_STICKY
+    }
+
+    private fun playQueueIndex(index: Int) {
+        val app = application as? MusicDLPApplication ?: return
+        val queue = app.currentQueue
+        if (queue.isEmpty()) return
+
+        val safeIndex = index.coerceIn(0, queue.size - 1)
+        val mediaItems = queue.map { it.toMediaItem() }
+
+        // ExoPlayer handles indexing internally
+        exoPlayer.setMediaItems(mediaItems, safeIndex, C.TIME_UNSET)
+        exoPlayer.prepare()
+        exoPlayer.play()
+
+        val intent = Intent("com.example.musicdlp.ACTION_QUEUE_CHANGED").apply {
+            setPackage(packageName)
+            putExtra(EXTRA_CURRENT_INDEX, exoPlayer.currentMediaItemIndex)
+        }
+        sendBroadcast(intent)
     }
 
     private suspend fun resolvePlayableUri(
@@ -501,18 +554,18 @@ class MusicLibraryService : MediaLibraryService() {
                             val queue = app.currentQueue
                             val liked = queue.filter { it.isLiked }
                             val listToUse = if (liked.isNotEmpty()) liked else app.playlistLikedSongs
-                            listToUse.map { it.toMediaItem() }
+                            listToUse.map { it.toMediaItem(parentId = "NOW_PLAYING_LIKED") }
                         }
                         "NOW_PLAYING_DISLIKED" -> {
                             val queue = app.currentQueue
                             val disliked = queue.filter { it.isDisliked }
                             val listToUse = if (disliked.isNotEmpty()) disliked else app.playlistDislikedSongs
-                            listToUse.map { it.toMediaItem() }
+                            listToUse.map { it.toMediaItem(parentId = "NOW_PLAYING_DISLIKED") }
                         }
                         "NOW_PLAYING_NEW" -> {
                             val queue = app.currentQueue
                             val newSongs = queue.filter { !it.isLiked && !it.isDisliked }
-                            newSongs.map { it.toMediaItem() }
+                            newSongs.map { it.toMediaItem(parentId = "NOW_PLAYING_NEW") }
                         }
                         "SETTINGS" -> {
                             listOf(
@@ -523,11 +576,11 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         "LIKED" -> {
                             val liked = app.database.songDao().getLikedSongsList()
-                            liked.map { it.toMediaItem() }
+                            liked.map { it.toMediaItem(parentId = "LIKED") }
                         }
                         "DISLIKED" -> {
                             val disliked = app.database.songDao().getDislikedSongsList()
-                            disliked.map { it.toMediaItem() }
+                            disliked.map { it.toMediaItem(parentId = "DISLIKED") }
                         }
                         else -> emptyList()
                     }
@@ -560,55 +613,67 @@ class MusicLibraryService : MediaLibraryService() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val app = application as MusicDLPApplication
-                    val resolvedItems = mutableListOf<MediaItem>()
+                    val clickedItem = mediaItems.getOrNull(startIndex.coerceAtLeast(0)) ?: mediaItems.firstOrNull()
 
-                    for (item in mediaItems) {
-                        val mediaId = item.mediaId
-                        if (mediaId.startsWith("MODE_")) {
-                            val modeStr = when (mediaId) {
-                                "MODE_NEW_AND_LIKED" -> "NEW_AND_LIKED"
-                                "MODE_PLAY_ALL" -> "PLAY_ALL_RECATEGORISE"
-                                else -> "ONLY_NEW"
-                            }
-                            val intent = Intent("com.example.musicdlp.ACTION_SET_MODE").apply {
-                                setPackage(packageName)
-                                putExtra("mode", modeStr)
-                            }
-                            sendBroadcast(intent)
-                            continue
+                    if (clickedItem == null) {
+                        settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
+                        return@launch
+                    }
+
+                    val mediaId = clickedItem.mediaId
+
+                    // Read parentId from extras
+                    val parentId = clickedItem.requestMetadata.extras?.getString("parentId")?.uppercase() ?: ""
+
+                    // Handle setting mode toggles
+                    if (mediaId.startsWith("MODE_")) {
+                        val modeStr = when (mediaId) {
+                            "MODE_NEW_AND_LIKED" -> "NEW_AND_LIKED"
+                            "MODE_PLAY_ALL" -> "PLAY_ALL_RECATEGORISE"
+                            else -> "ONLY_NEW"
                         }
-
-                        // Ensure every item returned has a non-null RequestMetadata URI to satisfy DefaultMediaSourceFactory
-                        val safeUri = item.localConfiguration?.uri ?: Uri.parse("https://dummy.local/$mediaId")
-                        val safeItem = item.buildUpon()
-                            .setUri(safeUri)
-                            .setRequestMetadata(
-                                MediaItem.RequestMetadata.Builder()
-                                    .setMediaUri(safeUri)
-                                    .build()
-                            )
-                            .build()
-
-                        resolvedItems.add(safeItem)
+                        sendBroadcast(Intent("com.example.musicdlp.ACTION_SET_MODE").apply {
+                            setPackage(packageName)
+                            putExtra("mode", modeStr)
+                        })
+                        settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
+                        return@launch
                     }
 
-                    // FIX: Handle startIndex = -1 (C.INDEX_UNSET) safely
-                    val actualStartIndex = if (startIndex == C.INDEX_UNSET || startIndex < 0) {
-                        0
-                    } else {
-                        startIndex.coerceIn(0, (resolvedItems.size - 1).coerceAtLeast(0))
-                    }
+                    val queue = app.currentQueue
 
-                    val actualPosition = if (startPositionMs == C.TIME_UNSET) 0L else startPositionMs
+                    val result = when (parentId) {
+                        "LIKED" -> {
+                            val list = app.database.songDao().getLikedSongsList()
+                            playSongInContext(mediaId, list, "PLAY_ALL_RECATEGORISE")
+                        }
+                        "DISLIKED" -> {
+                            val list = app.database.songDao().getDislikedSongsList()
+                            playSongInContext(mediaId, list, "PLAY_ALL_RECATEGORISE")
+                        }
+                        "NOW_PLAYING_LIKED" -> {
+                            val list = queue.filter { it.isLiked }.ifEmpty { app.playlistLikedSongs }
+                            playSongInContext(mediaId, list, "PLAY_ALL_RECATEGORISE")
+                        }
+                        "NOW_PLAYING_DISLIKED" -> {
+                            val list = queue.filter { it.isDisliked }.ifEmpty { app.playlistDislikedSongs }
+                            playSongInContext(mediaId, list, "PLAY_ALL_RECATEGORISE")
+                        }
+                        "NOW_PLAYING_NEW" -> {
+                            val list = queue.filter { !it.isLiked && !it.isDisliked }
+                            playSongInContext(mediaId, list, "ONLY_NEW")
+                        }
+                        else -> {
+                            // Fallback to active queue or single item lookup
+                            val fallbackList = queue.ifEmpty {
+                                app.database.songDao().getSongById(mediaId)?.let { listOf(it) } ?: emptyList()
+                            }
+                            playSongInContext(mediaId, fallbackList, "ONLY_NEW")
+                        }
+                    }
 
                     withContext(Dispatchers.Main) {
-                        settableFuture.set(
-                            MediaSession.MediaItemsWithStartPosition(
-                                resolvedItems,
-                                actualStartIndex,
-                                actualPosition
-                            )
-                        )
+                        settableFuture.set(result)
                     }
                 } catch (t: Throwable) {
                     Napier.e("onSetMediaItems failed: ${t.message}", t, tag = "DEBUG_METADATA")
@@ -740,6 +805,34 @@ class MusicLibraryService : MediaLibraryService() {
                         .build()
                 )
                 .build()
+        }
+
+        fun playSongInContext(
+            targetMediaId: String,
+            contextList: List<Song>,
+            swipingMode: String
+        ): MediaSession.MediaItemsWithStartPosition {
+            // 1. Find the target index within the context list
+            val targetIndex = contextList.indexOfFirst { it.id == targetMediaId }.coerceAtLeast(0)
+
+            // 2. Broadcast mode change to keep ViewModel / UI state synced
+            val intent = Intent("com.example.musicdlp.ACTION_SET_MODE").apply {
+                setPackage(packageName)
+                putExtra("mode", swipingMode)
+            }
+            sendBroadcast(intent)
+
+            // 3. Update application queue context
+            (application as MusicDLPApplication).currentQueue = contextList
+
+            // 4. Map songs to lightweight MediaItems for ExoPlayer
+            val mediaItems = contextList.map { it.toMediaItem() }
+
+            return MediaSession.MediaItemsWithStartPosition(
+                mediaItems,
+                targetIndex,
+                0L
+            )
         }
 
         @Suppress("DEPRECATION")

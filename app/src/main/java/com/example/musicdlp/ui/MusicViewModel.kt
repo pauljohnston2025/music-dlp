@@ -117,9 +117,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 val mediaId = mediaItem?.mediaId ?: return
                 if (mediaId == "no_more_songs" || mediaId == "ROOT") return
 
-                // CRITICAL: Prevent re-entering if we're already handling this exact mediaId
-                if (_currentlyPlayingId.value == mediaId && _currentPlayingSong.value?.isMetadataCleaned == true) return
-
                 viewModelScope.launch(Dispatchers.IO) {
                     val song = songDao.getSongById(mediaId)
                         ?: app.currentQueue.firstOrNull { it.id == mediaId }
@@ -128,12 +125,25 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     if (song != null) {
                         val songWithState = updatePlayingSongWithDbState(song)
                         withContext(Dispatchers.Main) {
-                            // Only update flows if ID actually changed to prevent feedback loop
+                            // 1. Sync active queue from app if updated externally (by AA / MediaLibraryService)
+                            if (app.currentQueue.isNotEmpty() && _activePlayingList.value != app.currentQueue) {
+                                _activePlayingList.value = app.currentQueue
+                            }
+
+                            // 2. Sync currentIndex based on the actual transition index
+                            val currentList = if (_activePlayingList.value.isNotEmpty()) _activePlayingList.value else app.currentQueue
+                            val newIdx = currentList.indexOfFirst { it.id == mediaId }
+                            if (newIdx != -1) {
+                                _currentIndex.value = newIdx
+                            }
+
+                            // 3. Update current playing flows
                             if (_currentlyPlayingId.value != songWithState.id) {
                                 _currentlyPlayingId.value = songWithState.id
                                 _currentPlayingSong.value = songWithState
                             }
 
+                            // 4. Update swipe deck if playing within the swipe queue
                             val deck = _songsToSwipe.value
                             val deckIndex = deck.indexOfFirst { it.id == songWithState.id }
                             if (deckIndex > 0) {
@@ -175,9 +185,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                _currentPlayingSong.value?.let {
-                    // Notification handled by MediaSession
-                }
+                // Handled by MediaSession
             }
         })
     }
@@ -422,21 +430,33 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val canGoPreviousInContext: StateFlow<Boolean> = combine(
         _currentPlayingSong,
         _activePlayingList,
+        _currentIndex,
         _canGoBack
-    ) { current, list, canBack ->
+    ) { current, list, idx, canBack ->
         if (current == null) return@combine false
-        val index = list.indexOfFirst { it.id == current.id }
+        val activeList = if (list.isNotEmpty()) list else app.currentQueue
+        val index = if (idx in activeList.indices && activeList[idx].id == current.id) {
+            idx
+        } else {
+            activeList.indexOfFirst { it.id == current.id }
+        }
         if (index > 0) true else canBack
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     val canGoNextInContext: StateFlow<Boolean> = combine(
         _currentPlayingSong,
         _activePlayingList,
+        _currentIndex,
         _songsToSwipe
-    ) { current, list, swipeList ->
+    ) { current, list, idx, swipeList ->
         if (current == null) return@combine false
-        val index = list.indexOfFirst { it.id == current.id }
-        if (index != -1 && index < list.lastIndex) true else swipeList.isNotEmpty()
+        val activeList = if (list.isNotEmpty()) list else app.currentQueue
+        val index = if (idx in activeList.indices && activeList[idx].id == current.id) {
+            idx
+        } else {
+            activeList.indexOfFirst { it.id == current.id }
+        }
+        if (index != -1 && index < activeList.lastIndex) true else swipeList.isNotEmpty()
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     private val notificationReceiver = object : BroadcastReceiver() {
@@ -474,6 +494,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 "com.example.musicdlp.ACTION_PLAY_MEDIA_ID" -> {
                     val mediaId = intent.getStringExtra("mediaId") ?: ""
                     handlePlayMediaId(mediaId)
+                }
+                "com.example.musicdlp.ACTION_QUEUE_CHANGED" -> {
+                    val app = getApplication() as MusicDLPApplication
+                    val updatedQueue = app.currentQueue
+                    val newIndex = intent.getIntExtra(MusicLibraryService.EXTRA_CURRENT_INDEX, 0)
+
+                    _activePlayingList.value = updatedQueue
+                    _currentIndex.value = newIndex
+
+                    _playlistLikedSongs.value = updatedQueue.filter { it.isLiked }
+                    _playlistDislikedSongs.value = updatedQueue.filter { it.isDisliked }
+                    _playlistNewSongs.value = updatedQueue.filter { !it.isLiked && !it.isDisliked }
+
+                    updateSwipingDeck()
                 }
             }
         }
@@ -1297,21 +1331,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun playSongInContext(song: Song, contextList: List<Song>, isFromLikedOrDisliked: Boolean = false) {
-        if (isFromLikedOrDisliked) {
+        viewModelScope.launch {
+            // 1. Single source of truth update
+            app.currentQueue = contextList
+            _activePlayingList.value = contextList
+
             setSwipingMode(SwipingMode.PLAY_ALL_RECATEGORISE)
+
+            // 2. Play via MediaController rather than starting service manually
+            playSong(song, contextList)
         }
-        _activePlayingList.value = contextList
-
-        // Categorize contextList items into respective StateFlows
-        _playlistLikedSongs.value = contextList.filter { it.isLiked }
-        _playlistDislikedSongs.value = contextList.filter { it.isDisliked }
-        _playlistNewSongs.value = contextList.filter { !it.isLiked && !it.isDisliked }
-
-        val targetIdx = contextList.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
-        _currentIndex.value = targetIdx
-
-        updateSwipingDeck()
-        playSong(song, contextList)
     }
 
     fun playNextInContext() {
@@ -1591,6 +1620,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             addAction("com.example.musicdlp.ACTION_SET_MODE")
             addAction("com.example.musicdlp.ACTION_SEARCH_VOICE")
             addAction("com.example.musicdlp.ACTION_PLAY_MEDIA_ID")
+            addAction("com.example.musicdlp.ACTION_QUEUE_CHANGED")
         }
         ContextCompat.registerReceiver(application, notificationReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
