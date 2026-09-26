@@ -63,9 +63,17 @@ data class Song(
 
     fun containsYoutubeUrlOrId(targetUrlOrId: String, json: Json = Json { ignoreUnknownKeys = true }): Boolean {
         if (targetUrlOrId.isBlank()) return false
-        if (id == targetUrlOrId || youtubeUrl.contains(targetUrlOrId) || targetUrlOrId.contains(id)) return true
+        val cleanTarget = targetUrlOrId.trim()
+        if (cleanTarget.length < 5 || cleanTarget.contains("watch?v=null")) return false
+
+        if (id.isNotBlank() && !id.startsWith("url_") && !id.startsWith("search_") && id == cleanTarget) return true
+        if (youtubeUrl.isNotBlank() && !youtubeUrl.contains("watch?v=null") && (youtubeUrl.contains(cleanTarget) || cleanTarget.contains(youtubeUrl))) return true
+
         val alternates = getAlternateVersionsList(json)
-        return alternates.any { it.youtubeUrl.contains(targetUrlOrId) || targetUrlOrId.contains(it.youtubeUrl) }
+        return alternates.any {
+            it.youtubeUrl.isNotBlank() && !it.youtubeUrl.contains("watch?v=null") &&
+                    (it.youtubeUrl.contains(cleanTarget) || cleanTarget.contains(it.youtubeUrl))
+        }
     }
 }
 

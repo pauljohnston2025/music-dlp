@@ -28,6 +28,7 @@ import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.serialization.kotlinx.json.*
+import java.util.UUID
 
 @Serializable
 data class GeminiModelList(
@@ -66,6 +67,7 @@ data class YtDlpPlaylist(
 @Serializable
 data class YtDlpEntry(
     val id: String? = null,
+    val url: String? = null,
     val title: String? = null,
     val uploader: String? = null,
     val creator: String? = null,
@@ -528,7 +530,7 @@ class YoutubeDLRepository(private val context: Context) {
                     listOf(json.decodeFromString<YtDlpEntry>(trimmed))
                 }
 
-                for (entry in rawEntries) {
+                for ((index, entry) in rawEntries.withIndex()) {
                     val rawTitle = entry.title ?: ""
                     val artist = entry.uploader?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim() ?: "Unknown"
                     val thumbnail = if (!entry.thumbnail.isNullOrBlank()) {
@@ -538,22 +540,28 @@ class YoutubeDLRepository(private val context: Context) {
                     } else {
                         ""
                     }
-                    val id = entry.id
-                    val videoOrPlaylistUrl = if (id?.startsWith("PL") == true || id?.startsWith("RD") == true || id?.startsWith("OLAK") == true) {
-                        "https://www.youtube.com/playlist?list=$id"
-                    } else if (!id.isNullOrBlank()) {
-                        "https://www.youtube.com/watch?v=$id"
+                    val rawId = entry.id
+                    val isPlaylistId = rawId?.startsWith("PL") == true || rawId?.startsWith("RD") == true || rawId?.startsWith("OLAK") == true
+                    val videoOrPlaylistUrl = if (isPlaylistId) {
+                        "https://www.youtube.com/playlist?list=$rawId"
+                    } else if (!rawId.isNullOrBlank()) {
+                        "https://www.youtube.com/watch?v=$rawId"
                     } else {
                         ""
                     }
-                    if (videoOrPlaylistUrl.isNotBlank()) {
+                    val songId = if (!rawId.isNullOrBlank() && !isPlaylistId) {
+                        rawId
+                    } else {
+                        "search_${query.hashCode()}_$index"
+                    }
+                    if (videoOrPlaylistUrl.isNotBlank() || songId.isNotBlank()) {
                         songs.add(
                             Song(
-                                id = id ?: "search_${videoOrPlaylistUrl.hashCode()}",
+                                id = songId,
                                 title = rawTitle.ifBlank { "Unknown Title" },
                                 artist = artist.ifBlank { "Unknown" },
                                 thumbnailUrl = thumbnail,
-                                youtubeUrl = videoOrPlaylistUrl,
+                                youtubeUrl = if (videoOrPlaylistUrl.isNotBlank()) videoOrPlaylistUrl else "https://www.youtube.com/watch?v=$songId",
                                 isLiked = false,
                                 isDisliked = false,
                                 isrc = entry.isrc,
@@ -613,30 +621,42 @@ class YoutubeDLRepository(private val context: Context) {
                 
                 Napier.d("Found ${rawEntries.size} raw entries", tag = "DEBUG_METADATA")
                 val songs = mutableListOf<Song>()
-                for (entry in rawEntries) {
+                for ((index, entry) in rawEntries.withIndex()) {
                     val rawTitle = entry.title ?: ""
                     // Do NOT run heavy MusicBrainz lookup during playlist load; use raw/uploader info initially so load is instantaneous.
                     // MusicBrainz lookup / cleaning will happen lazily when playing/buffering.
                     val artist = entry.uploader?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim() ?: "Unknown"
+
+                    val rawId = entry.id?.takeIf { it.isNotBlank() && it != "null" }
+                        ?: entry.url?.let { u ->
+                            if (u.contains("watch?v=")) u.substringAfter("watch?v=").substringBefore("&").substringBefore("?").trim()
+                            else if (u.contains("youtu.be/")) u.substringAfter("youtu.be/").substringBefore("?").substringBefore("&").trim()
+                            else if (u.length in 10..12 && !u.contains("/")) u.trim()
+                            else null
+                        }?.takeIf { it.isNotBlank() && it != "null" }
+
+                    val videoId = rawId ?: UUID.randomUUID().toString()
+                    val videoUrl = if (rawId != null) "https://www.youtube.com/watch?v=$rawId" else (entry.url ?: url)
+
                     val thumbnail = if (!entry.thumbnail.isNullOrBlank()) {
                         entry.thumbnail
-                    } else if (!entry.id.isNullOrBlank()) {
-                        "https://i.ytimg.com/vi/${entry.id}/hqdefault.jpg"
+                    } else if (rawId != null) {
+                        "https://i.ytimg.com/vi/$rawId/hqdefault.jpg"
                     } else {
                         ""
                     }
-                    
+
                     songs.add(
                         Song(
-                            id = entry.id ?: "url_${"https://www.youtube.com/watch?v=${entry.id}".hashCode()}",
-                            title = rawTitle,
+                            id = videoId,
+                            title = rawTitle.ifBlank { "Unknown Title" },
                             artist = artist.ifBlank { "Unknown" },
                             thumbnailUrl = thumbnail,
-                            youtubeUrl = "https://www.youtube.com/watch?v=${entry.id}",
+                            youtubeUrl = videoUrl,
                             isLiked = false,
                             isDisliked = false,
                             isrc = entry.isrc,
-                            rawTitle = rawTitle
+                            rawTitle = rawTitle.ifBlank { "Unknown Title" }
                         )
                     )
                 }
@@ -653,7 +673,9 @@ class YoutubeDLRepository(private val context: Context) {
         }
     }
 
-    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    companion object {
+        const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
 
     var rateLimitCooldownUntilMs: Long = 0L
         private set
@@ -676,9 +698,9 @@ class YoutubeDLRepository(private val context: Context) {
             return@withContext null
         }
         val request = YoutubeDLRequest(youtubeUrl)
-        request.addOption("-f", "bestaudio")
+        request.addOption("-f", "bestaudio/best")
         request.addOption("-g")
-        request.addOption("--user-agent", userAgent)
+        request.addOption("--user-agent", USER_AGENT)
         
         Napier.d("Fetching stream URL for: $youtubeUrl", tag = "DEBUG_METADATA")
         return@withContext try {
@@ -712,7 +734,7 @@ class YoutubeDLRepository(private val context: Context) {
         request.addOption("-f", "bestaudio")
         request.addOption("-x")
         request.addOption("--audio-format", "mp3")
-        request.addOption("--user-agent", userAgent)
+        request.addOption("--user-agent", USER_AGENT)
         
         YoutubeDL.getInstance().execute(request) { progress, _, _ ->
             onProgress(progress / 100f)

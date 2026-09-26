@@ -84,16 +84,34 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _swipingMode = MutableStateFlow(SwipingMode.ONLY_NEW)
     val swipingMode: StateFlow<SwipingMode> = _swipingMode
 
+    private fun isValidTitleAndArtist(song: Song): Boolean {
+        return song.title.isNotBlank() &&
+                !song.title.equals("Unknown Title", ignoreCase = true) &&
+                !song.title.equals("Loading...", ignoreCase = true) &&
+                song.artist.isNotBlank() &&
+                !song.artist.equals("Unknown", ignoreCase = true)
+    }
+
     // Derived Flows directly linked to DB and active queue
     val playlistLikedSongs: StateFlow<List<Song>> = combine(_activePlayingList, dbLikedSongsFlow) { queue, dbLiked ->
         queue.filter { song ->
-            song.isLiked || dbLiked.any { db -> db.id == song.id || (db.title.equals(song.title, ignoreCase = true) && db.artist.equals(song.artist, ignoreCase = true)) }
+            song.isLiked || dbLiked.any { db ->
+                (db.id.isNotBlank() && db.id == song.id) ||
+                        (isValidTitleAndArtist(song) && isValidTitleAndArtist(db) &&
+                                db.title.equals(song.title, ignoreCase = true) &&
+                                db.artist.equals(song.artist, ignoreCase = true))
+            }
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val playlistDislikedSongs: StateFlow<List<Song>> = combine(_activePlayingList, dbDislikedSongsFlow) { queue, dbDisliked ->
         queue.filter { song ->
-            song.isDisliked || dbDisliked.any { db -> db.id == song.id || (db.title.equals(song.title, ignoreCase = true) && db.artist.equals(song.artist, ignoreCase = true)) }
+            song.isDisliked || dbDisliked.any { db ->
+                (db.id.isNotBlank() && db.id == song.id) ||
+                        (isValidTitleAndArtist(song) && isValidTitleAndArtist(db) &&
+                                db.title.equals(song.title, ignoreCase = true) &&
+                                db.artist.equals(song.artist, ignoreCase = true))
+            }
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
@@ -188,25 +206,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         val currentSong = currentList[newIndex]
                         _currentlyPlayingId.value = currentSong.id
                         _currentPlayingSong.value = currentSong
-                    } else if (currentList.isEmpty()) {
+                    } else {
                         _currentlyPlayingId.value = null
                         _currentPlayingSong.value = null
                     }
-                }
-                "com.example.musicdlp.ACTION_PLAY_PAUSE" -> togglePlayPause()
-                "com.example.musicdlp.ACTION_NEXT" -> playNextInContext()
-                "com.example.musicdlp.ACTION_PREVIOUS" -> playPreviousInContext()
-                "com.example.musicdlp.ACTION_LIKE" -> {
-                    _currentPlayingSong.value?.let { likeSong(it) }
-                }
-                "com.example.musicdlp.ACTION_DISLIKE" -> {
-                    _currentPlayingSong.value?.let { dislikeSong(it, true) }
-                }
-                "com.example.musicdlp.ACTION_CYCLE_MODE" -> cycleSwipingMode()
-                "com.example.musicdlp.ACTION_SET_MODE" -> {
-                    val modeStr = intent.getStringExtra("mode") ?: ""
-                    val mode = try { SwipingMode.valueOf(modeStr) } catch (e: Exception) { SwipingMode.ONLY_NEW }
-                    _swipingMode.value = mode
                 }
                 "com.example.musicdlp.ACTION_SEARCH_VOICE" -> {
                     val query = intent.getStringExtra("query") ?: ""
@@ -229,13 +232,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
         val filter = IntentFilter().apply {
             addAction(MusicLibraryService.ACTION_QUEUE_CHANGED)
-            addAction("com.example.musicdlp.ACTION_PLAY_PAUSE")
-            addAction("com.example.musicdlp.ACTION_NEXT")
-            addAction("com.example.musicdlp.ACTION_PREVIOUS")
-            addAction("com.example.musicdlp.ACTION_LIKE")
-            addAction("com.example.musicdlp.ACTION_DISLIKE")
-            addAction("com.example.musicdlp.ACTION_CYCLE_MODE")
-            addAction("com.example.musicdlp.ACTION_SET_MODE")
             addAction("com.example.musicdlp.ACTION_SEARCH_VOICE")
             addAction("com.example.musicdlp.ACTION_PLAY_MEDIA_ID")
         }
@@ -274,20 +270,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
             override fun onPlayerError(error: PlaybackException) {
                 Napier.e("Player error: ${error.message}", tag = "DEBUG_METADATA")
-                val currentSong = _currentPlayingSong.value
-                if (currentSong != null && retryAttempts < 3) {
-                    retryAttempts++
-                    _errorMessage.value = "Playback error. Retrying stream... ($retryAttempts/3)"
-                    _isSongLoading.value = true
-                    viewModelScope.launch {
-                        delay(800)
-                        playPreview(currentSong, forceRefreshSource = true)
-                    }
-                } else {
-                    retryAttempts = 0
-                    _isSongLoading.value = false
-                    _errorMessage.value = "Playback error: ${error.message}"
-                }
+                _isSongLoading.value = false
+                _errorMessage.value = "Playback error: ${error.message}"
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -368,17 +352,31 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun playNextInContext() {
-        val intent = Intent("com.example.musicdlp.ACTION_NEXT").apply {
-            setPackage(app.packageName)
+        viewModelScope.launch {
+            val p = getMediaController()
+            if (p != null) {
+                p.seekToNextMediaItem()
+            } else {
+                val intent = Intent(MusicLibraryService.ACTION_NEXT).apply {
+                    setPackage(app.packageName)
+                }
+                app.sendBroadcast(intent)
+            }
         }
-        app.sendBroadcast(intent)
     }
 
     fun playPreviousInContext() {
-        val intent = Intent("com.example.musicdlp.ACTION_PREVIOUS").apply {
-            setPackage(app.packageName)
+        viewModelScope.launch {
+            val p = getMediaController()
+            if (p != null) {
+                p.seekToPreviousMediaItem()
+            } else {
+                val intent = Intent(MusicLibraryService.ACTION_PREVIOUS).apply {
+                    setPackage(app.packageName)
+                }
+                app.sendBroadcast(intent)
+            }
         }
-        app.sendBroadcast(intent)
     }
 
     fun playLikedSong(song: Song, onNotDownloaded: () -> Unit = {}) {
@@ -579,16 +577,31 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch(Dispatchers.IO) {
             val allSongs = songDao.getAllSongs()
-            val matchingLiked = allSongs.firstOrNull {
-                it.isLiked &&
-                        it.title.equals(trimmedTitle, ignoreCase = true) &&
-                        (it.artist.equals(trimmedArtist, ignoreCase = true) || trimmedArtist == "Unknown" || it.artist == "Unknown")
-            }
-            val matchingDisliked = if (matchingLiked == null) {
+            val hasValidTrimmed = trimmedTitle.isNotBlank() &&
+                    !trimmedTitle.equals("Unknown Title", ignoreCase = true) &&
+                    !trimmedTitle.equals("Loading...", ignoreCase = true) &&
+                    trimmedArtist.isNotBlank() &&
+                    !trimmedArtist.equals("Unknown", ignoreCase = true)
+
+            val matchingLiked = if (hasValidTrimmed) {
                 allSongs.firstOrNull {
-                    it.isDisliked &&
+                    it.isLiked &&
                             it.title.equals(trimmedTitle, ignoreCase = true) &&
-                            (it.artist.equals(trimmedArtist, ignoreCase = true) || trimmedArtist == "Unknown" || it.artist == "Unknown")
+                            it.artist.equals(trimmedArtist, ignoreCase = true)
+                }
+            } else {
+                allSongs.firstOrNull { it.isLiked && it.id.isNotBlank() && it.id == song.id }
+            }
+
+            val matchingDisliked = if (matchingLiked == null) {
+                if (hasValidTrimmed) {
+                    allSongs.firstOrNull {
+                        it.isDisliked &&
+                                it.title.equals(trimmedTitle, ignoreCase = true) &&
+                                it.artist.equals(trimmedArtist, ignoreCase = true)
+                    }
+                } else {
+                    allSongs.firstOrNull { it.isDisliked && it.id.isNotBlank() && it.id == song.id }
                 }
             } else null
 

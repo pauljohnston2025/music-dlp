@@ -230,7 +230,11 @@ fun SwipingScreen(viewModel: MusicViewModel) {
                 keyboardActions = KeyboardActions(onSearch = { performSearchOrLoad() }),
                 trailingIcon = {
                     IconButton(onClick = { performSearchOrLoad() }, enabled = !isPlaylistLoading) {
-                        Icon(Icons.Default.Search, contentDescription = "Search / Load")
+                        if (isPlaylistLoading) {
+                            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.Search, contentDescription = "Search / Load")
+                        }
                     }
                 },
                 modifier = Modifier.weight(1f)
@@ -317,10 +321,15 @@ fun SwipingScreen(viewModel: MusicViewModel) {
                 .fillMaxWidth(),
             contentAlignment = Alignment.Center
         ) {
-            if (activePlayingList.isEmpty() && (isPlaylistLoading || isBuffering)) {
+            if (isPlaylistLoading) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator()
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Loading playlist...", style = MaterialTheme.typography.bodyMedium)
+                }
+            } else if (activePlayingList.isEmpty() && isBuffering) {
                 CircularProgressIndicator()
             } else if (currentSong != null) {
-                // Change this line in SwipingScreen:
                 key(currentIndex, currentSong.id) {
                     TinderCard(
                         song = currentSong,

@@ -18,9 +18,11 @@ import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -73,6 +75,9 @@ class MusicLibraryService : MediaLibraryService() {
         const val ACTION_UPDATE_SONG = "com.example.musicdlp.ACTION_UPDATE_SONG"
         const val ACTION_CLEAR_QUEUE = "com.example.musicdlp.ACTION_CLEAR_QUEUE"
         const val ACTION_REQUEST_QUEUE_STATE = "com.example.musicdlp.ACTION_REQUEST_QUEUE_STATE"
+        const val ACTION_PLAY_PAUSE = "com.example.musicdlp.ACTION_PLAY_PAUSE"
+        const val ACTION_NEXT = "com.example.musicdlp.ACTION_NEXT"
+        const val ACTION_PREVIOUS = "com.example.musicdlp.ACTION_PREVIOUS"
 
         const val EXTRA_QUEUE_JSON = "extra_queue_json"
         const val EXTRA_SONG_JSON = "extra_song_json"
@@ -93,6 +98,7 @@ class MusicLibraryService : MediaLibraryService() {
     // Master Queue State managed exclusively by Service
     private var activeQueue = mutableListOf<Song>()
     private val queueLock = Any()
+    private var virtualCurrentIndex: Int? = null
 
     private var currentMode: SwipingMode = SwipingMode.ONLY_NEW
     private var isProcessingQueue: Boolean = false
@@ -189,6 +195,11 @@ class MusicLibraryService : MediaLibraryService() {
                 ACTION_REQUEST_QUEUE_STATE -> {
                     broadcastQueueChanged()
                 }
+                ACTION_NEXT -> forwardingPlayer.seekToNextMediaItem()
+                ACTION_PREVIOUS -> forwardingPlayer.seekToPreviousMediaItem()
+                ACTION_PLAY_PAUSE -> {
+                    if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+                }
             }
         }
     }
@@ -201,7 +212,13 @@ class MusicLibraryService : MediaLibraryService() {
             .setUsage(C.USAGE_MEDIA)
             .build()
 
-        val upstreamFactory = DefaultDataSource.Factory(this)
+        val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(YoutubeDLRepository.USER_AGENT)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(15000)
+            .setReadTimeoutMs(15000)
+
+        val upstreamFactory = DefaultDataSource.Factory(this, httpDataSourceFactory)
 
         val resolvingDataSourceFactory = ResolvingDataSource.Factory(upstreamFactory) { dataSpec ->
             val uri = dataSpec.uri
@@ -260,6 +277,13 @@ class MusicLibraryService : MediaLibraryService() {
             .build()
 
         exoPlayer.addListener(object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                val currentMediaId = exoPlayer.currentMediaItem?.mediaId
+                if (!currentMediaId.isNullOrBlank()) {
+                    bufferedStreamUrls.remove(currentMediaId)
+                }
+            }
+
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 if (mediaItem != null) {
                     val mediaId = mediaItem.mediaId
@@ -304,12 +328,14 @@ class MusicLibraryService : MediaLibraryService() {
 
             override fun hasNextMediaItem(): Boolean {
                 val currentList = synchronized(queueLock) { activeQueue.toList() }
-                return getNextSongIndex(currentList, currentMediaItemIndex, currentMode) != -1
+                val startIdx = virtualCurrentIndex ?: currentMediaItemIndex
+                return getNextSongIndex(currentList, startIdx, currentMode) != -1
             }
 
             override fun hasPreviousMediaItem(): Boolean {
                 val currentList = synchronized(queueLock) { activeQueue.toList() }
-                return getPreviousSongIndex(currentList, currentMediaItemIndex, currentMode) != -1
+                val startIdx = virtualCurrentIndex ?: currentMediaItemIndex
+                return getPreviousSongIndex(currentList, startIdx, currentMode) != -1
             }
 
             override fun seekToNext() {
@@ -318,9 +344,15 @@ class MusicLibraryService : MediaLibraryService() {
 
             override fun seekToNextMediaItem() {
                 val currentList = synchronized(queueLock) { activeQueue.toList() }
-                val nextIdx = getNextSongIndex(currentList, currentMediaItemIndex, currentMode)
+                val startIdx = virtualCurrentIndex ?: currentMediaItemIndex
+                val nextIdx = getNextSongIndex(currentList, startIdx, currentMode)
                 if (nextIdx != -1 && nextIdx < mediaItemCount) {
+                    virtualCurrentIndex = null
                     seekTo(nextIdx, 0L)
+                } else if (nextIdx == -1) {
+                    virtualCurrentIndex = currentList.size
+                    exoPlayer.pause()
+                    broadcastQueueChanged(overrideCurrentIndex = currentList.size)
                 }
             }
 
@@ -330,8 +362,10 @@ class MusicLibraryService : MediaLibraryService() {
 
             override fun seekToPreviousMediaItem() {
                 val currentList = synchronized(queueLock) { activeQueue.toList() }
-                val prevIdx = getPreviousSongIndex(currentList, currentMediaItemIndex, currentMode)
+                val startIdx = virtualCurrentIndex ?: currentMediaItemIndex
+                val prevIdx = getPreviousSongIndex(currentList, startIdx, currentMode)
                 if (prevIdx != -1 && prevIdx < mediaItemCount) {
+                    virtualCurrentIndex = null
                     seekTo(prevIdx, 0L)
                 }
             }
@@ -358,14 +392,20 @@ class MusicLibraryService : MediaLibraryService() {
             addAction(ACTION_UPDATE_SONG)
             addAction(ACTION_CLEAR_QUEUE)
             addAction(ACTION_REQUEST_QUEUE_STATE)
+            addAction(ACTION_PLAY_PAUSE)
+            addAction(ACTION_NEXT)
+            addAction(ACTION_PREVIOUS)
+            addAction(CUSTOM_ACTION_LIKE)
+            addAction(CUSTOM_ACTION_DISLIKE)
+            addAction(CUSTOM_ACTION_CYCLE_MODE)
         }
         ContextCompat.registerReceiver(this, serviceCommandReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 
-    private fun broadcastQueueChanged() {
+    private fun broadcastQueueChanged(notifyMediaBrowser: Boolean = true, overrideCurrentIndex: Int? = null) {
         val currentList = synchronized(queueLock) { activeQueue.toList() }
         val queueJson = json.encodeToString(currentList)
-        val currentIndex = if (exoPlayer.mediaItemCount > 0) exoPlayer.currentMediaItemIndex else 0
+        val currentIndex = overrideCurrentIndex ?: virtualCurrentIndex ?: (if (exoPlayer.mediaItemCount > 0) exoPlayer.currentMediaItemIndex else 0)
         val currentSongId = exoPlayer.currentMediaItem?.mediaId ?: ""
 
         val intent = Intent(ACTION_QUEUE_CHANGED).apply {
@@ -377,7 +417,9 @@ class MusicLibraryService : MediaLibraryService() {
             putExtra(EXTRA_IS_BUFFERING, isProcessingQueue)
         }
         sendBroadcast(intent)
-        notifyMediaBrowserChildrenChanged()
+        if (notifyMediaBrowser) {
+            notifyMediaBrowserChildrenChanged()
+        }
     }
 
     private fun notifyMediaBrowserChildrenChanged() {
@@ -489,121 +531,137 @@ class MusicLibraryService : MediaLibraryService() {
     }
 
     fun likeSong(targetSong: Song?, advance: Boolean = false) {
-        serviceScope.launch(Dispatchers.IO) {
+        serviceScope.launch(Dispatchers.Main) {
             val currentList = synchronized(queueLock) { activeQueue.toList() }
             val songToLike = targetSong
                 ?: currentList.getOrNull(exoPlayer.currentMediaItemIndex)
                 ?: currentList.firstOrNull { it.id == exoPlayer.currentMediaItem?.mediaId }
                 ?: return@launch
 
-            val app = application as MusicDLPApplication
-            val songDao = app.database.songDao()
-            val allSongs = songDao.getAllSongs()
+            withContext(Dispatchers.IO) {
+                val app = application as MusicDLPApplication
+                val songDao = app.database.songDao()
+                val allSongs = songDao.getAllSongs()
 
-            val matchingDisliked = allSongs.filter {
-                it.isDisliked && (it.id == songToLike.id || (it.title.equals(songToLike.title, ignoreCase = true) && it.artist.equals(songToLike.artist, ignoreCase = true)))
-            }
-            for (disliked in matchingDisliked) {
-                songDao.deleteSongById(disliked.id)
-            }
+                val hasValidTitleAndArtist = !songToLike.title.isBlank() &&
+                        !songToLike.title.equals("Unknown Title", ignoreCase = true) &&
+                        !songToLike.title.equals("Loading...", ignoreCase = true) &&
+                        !songToLike.artist.isBlank() &&
+                        !songToLike.artist.equals("Unknown", ignoreCase = true)
 
-            val existingLiked = allSongs.firstOrNull {
-                it.isLiked && it.title.equals(songToLike.title, ignoreCase = true) &&
-                        (it.artist.equals(songToLike.artist, ignoreCase = true) || songToLike.artist == "Unknown" || it.artist == "Unknown")
-            }
-
-            val likedRecord = if (existingLiked != null) {
-                val updated = existingLiked.addAlternateVersion(
-                    AlternateVersion(
-                        youtubeUrl = songToLike.youtubeUrl,
-                        rawTitle = songToLike.rawTitle ?: songToLike.title,
-                        thumbnailUrl = songToLike.thumbnailUrl
-                    )
-                )
-                songDao.insertSong(updated)
-                updated
-            } else {
-                val newLiked = songToLike.copy(isLiked = true, isDisliked = false, likedAt = System.currentTimeMillis())
-                songDao.insertSong(newLiked)
-                saveLikedSong(newLiked)
-                newLiked
-            }
-
-            val updatedSong = songToLike.copy(isLiked = true, isDisliked = false)
-            synchronized(queueLock) {
-                activeQueue = activeQueue.map { if (it.id == songToLike.id) updatedSong else it }.toMutableList()
-            }
-
-            withContext(Dispatchers.Main) {
-                updateNotificationLayout(exoPlayer.currentMediaItem)
-                broadcastQueueChanged()
-                if (advance || exoPlayer.currentMediaItem?.mediaId == songToLike.id) {
-                    forwardingPlayer.seekToNextMediaItem()
+                val matchingDisliked = allSongs.filter {
+                    it.isDisliked && ((it.id.isNotBlank() && it.id == songToLike.id) ||
+                            (hasValidTitleAndArtist && it.title.equals(songToLike.title, ignoreCase = true) && it.artist.equals(songToLike.artist, ignoreCase = true)))
                 }
+                for (disliked in matchingDisliked) {
+                    songDao.deleteSongById(disliked.id)
+                }
+
+                val existingLiked = if (hasValidTitleAndArtist) {
+                    allSongs.firstOrNull {
+                        it.isLiked && it.title.equals(songToLike.title, ignoreCase = true) && it.artist.equals(songToLike.artist, ignoreCase = true)
+                    }
+                } else {
+                    allSongs.firstOrNull { it.isLiked && it.id.isNotBlank() && it.id == songToLike.id }
+                }
+
+                if (existingLiked != null) {
+                    val updated = existingLiked.addAlternateVersion(
+                        AlternateVersion(
+                            youtubeUrl = songToLike.youtubeUrl,
+                            rawTitle = songToLike.rawTitle ?: songToLike.title,
+                            thumbnailUrl = songToLike.thumbnailUrl
+                        )
+                    )
+                    songDao.insertSong(updated)
+                } else {
+                    val newLiked = songToLike.copy(isLiked = true, isDisliked = false, likedAt = System.currentTimeMillis())
+                    songDao.insertSong(newLiked)
+                    saveLikedSong(newLiked)
+                }
+
+                val updatedSong = songToLike.copy(isLiked = true, isDisliked = false)
+                synchronized(queueLock) {
+                    activeQueue = activeQueue.map { if (it.id == songToLike.id) updatedSong else it }.toMutableList()
+                }
+            }
+
+            updateNotificationLayout(exoPlayer.currentMediaItem)
+            broadcastQueueChanged()
+            if (advance) {
+                forwardingPlayer.seekToNextMediaItem()
             }
             triggerProcessQueue()
         }
     }
 
     fun dislikeSong(targetSong: Song?, advance: Boolean = false) {
-        serviceScope.launch(Dispatchers.IO) {
+        serviceScope.launch(Dispatchers.Main) {
             val currentList = synchronized(queueLock) { activeQueue.toList() }
             val songToDislike = targetSong
                 ?: currentList.getOrNull(exoPlayer.currentMediaItemIndex)
                 ?: currentList.firstOrNull { it.id == exoPlayer.currentMediaItem?.mediaId }
                 ?: return@launch
 
-            val app = application as MusicDLPApplication
-            val songDao = app.database.songDao()
-            val allSongs = songDao.getAllSongs()
+            withContext(Dispatchers.IO) {
+                val app = application as MusicDLPApplication
+                val songDao = app.database.songDao()
+                val allSongs = songDao.getAllSongs()
 
-            val matchingLiked = allSongs.filter {
-                it.isLiked && (it.id == songToDislike.id || (it.title.equals(songToDislike.title, ignoreCase = true) && it.artist.equals(songToDislike.artist, ignoreCase = true)))
-            }
-            for (liked in matchingLiked) {
-                val safeArtist = liked.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
-                val safeTitle = liked.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
-                val finalFileName = "$safeArtist - $safeTitle.mp3"
-                val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
-                val downloadDir = File(publicMusicDir, "MusicDLP")
-                val targetFile = File(downloadDir, finalFileName)
-                if (targetFile.exists()) targetFile.delete()
+                val hasValidTitleAndArtist = !songToDislike.title.isBlank() &&
+                        !songToDislike.title.equals("Unknown Title", ignoreCase = true) &&
+                        !songToDislike.title.equals("Loading...", ignoreCase = true) &&
+                        !songToDislike.artist.isBlank() &&
+                        !songToDislike.artist.equals("Unknown", ignoreCase = true)
 
-                songDao.deleteSongById(liked.id)
-            }
-
-            val existingDisliked = allSongs.firstOrNull {
-                it.isDisliked && it.title.equals(songToDislike.title, ignoreCase = true) &&
-                        (it.artist.equals(songToDislike.artist, ignoreCase = true) || songToDislike.artist == "Unknown" || it.artist == "Unknown")
-            }
-
-            val dislikedRecord = if (existingDisliked != null) {
-                val updated = existingDisliked.addAlternateVersion(
-                    AlternateVersion(
-                        youtubeUrl = songToDislike.youtubeUrl,
-                        rawTitle = songToDislike.rawTitle ?: songToDislike.title,
-                        thumbnailUrl = songToDislike.thumbnailUrl
-                    )
-                )
-                songDao.insertSong(updated)
-                updated
-            } else {
-                val newDisliked = songToDislike.copy(isLiked = false, isDisliked = true, dislikedAt = System.currentTimeMillis())
-                songDao.insertSong(newDisliked)
-                newDisliked
-            }
-
-            val updatedSong = songToDislike.copy(isLiked = false, isDisliked = true)
-            synchronized(queueLock) {
-                activeQueue = activeQueue.map { if (it.id == songToDislike.id) updatedSong else it }.toMutableList()
-            }
-
-            withContext(Dispatchers.Main) {
-                updateNotificationLayout(exoPlayer.currentMediaItem)
-                broadcastQueueChanged()
-                if (advance || exoPlayer.currentMediaItem?.mediaId == songToDislike.id) {
-                    forwardingPlayer.seekToNextMediaItem()
+                val matchingLiked = allSongs.filter {
+                    it.isLiked && ((it.id.isNotBlank() && it.id == songToDislike.id) ||
+                            (hasValidTitleAndArtist && it.title.equals(songToDislike.title, ignoreCase = true) && it.artist.equals(songToDislike.artist, ignoreCase = true)))
                 }
+                for (liked in matchingLiked) {
+                    val safeArtist = liked.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                    val safeTitle = liked.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                    val finalFileName = "$safeArtist - $safeTitle.mp3"
+                    val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                    val downloadDir = File(publicMusicDir, "MusicDLP")
+                    val targetFile = File(downloadDir, finalFileName)
+                    if (targetFile.exists()) targetFile.delete()
+
+                    songDao.deleteSongById(liked.id)
+                }
+
+                val existingDisliked = if (hasValidTitleAndArtist) {
+                    allSongs.firstOrNull {
+                        it.isDisliked && it.title.equals(songToDislike.title, ignoreCase = true) && it.artist.equals(songToDislike.artist, ignoreCase = true)
+                    }
+                } else {
+                    allSongs.firstOrNull { it.isDisliked && it.id.isNotBlank() && it.id == songToDislike.id }
+                }
+
+                if (existingDisliked != null) {
+                    val updated = existingDisliked.addAlternateVersion(
+                        AlternateVersion(
+                            youtubeUrl = songToDislike.youtubeUrl,
+                            rawTitle = songToDislike.rawTitle ?: songToDislike.title,
+                            thumbnailUrl = songToDislike.thumbnailUrl
+                        )
+                    )
+                    songDao.insertSong(updated)
+                } else {
+                    val newDisliked = songToDislike.copy(isLiked = false, isDisliked = true, dislikedAt = System.currentTimeMillis())
+                    songDao.insertSong(newDisliked)
+                }
+
+                val updatedSong = songToDislike.copy(isLiked = false, isDisliked = true)
+                synchronized(queueLock) {
+                    activeQueue = activeQueue.map { if (it.id == songToDislike.id) updatedSong else it }.toMutableList()
+                }
+            }
+
+            updateNotificationLayout(exoPlayer.currentMediaItem)
+            broadcastQueueChanged()
+            if (advance) {
+                forwardingPlayer.seekToNextMediaItem()
             }
             triggerProcessQueue()
         }
@@ -755,17 +813,16 @@ class MusicLibraryService : MediaLibraryService() {
 
                     withContext(Dispatchers.Main) {
                         val idxInPlayer = activeQueue.indexOfFirst { it.id == cleanedSong.id }
-                        if (idxInPlayer >= 0 && idxInPlayer < exoPlayer.mediaItemCount) {
-                            val currentPos = if (exoPlayer.currentMediaItemIndex == idxInPlayer) exoPlayer.currentPosition else 0L
+                        val isCurrentlyPlaying = exoPlayer.currentMediaItemIndex == idxInPlayer
+                        if (isCurrentlyPlaying && idxInPlayer >= 0 && idxInPlayer < exoPlayer.mediaItemCount) {
+                            val currentPos = exoPlayer.currentPosition
                             val isPlaying = exoPlayer.isPlaying
                             val mediaItem = cleanedSong.toMediaItem(swipingMode = currentMode.name)
                             exoPlayer.replaceMediaItem(idxInPlayer, mediaItem)
-                            if (exoPlayer.currentMediaItemIndex == idxInPlayer) {
-                                exoPlayer.seekTo(idxInPlayer, currentPos)
-                                if (isPlaying) exoPlayer.play()
-                            }
+                            exoPlayer.seekTo(idxInPlayer, currentPos)
+                            if (isPlaying) exoPlayer.play()
                         }
-                        broadcastQueueChanged()
+                        broadcastQueueChanged(notifyMediaBrowser = false)
                     }
 
                     // PRE-BUFFERING GUARD: Only pre-buffer audio if within 5 tracks ahead
@@ -972,7 +1029,7 @@ class MusicLibraryService : MediaLibraryService() {
             try {
                 session.setAvailableCommands(
                     controller,
-                    MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+                    MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
                         .add(customCommandLike)
                         .add(customCommandDislike)
                         .add(customCommandCycleMode)
@@ -1014,7 +1071,7 @@ class MusicLibraryService : MediaLibraryService() {
             session: MediaSession,
             controller: MediaSession.ControllerInfo
         ): MediaSession.ConnectionResult {
-            val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+            val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
                 .add(customCommandLike)
                 .add(customCommandDislike)
                 .add(customCommandCycleMode)
@@ -1025,6 +1082,7 @@ class MusicLibraryService : MediaLibraryService() {
 
             @Suppress("DEPRECATION")
             return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(sessionCommands)
                 .setAvailablePlayerCommands(playerCommands)
                 .setCustomLayout(layout)
                 .build()
@@ -1045,13 +1103,14 @@ class MusicLibraryService : MediaLibraryService() {
             customCommand: SessionCommand,
             args: Bundle
         ): ListenableFuture<SessionResult> {
-            if (customCommand.customAction == CUSTOM_ACTION_LIKE) {
+            val action = customCommand.customAction
+            if (action == CUSTOM_ACTION_LIKE || action == ACTION_LIKE) {
                 likeSong(null, advance = true)
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
-            } else if (customCommand.customAction == CUSTOM_ACTION_DISLIKE) {
+            } else if (action == CUSTOM_ACTION_DISLIKE || action == ACTION_DISLIKE) {
                 dislikeSong(null, advance = true)
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
-            } else if (customCommand.customAction == CUSTOM_ACTION_CYCLE_MODE) {
+            } else if (action == CUSTOM_ACTION_CYCLE_MODE || action == ACTION_CYCLE_MODE) {
                 currentMode = when (currentMode) {
                     SwipingMode.ONLY_NEW -> SwipingMode.NEW_AND_LIKED
                     SwipingMode.NEW_AND_LIKED -> SwipingMode.PLAY_ALL_RECATEGORISE
@@ -1168,6 +1227,14 @@ class MusicLibraryService : MediaLibraryService() {
                         else -> emptyList()
                     }
 
+                    val paginatedChildren = if (pageSize > 0 && page >= 0) {
+                        val fromIndex = (page * pageSize).coerceAtMost(children.size)
+                        val toIndex = (fromIndex + pageSize).coerceAtMost(children.size)
+                        children.subList(fromIndex, toIndex)
+                    } else {
+                        children
+                    }
+
                     val returnParams = params ?: LibraryParams.Builder().setExtras(
                         Bundle().apply {
                             putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
@@ -1175,7 +1242,7 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                     ).build()
 
-                    settableFuture.set(LibraryResult.ofItemList(ImmutableList.copyOf(children), returnParams))
+                    settableFuture.set(LibraryResult.ofItemList(ImmutableList.copyOf(paginatedChildren), returnParams))
                 } catch (t: Throwable) {
                     Napier.e("onGetChildren failed for parentId=$parentId: ${t.message}", t, tag = "DEBUG_METADATA")
                     settableFuture.set(LibraryResult.ofItemList(ImmutableList.of(), params))
@@ -1311,24 +1378,24 @@ class MusicLibraryService : MediaLibraryService() {
                 try {
                     val app = application as MusicDLPApplication
                     val dbSongs = app.database.songDao().getAllSongs()
-                    var matches = dbSongs.filter {
-                        it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true)
-                    }.map { it.toMediaItem(swipingMode = currentMode.name) }
+                    var rawMatches = dbSongs.filter {
+                        it.isLiked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true))
+                    }
 
-                    if (matches.isEmpty()) {
+                    if (rawMatches.isEmpty()) {
                         val repo = YoutubeDLRepository(app)
-                        val searchResults = repo.searchSongsOrPlaylists(query)
-                        matches = searchResults.map { it.toMediaItem(swipingMode = currentMode.name) }
+                        rawMatches = repo.searchSongsOrPlaylists(query)
                     }
 
-                    searchResultsCache[query] = matches
-                    session.notifySearchResultChanged(browser, query, matches.size, params)
+                    if (rawMatches.isNotEmpty()) {
+                        val mediaItems = rawMatches.map { it.toMediaItem(swipingMode = currentMode.name) }
+                        searchResultsCache[query] = mediaItems
+                        session.notifySearchResultChanged(browser, query, mediaItems.size, params)
 
-                    val intent = Intent("com.example.musicdlp.ACTION_SEARCH_VOICE").apply {
-                        setPackage(packageName)
-                        putExtra("query", query)
+                        withContext(Dispatchers.Main) {
+                            setQueueAndPlay(rawMatches, rawMatches.first().id, 0, 0L)
+                        }
                     }
-                    sendBroadcast(intent)
                 } catch (e: Exception) {
                     Napier.e("onSearch failed: ${e.message}", e, tag = "DEBUG_METADATA")
                 }
