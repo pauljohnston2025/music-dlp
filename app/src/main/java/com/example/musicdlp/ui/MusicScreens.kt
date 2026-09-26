@@ -262,26 +262,6 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             }
         }
 
-        // 3. Mode Selector & Chips Row
-        val currentSwipingMode by viewModel.swipingMode.collectAsState()
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 2.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            SwipingMode.entries.forEach { mode ->
-                FilterChip(
-                    selected = currentSwipingMode == mode,
-                    onClick = { viewModel.setSwipingMode(mode) },
-                    label = { Text(mode.displayName, style = MaterialTheme.typography.labelSmall) },
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-
         if (playlistTotal > 0 || uniqueLiked.isNotEmpty() || uniqueDisliked.isNotEmpty() || uniqueNew.isNotEmpty() || uniqueAll.isNotEmpty()) {
             Row(
                 modifier = Modifier

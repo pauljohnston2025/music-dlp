@@ -686,14 +686,11 @@ class MusicLibraryService : MediaLibraryService() {
                     if (exoPlayer.mediaItemCount > 0) exoPlayer.currentMediaItemIndex else 0
                 }.coerceAtLeast(0)
 
-                if (currentIndex >= currentList.size) break
+                // Find the FIRST uncleaned song anywhere in the queue (not just window)
+                val songToProcess = currentList.firstOrNull { it.isMetadataCleaned != true }
+                if (songToProcess == null) break // All songs are cleaned!
 
-                // Look ahead from current playing song up to 5 next songs
-                val windowEnd = (currentIndex + 6).coerceAtMost(currentList.size)
-                val window = currentList.subList(currentIndex, windowEnd)
-                val songToProcess = window.firstOrNull { it.isMetadataCleaned != true }
-
-                if (songToProcess == null) break
+                val targetIndex = currentList.indexOfFirst { it.id == songToProcess.id }
 
                 try {
                     val app = application as MusicDLPApplication
@@ -701,9 +698,6 @@ class MusicLibraryService : MediaLibraryService() {
                     val repository = YoutubeDLRepository(app)
 
                     val allSongs = songDao.getAllSongs()
-                    val existingByIdOrUrl = allSongs.firstOrNull {
-                        it.containsYoutubeUrlOrId(songToProcess.id) || it.containsYoutubeUrlOrId(songToProcess.youtubeUrl)
-                    }
 
                     val cleanResult = repository.cleanTitleAndArtist(
                         songToProcess.title,
@@ -713,20 +707,34 @@ class MusicLibraryService : MediaLibraryService() {
                     )
                     val finalRawTitle = cleanResult.recoveredRawTitle ?: songToProcess.rawTitle ?: cleanResult.title
 
-                    val matchingExistingLiked = allSongs.firstOrNull {
-                        it.isLiked &&
-                                it.title.equals(cleanResult.title, ignoreCase = true) &&
-                                (it.artist.equals(cleanResult.artist, ignoreCase = true) || cleanResult.artist == "Unknown" || it.artist == "Unknown")
-                    }
-
-                    val matchingExistingDisliked = if (matchingExistingLiked == null) {
+                    // 1. Strict ID / URL match first
+                    val existingByIdOrUrl = if (songToProcess.id.isNotBlank() || !songToProcess.youtubeUrl.isNullOrBlank()) {
                         allSongs.firstOrNull {
-                            it.isDisliked &&
-                                    it.title.equals(cleanResult.title, ignoreCase = true) &&
-                                    (it.artist.equals(cleanResult.artist, ignoreCase = true) || cleanResult.artist == "Unknown" || it.artist == "Unknown")
+                            (songToProcess.id.isNotBlank() && it.containsYoutubeUrlOrId(songToProcess.id)) ||
+                                    (!songToProcess.youtubeUrl.isNullOrBlank() && it.containsYoutubeUrlOrId(songToProcess.youtubeUrl))
                         }
                     } else null
 
+                    // 2. Strict Title + Artist match (ignore "Unknown" fallback false-positives)
+                    val hasValidArtist = cleanResult.artist.isNotBlank() && !cleanResult.artist.equals("Unknown", ignoreCase = true)
+
+                    val matchingExistingLiked = if (existingByIdOrUrl == null && hasValidArtist && cleanResult.title.isNotBlank()) {
+                        allSongs.firstOrNull {
+                            it.isLiked &&
+                                    it.title.equals(cleanResult.title, ignoreCase = true) &&
+                                    it.artist.equals(cleanResult.artist, ignoreCase = true)
+                        }
+                    } else null
+
+                    val matchingExistingDisliked = if (existingByIdOrUrl == null && matchingExistingLiked == null && hasValidArtist && cleanResult.title.isNotBlank()) {
+                        allSongs.firstOrNull {
+                            it.isDisliked &&
+                                    it.title.equals(cleanResult.title, ignoreCase = true) &&
+                                    it.artist.equals(cleanResult.artist, ignoreCase = true)
+                        }
+                    } else null
+
+                    // 3. Resolve flags safely
                     val isLiked = existingByIdOrUrl?.isLiked == true || matchingExistingLiked != null
                     val isDisliked = !isLiked && (existingByIdOrUrl?.isDisliked == true || matchingExistingDisliked != null)
 
@@ -740,6 +748,7 @@ class MusicLibraryService : MediaLibraryService() {
                         isDisliked = isDisliked
                     )
 
+                    // Update activeQueue state in thread-safe block
                     synchronized(queueLock) {
                         activeQueue = activeQueue.map { if (it.id == songToProcess.id) cleanedSong else it }.toMutableList()
                     }
@@ -759,12 +768,16 @@ class MusicLibraryService : MediaLibraryService() {
                         broadcastQueueChanged()
                     }
 
-                    prebufferNextItem(repository, cleanedSong.toMediaItem())
+                    // PRE-BUFFERING GUARD: Only pre-buffer audio if within 5 tracks ahead
+                    val distanceToCurrent = targetIndex - currentIndex
+                    if (distanceToCurrent in 1..5) {
+                        prebufferNextItem(repository, cleanedSong.toMediaItem())
+                    }
 
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    Napier.e("Failed to process song ${songToProcess.id}: ${e.message}", e)
+                    Napier.e("Failed to process song ${songToProcess.id}:${e.message}", e)
                 }
 
                 delay(100)
@@ -952,16 +965,24 @@ class MusicLibraryService : MediaLibraryService() {
         session.setCustomLayout(buildCustomLayout(mediaItem))
 
         val updatedCommands = forwardingPlayer.availableCommands
-        for (controller in session.connectedControllers) {
-            session.setAvailableCommands(
-                controller,
-                MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
-                    .add(customCommandLike)
-                    .add(customCommandDislike)
-                    .add(customCommandCycleMode)
-                    .build(),
-                updatedCommands
-            )
+        // Copy the connectedControllers list to avoid ConcurrentModificationException
+        val controllers = ArrayList(session.connectedControllers)
+
+        for (controller in controllers) {
+            try {
+                session.setAvailableCommands(
+                    controller,
+                    MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+                        .add(customCommandLike)
+                        .add(customCommandDislike)
+                        .add(customCommandCycleMode)
+                        .build(),
+                    updatedCommands
+                )
+            } catch (e: Exception) {
+                // Catches DeadObjectException / RemoteException if a client process died unexpectedly
+                Napier.w("Failed to set available commands for ${controller.packageName}:${e.message}", tag = "DEBUG_METADATA")
+            }
         }
     }
 
@@ -1007,6 +1028,14 @@ class MusicLibraryService : MediaLibraryService() {
                 .setAvailablePlayerCommands(playerCommands)
                 .setCustomLayout(layout)
                 .build()
+        }
+
+        override fun onDisconnected(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo
+        ) {
+            Napier.d("Controller disconnected: ${controller.packageName}", tag = "DEBUG_METADATA")
+            super.onDisconnected(session, controller)
         }
 
         @OptIn(UnstableApi::class)

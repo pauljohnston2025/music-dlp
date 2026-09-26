@@ -14,7 +14,7 @@ import java.io.File
 enum class SwipingMode(val displayName: String) {
     ONLY_NEW("Only Categorise New"),
     NEW_AND_LIKED("New and Liked"),
-    PLAY_ALL_RECATEGORISE("Play All / RecATEGORISE")
+    PLAY_ALL_RECATEGORISE("Play All / Recategorise")
 }
 
 @Serializable
