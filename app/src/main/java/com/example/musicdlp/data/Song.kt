@@ -12,9 +12,9 @@ import java.io.File
 
 @Serializable
 enum class SwipingMode(val displayName: String) {
-    ONLY_NEW("Only Categorise New"),
+    ONLY_NEW("Only New"),
     NEW_AND_LIKED("New and Liked"),
-    PLAY_ALL_RECATEGORISE("Play All / Recategorise")
+    PLAY_ALL_RECATEGORISE("Play All")
 }
 
 @Serializable

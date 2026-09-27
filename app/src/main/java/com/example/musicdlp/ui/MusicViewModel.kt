@@ -211,14 +211,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         _currentPlayingSong.value = null
                     }
                 }
-                "com.example.musicdlp.ACTION_SEARCH_VOICE" -> {
-                    val query = intent.getStringExtra("query") ?: ""
-                    handleVoiceSearch(query)
-                }
-                "com.example.musicdlp.ACTION_PLAY_MEDIA_ID" -> {
-                    val mediaId = intent.getStringExtra("mediaId") ?: ""
-                    handlePlayMediaId(mediaId)
-                }
             }
         }
     }
@@ -232,8 +224,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
         val filter = IntentFilter().apply {
             addAction(MusicLibraryService.ACTION_QUEUE_CHANGED)
-            addAction("com.example.musicdlp.ACTION_SEARCH_VOICE")
-            addAction("com.example.musicdlp.ACTION_PLAY_MEDIA_ID")
         }
         ContextCompat.registerReceiver(application, notificationReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
@@ -419,43 +409,32 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun handleVoiceSearch(query: String) {
-        setSwipingMode(SwipingMode.NEW_AND_LIKED)
-        if (query.isBlank()) return
-        val likedMatches = dbLikedSongsFlow.value.filter { song ->
-            song.title.contains(query, ignoreCase = true) || song.artist.contains(query, ignoreCase = true)
-        }
-        if (likedMatches.isNotEmpty()) {
-            val matched = likedMatches.first()
-            playSongInContext(matched, likedMatches)
-        } else {
-            searchPlaylists(query)
-        }
-    }
-
-    fun handlePlayMediaId(mediaId: String) {
-        if (mediaId.isBlank()) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val song = songDao.getSongById(mediaId) ?: _activePlayingList.value.firstOrNull { it.id == mediaId }
-            if (song != null) {
-                withContext(Dispatchers.Main) {
-                    playLikedSong(song) { playPreview(song) }
-                }
-            }
-        }
-    }
-
     fun searchPlaylists(query: String) {
         if (query.isBlank()) return
         viewModelScope.launch {
             _isPlaylistLoading.value = true
             try {
-                val results = repository.searchSongsOrPlaylists(query)
-                _playlistTotal.value = results.size
+                val allDbSongs = songDao.getAllSongs()
+
+                val likedMatches = allDbSongs.filter {
+                    it.isLiked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true) || (it.rawTitle?.contains(query, ignoreCase = true) == true))
+                }
+
+                val dislikedMatches = allDbSongs.filter {
+                    it.isDisliked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true) || (it.rawTitle?.contains(query, ignoreCase = true) == true))
+                }
+
+                val onlineResults = repository.searchSongsOrPlaylists(query)
+
+                val likedOrDislikedIds = (likedMatches + dislikedMatches).map { it.id }.toSet()
+                val filteredOnline = onlineResults.filter { it.id !in likedOrDislikedIds }
+
+                val combinedResults = likedMatches + dislikedMatches + filteredOnline
+                _playlistTotal.value = combinedResults.size
 
                 val intent = Intent(MusicLibraryService.ACTION_SET_QUEUE).apply {
                     setPackage(app.packageName)
-                    putExtra(MusicLibraryService.EXTRA_QUEUE_JSON, json.encodeToString(results))
+                    putExtra(MusicLibraryService.EXTRA_QUEUE_JSON, json.encodeToString(combinedResults))
                     putExtra(MusicLibraryService.EXTRA_START_INDEX, 0)
                 }
                 app.sendBroadcast(intent)

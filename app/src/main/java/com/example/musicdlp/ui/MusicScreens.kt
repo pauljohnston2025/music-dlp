@@ -19,11 +19,13 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FiberNew
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -682,7 +684,7 @@ fun PlayerControls(
             IconButton(onClick = { viewModel.cycleSwipingMode() }) {
                 val (modeIcon, modeTint) = when (swipingMode) {
                     SwipingMode.ONLY_NEW -> Icons.Default.MusicNote to MaterialTheme.colorScheme.primary
-                    SwipingMode.NEW_AND_LIKED -> Icons.Default.ThumbUp to MaterialTheme.colorScheme.primary
+                    SwipingMode.NEW_AND_LIKED -> Icons.Default.Favorite to MaterialTheme.colorScheme.primary
                     SwipingMode.PLAY_ALL_RECATEGORISE -> Icons.Default.Layers to MaterialTheme.colorScheme.secondary
                 }
                 Icon(

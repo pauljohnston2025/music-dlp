@@ -313,17 +313,24 @@ class MusicLibraryService : MediaLibraryService() {
                 val builder = super.getAvailableCommands().buildUpon()
                 builder.add(COMMAND_SEEK_TO_NEXT).add(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
                 builder.add(COMMAND_SEEK_TO_PREVIOUS).add(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+                builder.add(COMMAND_GET_TIMELINE)
                 return builder.build()
             }
 
             override fun isCommandAvailable(command: Int): Boolean {
                 return when (command) {
+                    COMMAND_GET_TIMELINE -> true
                     COMMAND_SEEK_TO_NEXT,
                     COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> hasNextMediaItem()
                     COMMAND_SEEK_TO_PREVIOUS,
                     COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> hasPreviousMediaItem()
                     else -> super.isCommandAvailable(command)
                 }
+            }
+
+            override fun seekTo(mediaItemIndex: Int, positionMs: Long) {
+                virtualCurrentIndex = null
+                super.seekTo(mediaItemIndex, positionMs)
             }
 
             override fun hasNextMediaItem(): Boolean {
@@ -373,6 +380,7 @@ class MusicLibraryService : MediaLibraryService() {
 
         mediaSession = MediaLibrarySession.Builder(this, forwardingPlayer, LibrarySessionCallback())
             .setCustomLayout(buildCustomLayout(null))
+            .setPeriodicPositionUpdateEnabled(false)
             .build()
 
         setMediaNotificationProvider(
@@ -422,12 +430,16 @@ class MusicLibraryService : MediaLibraryService() {
         }
     }
 
-    private fun notifyMediaBrowserChildrenChanged() {
+    private fun notifyMediaBrowserChildrenChanged(folderId: String? = null) {
         val session = mediaSession ?: return
 
-        // Notify ALL folder IDs across the entire tree hierarchy
-        val targetFolders = listOf(
-            "ROOT",
+        if (!folderId.isNullOrBlank()) {
+            session.notifyChildrenChanged(folderId, 0, null)
+            return
+        }
+
+        // Only notify content folders that change (do NOT notify ROOT)
+        val queueFolders = listOf(
             "NOW_PLAYING",
             "NOW_PLAYING_LIKED",
             "NOW_PLAYING_DISLIKED",
@@ -437,15 +449,16 @@ class MusicLibraryService : MediaLibraryService() {
             "DISLIKED"
         )
 
-        // Send notifications to default session and all active connected controllers
-        for (folderId in targetFolders) {
-            session.notifyChildrenChanged(folderId, 0, null)
+        for (id in queueFolders) {
+            session.notifyChildrenChanged(id, 0, null)
         }
+    }
 
-        for (controller in session.connectedControllers) {
-            for (folderId in targetFolders) {
-                session.notifyChildrenChanged(controller, folderId, 0, null)
-            }
+    private fun getFilteredQueueForMode(queue: List<Song>, mode: SwipingMode): List<Song> {
+        return when (mode) {
+            SwipingMode.ONLY_NEW -> queue.filter { !it.isLiked && !it.isDisliked }
+            SwipingMode.NEW_AND_LIKED -> queue.filter { !it.isDisliked }
+            SwipingMode.PLAY_ALL_RECATEGORISE -> queue
         }
     }
 
@@ -459,13 +472,15 @@ class MusicLibraryService : MediaLibraryService() {
             activeQueue = queue.toMutableList()
         }
 
-        val targetIndex = if (!targetSongId.isNullOrBlank()) {
-            queue.indexOfFirst { it.id == targetSongId }.let { if (it != -1) it else startIndex }
-        } else {
-            startIndex
-        }.coerceIn(0, (queue.size - 1).coerceAtLeast(0))
+        val playableQueue = getFilteredQueueForMode(queue, currentMode).ifEmpty { queue }
 
-        val mediaItems = queue.map { it.toMediaItem(swipingMode = currentMode.name) }
+        val targetIndex = if (!targetSongId.isNullOrBlank()) {
+            playableQueue.indexOfFirst { it.id == targetSongId }.let { if (it != -1) it else 0 }
+        } else {
+            startIndex.coerceIn(0, (playableQueue.size - 1).coerceAtLeast(0))
+        }
+
+        val mediaItems = playableQueue.map { it.toMediaItem(swipingMode = currentMode.name) }
 
         exoPlayer.setMediaItems(mediaItems, targetIndex, seekToMs)
         exoPlayer.prepare()
@@ -841,7 +856,9 @@ class MusicLibraryService : MediaLibraryService() {
             }
         } finally {
             isProcessingQueue = false
-            withContext(Dispatchers.Main) { broadcastQueueChanged() }
+            withContext(Dispatchers.Main) {
+                broadcastQueueChanged(notifyMediaBrowser = false)
+            }
             processMutex.unlock()
         }
     }
@@ -1105,10 +1122,10 @@ class MusicLibraryService : MediaLibraryService() {
         ): ListenableFuture<SessionResult> {
             val action = customCommand.customAction
             if (action == CUSTOM_ACTION_LIKE || action == ACTION_LIKE) {
-                likeSong(null, advance = true)
+                likeSong(null, advance = false)
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             } else if (action == CUSTOM_ACTION_DISLIKE || action == ACTION_DISLIKE) {
-                dislikeSong(null, advance = true)
+                dislikeSong(null, advance = false)
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             } else if (action == CUSTOM_ACTION_CYCLE_MODE || action == ACTION_CYCLE_MODE) {
                 currentMode = when (currentMode) {
@@ -1176,10 +1193,10 @@ class MusicLibraryService : MediaLibraryService() {
                     val children = when (parentId.uppercase()) {
                         "ROOT", "/", "MEDIA_ROOT" -> {
                             listOf(
-                                createBrowsableItem("NOW_PLAYING", "Now Playing"),
-                                createBrowsableItem("LIKED", "Liked"),
-                                createBrowsableItem("DISLIKED", "Disliked"),
-                                createBrowsableItem("SETTINGS", "Settings")
+                                createBrowsableItem("NOW_PLAYING", "Queue / Up Next"),
+                                createBrowsableItem("LIKED", "Liked Songs"),
+                                createBrowsableItem("DISLIKED", "Disliked Songs"),
+                                createBrowsableItem("SETTINGS", "Playback Settings")
                             )
                         }
                         "NOW_PLAYING" -> {
@@ -1211,9 +1228,9 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         "SETTINGS" -> {
                             listOf(
-                                createPlayableSettingItem("MODE_ONLY_NEW", "Mode: Only Categorise New"),
-                                createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: New and Liked"),
-                                createPlayableSettingItem("MODE_PLAY_ALL", "Mode: Play All / Recateogise")
+                                createPlayableSettingItem("MODE_ONLY_NEW", "Mode: Only Categorise New", isSelected = currentMode == SwipingMode.ONLY_NEW),
+                                createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: New and Liked", isSelected = currentMode == SwipingMode.NEW_AND_LIKED),
+                                createPlayableSettingItem("MODE_PLAY_ALL", "Mode: Play All / Recategorise", isSelected = currentMode == SwipingMode.PLAY_ALL_RECATEGORISE)
                             )
                         }
                         "LIKED" -> {
@@ -1281,6 +1298,7 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         currentMode = SwipingMode.valueOf(modeStr)
                         updateNotificationLayout(exoPlayer.currentMediaItem)
+                        notifyMediaBrowserChildrenChanged("SETTINGS")
                         broadcastQueueChanged()
                         settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
                         return@launch
@@ -1377,23 +1395,33 @@ class MusicLibraryService : MediaLibraryService() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val app = application as MusicDLPApplication
-                    val dbSongs = app.database.songDao().getAllSongs()
-                    var rawMatches = dbSongs.filter {
-                        it.isLiked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true))
+                    val songDao = app.database.songDao()
+                    val repo = YoutubeDLRepository(app)
+
+                    val allDbSongs = songDao.getAllSongs()
+
+                    val likedMatches = allDbSongs.filter {
+                        it.isLiked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true) || (it.rawTitle?.contains(query, ignoreCase = true) == true))
                     }
 
-                    if (rawMatches.isEmpty()) {
-                        val repo = YoutubeDLRepository(app)
-                        rawMatches = repo.searchSongsOrPlaylists(query)
+                    val dislikedMatches = allDbSongs.filter {
+                        it.isDisliked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true) || (it.rawTitle?.contains(query, ignoreCase = true) == true))
                     }
 
-                    if (rawMatches.isNotEmpty()) {
-                        val mediaItems = rawMatches.map { it.toMediaItem(swipingMode = currentMode.name) }
+                    val onlineResults = repo.searchSongsOrPlaylists(query)
+
+                    val likedOrDislikedIds = (likedMatches + dislikedMatches).map { it.id }.toSet()
+                    val filteredOnline = onlineResults.filter { it.id !in likedOrDislikedIds }
+
+                    val combinedResults = likedMatches + dislikedMatches + filteredOnline
+
+                    if (combinedResults.isNotEmpty()) {
+                        val mediaItems = combinedResults.map { it.toMediaItem(swipingMode = currentMode.name) }
                         searchResultsCache[query] = mediaItems
                         session.notifySearchResultChanged(browser, query, mediaItems.size, params)
 
                         withContext(Dispatchers.Main) {
-                            setQueueAndPlay(rawMatches, rawMatches.first().id, 0, 0L)
+                            setQueueAndPlay(combinedResults, combinedResults.first().id, 0, 0L)
                         }
                     }
                 } catch (e: Exception) {
@@ -1442,19 +1470,25 @@ class MusicLibraryService : MediaLibraryService() {
         }
 
         @Suppress("DEPRECATION")
-        private fun createPlayableSettingItem(id: String, title: String): MediaItem {
+        private fun createPlayableSettingItem(id: String, title: String, isSelected: Boolean = false): MediaItem {
+            val displayTitle = if (isSelected) "✓ $title" else "  $title"
+            val displaySubtitle = if (isSelected) "● ACTIVE MODE" else "Tap to select mode"
+
             val itemExtras = Bundle().apply {
                 putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
+                putBoolean("isSelected", isSelected)
+                putBoolean("android.media.extra.SELECTED", isSelected)
             }
             return MediaItem.Builder()
                 .setMediaId(id)
-                .setUri(Uri.parse("http://dummy_setting"))
+                .setUri(Uri.parse("http://dummy_setting/$id"))
                 .setMediaMetadata(
                     MediaMetadata.Builder()
                         .setIsBrowsable(false)
                         .setIsPlayable(true)
                         .setFolderType(MediaMetadata.FOLDER_TYPE_NONE)
-                        .setTitle(title)
+                        .setTitle(displayTitle)
+                        .setSubtitle(displaySubtitle)
                         .setExtras(itemExtras)
                         .build()
                 )
