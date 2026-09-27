@@ -36,6 +36,8 @@ import androidx.compose.material.icons.outlined.ThumbDown
 import androidx.compose.material.icons.outlined.ThumbUp
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.filled.Mood
+import androidx.compose.material.icons.filled.MoodBad
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -159,13 +161,19 @@ fun MainScreen() {
                         onClick = { navigateTab("swipe") }
                     )
                     NavigationBarItem(
-                        icon = { Icon(Icons.Default.Favorite, contentDescription = "Liked") },
+                        icon = { Icon(Icons.Default.FiberNew, contentDescription = "New") },
+                        label = { Text("New") },
+                        selected = currentDestination == "new",
+                        onClick = { navigateTab("new") }
+                    )
+                    NavigationBarItem(
+                        icon = { Icon(Icons.Default.Mood, contentDescription = "Liked") },
                         label = { Text("Liked") },
                         selected = currentDestination == "liked",
                         onClick = { navigateTab("liked") }
                     )
                     NavigationBarItem(
-                        icon = { Icon(Icons.Default.List, contentDescription = "Disliked") },
+                        icon = { Icon(Icons.Default.MoodBad, contentDescription = "Disliked") },
                         label = { Text("Disliked") },
                         selected = currentDestination == "disliked",
                         onClick = { navigateTab("disliked") }
@@ -186,6 +194,7 @@ fun MainScreen() {
             modifier = Modifier.padding(innerPadding)
         ) {
             composable("swipe") { SwipingScreen(viewModel) }
+            composable("new") { com.example.musicdlp.ui.NewSongsScreen(viewModel) }
             composable("liked") { LikedSongsScreen(viewModel) }
             composable("disliked") { DislikedSongsScreen(viewModel) }
             composable("settings") { SettingsScreen(viewModel) }
@@ -208,20 +217,38 @@ fun BottomPlayerBar(
     var isPlaying by remember { mutableStateOf(false) }
     var progress by remember { mutableFloatStateOf(0f) }
     var isUserSeeking by remember { mutableStateOf(false) }
+    var currentPositionMs by remember { mutableLongStateOf(0L) }
+    var durationMs by remember { mutableLongStateOf(0L) }
 
     LaunchedEffect(song.id) {
         progress = 0f
+        currentPositionMs = 0L
+        durationMs = 0L
     }
 
     LaunchedEffect(player) {
         if (player == null) return@LaunchedEffect
         while (true) {
             isPlaying = player.isPlaying
-            if (!isUserSeeking && player.duration > 0) {
-                progress = (player.currentPosition.toFloat() / player.duration.toFloat()).coerceIn(0f, 1f)
+            val dur = player.duration.coerceAtLeast(0L)
+            val pos = player.currentPosition.coerceAtLeast(0L)
+            durationMs = dur
+            if (!isUserSeeking) {
+                currentPositionMs = pos
+                if (dur > 0) {
+                    progress = (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
+                }
             }
             delay(300)
         }
+    }
+
+    fun formatMs(ms: Long): String {
+        if (ms <= 0L) return "0:00"
+        val totalSec = ms / 1000
+        val minutes = totalSec / 60
+        val seconds = totalSec % 60
+        return String.format("%d:%02d", minutes, seconds)
     }
 
     Surface(
@@ -238,6 +265,7 @@ fun BottomPlayerBar(
                 onValueChange = { newValue ->
                     isUserSeeking = true
                     progress = newValue
+                    if (durationMs > 0) currentPositionMs = (newValue * durationMs).toLong()
                 },
                 onValueChangeFinished = {
                     player?.let { p ->
@@ -257,6 +285,26 @@ fun BottomPlayerBar(
                     .fillMaxWidth()
                     .height(18.dp)
             )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = formatMs(currentPositionMs),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = formatMs(durationMs),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
 
             Row(
                 modifier = Modifier

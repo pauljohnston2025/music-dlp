@@ -82,9 +82,16 @@ data class YtDlpEntry(
 class YoutubeDLRepository(private val context: Context) {
 
     private val json = Json { ignoreUnknownKeys = true }
-    var geminiApiKey: String = ""
-
     private val prefs = context.getSharedPreferences("musicdlp_prefs", Context.MODE_PRIVATE)
+
+    var geminiApiKey: String
+        get() = prefs.getString("gemini_api_key", "") ?: ""
+        set(value) {
+            prefs.edit().putString("gemini_api_key", value).apply()
+        }
+
+    var lastStreamError: String? = null
+        private set
 
     var lastWorkingModel: String?
         get() = prefs.getString("last_working_gemini_model", null)
@@ -493,7 +500,7 @@ class YoutubeDLRepository(private val context: Context) {
         }
 
         // 2. Try Gemini if score is low or MB failed
-        if (geminiApiKey.isNotBlank() && regScore < 90) {
+        if (geminiApiKey.isNotBlank()) {
             val geminiGuess = guessWithGemini(effectiveRawTitle)
             if (geminiGuess != null) {
                 val a = postClean(geminiGuess.artist)
@@ -690,11 +697,14 @@ class YoutubeDLRepository(private val context: Context) {
 
     suspend fun getStreamUrl(youtubeUrl: String): String? = withContext(Dispatchers.IO) {
         if (youtubeUrl.startsWith("content://") || youtubeUrl.startsWith("file://") || youtubeUrl.startsWith("/")) {
+            lastStreamError = null
             return@withContext youtubeUrl
         }
         if (isRateLimited()) {
             val remainingSec = ((rateLimitCooldownUntilMs - System.currentTimeMillis()) / 1000).coerceAtLeast(1)
-            Napier.w("Rate limited. Waiting ${remainingSec}s before fetching stream URL.", tag = "DEBUG_METADATA")
+            val err = "YouTube rate limited. Waiting ${remainingSec}s before retrying."
+            lastStreamError = err
+            Napier.w(err, tag = "DEBUG_METADATA")
             return@withContext null
         }
         val request = YoutubeDLRequest(youtubeUrl)
@@ -707,18 +717,24 @@ class YoutubeDLRepository(private val context: Context) {
             val response = YoutubeDL.getInstance().execute(request)
             val url = response.out.trim().lines().firstOrNull()
             if (url != null && url.startsWith("http")) {
+                lastStreamError = null
                 Napier.d("Stream URL fetched: $url", tag = "DEBUG_METADATA")
                 url
             } else {
-                Napier.w("Invalid stream URL response: ${response.out}", tag = "DEBUG_METADATA")
+                val err = "Invalid stream URL response: ${response.out.take(150)}"
+                lastStreamError = err
+                Napier.w(err, tag = "DEBUG_METADATA")
                 null
             }
         } catch (e: Exception) {
-            val msg = e.message ?: ""
+            val msg = e.message ?: "Unknown yt-dlp error"
             Napier.e("Failed to fetch stream URL: $msg", tag = "DEBUG_METADATA")
             if (msg.contains("429") || msg.contains("Too Many Requests", ignoreCase = true) || msg.contains("bot", ignoreCase = true) || msg.contains("Sign in", ignoreCase = true)) {
                 setRateLimitedCooldown(25)
+                lastStreamError = "YouTube Bot Check / Rate Limited: Sign in required or wait 25s."
                 Napier.w("Set rate limit / bot check cooldown for 25s", tag = "DEBUG_METADATA")
+            } else {
+                lastStreamError = msg
             }
             null
         }

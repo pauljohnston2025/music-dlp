@@ -113,7 +113,7 @@ fun SwipingScreen(viewModel: MusicViewModel) {
 
     if (showNewPlaylistDialog) {
         FilteredSongsDialog(
-            title = "New / Upcoming Songs in Playlist",
+            title = "New Songs in Playlist",
             songs = uniqueNew,
             viewModel = viewModel,
             onDismiss = { showNewPlaylistDialog = false }
@@ -483,10 +483,13 @@ fun TinderCard(
                 )
                 if (song.isLiked || song.isDisliked) {
                     val isDownloaded = viewModel.isSongDownloaded(song)
+                    val isAlternate by produceState(initialValue = false, song.id) {
+                        value = viewModel.isAlternateVersionInDb(song)
+                    }
                     val labelText = if (song.isLiked) {
-                        if (isDownloaded) "Already Liked" else "Already Liked (Alternate)"
+                        if (!isAlternate && isDownloaded) "Already Liked" else "Already Liked (Alternate)"
                     } else {
-                        if (isDownloaded) "Already Disliked" else "Already Disliked (Alternate)"
+                        if (!isAlternate && isDownloaded) "Already Disliked" else "Already Disliked (Alternate)"
                     }
                     AssistChip(
                         onClick = { },
@@ -756,19 +759,8 @@ fun PlayerControls(
 fun LikedSongsScreen(viewModel: MusicViewModel) {
     val likedSongs by viewModel.likedSongs.collectAsState(initial = emptyList())
     val downloadProgress by viewModel.downloadProgress.collectAsState()
-    val currentlyPlayingId by viewModel.currentlyPlayingId.collectAsState()
-    var searchQuery by remember { mutableStateOf("") }
 
     var songToPrompt by remember { mutableStateOf<Song?>(null) }
-    var songForAlternatesDialog by remember { mutableStateOf<Song?>(null) }
-
-    if (songForAlternatesDialog != null) {
-        AlternateVersionsDialog(
-            song = songForAlternatesDialog!!,
-            viewModel = viewModel,
-            onDismiss = { songForAlternatesDialog = null }
-        )
-    }
 
     if (songToPrompt != null) {
         AlertDialog(
@@ -792,118 +784,33 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
         )
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text(
-            text = "Liked Songs (${likedSongs.size})",
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(bottom = 8.dp)
-        )
-        TextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            label = { Text("Search Liked (Artist or Song)") },
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        val filteredLikedList = remember(likedSongs, searchQuery) {
-            likedSongs.filter {
-                it.title.contains(searchQuery, ignoreCase = true) || it.artist.contains(searchQuery, ignoreCase = true)
-            }
-        }
-
-        LazyColumn(modifier = Modifier.weight(1f)) {
-            items(filteredLikedList) { song ->
-                val isDownloading = downloadProgress.containsKey(song.id)
-                val progress = downloadProgress[song.id] ?: 0f
-                val isPlaying = currentlyPlayingId == song.id
-
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (isPlaying) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp)
-                        .clickable {
-                            viewModel.playSongInContext(song, filteredLikedList, isFromLikedOrDisliked = true)
-                        }
-                ) {
-                    ListItem(
-                        colors = ListItemDefaults.colors(
-                            containerColor = Color.Transparent
-                        ),
-                        headlineContent = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = song.title,
-                                    fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.Normal
-                                )
-                                if (isPlaying) {
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    AssistChip(
-                                        onClick = {},
-                                        label = { Text("Playing", style = MaterialTheme.typography.labelSmall) },
-                                        leadingIcon = { Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(12.dp)) }
-                                    )
-                                }
-                            }
-                        },
-                        supportingContent = {
-                            val alternates = song.getAlternateVersionsList()
-                            Column {
-                                Text(song.artist)
-                                if (alternates.isNotEmpty()) {
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    AssistChip(
-                                        onClick = { songForAlternatesDialog = song },
-                                        label = { Text("Alternate Versions (${alternates.size})") },
-                                        leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(16.dp)) }
-                                    )
-                                }
-                            }
-                        },
-                        leadingContent = {
-                            val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
-                                val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
-                                "https://i.ytimg.com/vi/$id/hqdefault.jpg"
-                            } else {
-                                song.thumbnailUrl
-                            }
-
-                            if (effectiveThumbnail.isNotBlank()) {
-                                AsyncImage(
-                                    model = effectiveThumbnail,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(48.dp)
-                                )
-                            } else {
-                                Box(modifier = Modifier.size(48.dp).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-                                    Icon(Icons.Default.MusicNote, contentDescription = null)
-                                }
-                            }
-                        },
-                        trailingContent = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (isDownloading) {
-                                    CircularProgressIndicator(
-                                        progress = { progress },
-                                        modifier = Modifier.size(24.dp),
-                                        strokeWidth = 2.dp
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                }
-                                if (!viewModel.isSongDownloaded(song)) {
-                                    TextButton(onClick = { viewModel.retryDownload(song) }) {
-                                        Text("Retry")
-                                    }
-                                }
-                            }
-                        }
+    CommonSongListScreen(
+        title = "Liked Songs",
+        searchLabel = "Search Liked (Artist or Song)",
+        songs = likedSongs,
+        viewModel = viewModel,
+        emptyMessage = "No liked songs.",
+        isFromLikedOrDisliked = true,
+        trailingContent = { song ->
+            val isDownloading = downloadProgress.containsKey(song.id)
+            val progress = downloadProgress[song.id] ?: 0f
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (isDownloading) {
+                    CircularProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.size(24.dp),
+                        strokeWidth = 2.dp
                     )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+                if (!viewModel.isSongDownloaded(song)) {
+                    TextButton(onClick = { viewModel.retryDownload(song) }) {
+                        Text("Retry")
+                    }
                 }
             }
         }
-    }
+    )
 }
 
 @Composable
@@ -1157,113 +1064,14 @@ fun SettingsScreen(viewModel: MusicViewModel) {
 @Composable
 fun DislikedSongsScreen(viewModel: MusicViewModel) {
     val dislikedSongs by viewModel.dislikedSongs.collectAsState(initial = emptyList())
-    val currentlyPlayingId by viewModel.currentlyPlayingId.collectAsState()
-    var searchQuery by remember { mutableStateOf("") }
-
-    var songForAlternatesDialog by remember { mutableStateOf<Song?>(null) }
-
-    if (songForAlternatesDialog != null) {
-        AlternateVersionsDialog(
-            song = songForAlternatesDialog!!,
-            viewModel = viewModel,
-            onDismiss = { songForAlternatesDialog = null }
-        )
-    }
-
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text(
-            text = "Disliked Songs (${dislikedSongs.size})",
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(bottom = 8.dp)
-        )
-        TextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            label = { Text("Search Disliked (Artist or Song)") },
-            modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-
-        val filteredDislikedList = remember(dislikedSongs, searchQuery) {
-            dislikedSongs.filter {
-                it.title.contains(searchQuery, ignoreCase = true) || it.artist.contains(searchQuery, ignoreCase = true)
-            }
-        }
-
-        LazyColumn(modifier = Modifier.weight(1f)) {
-            items(filteredDislikedList) { song ->
-                val isPlaying = currentlyPlayingId == song.id
-                val alternates = song.getAlternateVersionsList()
-
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (isPlaying) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp)
-                        .clickable {
-                            viewModel.playSongInContext(song, filteredDislikedList, isFromLikedOrDisliked = true)
-                        }
-                ) {
-                    ListItem(
-                        colors = ListItemDefaults.colors(
-                            containerColor = Color.Transparent
-                        ),
-                        headlineContent = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = song.title,
-                                    fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.Normal
-                                )
-                                if (isPlaying) {
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    AssistChip(
-                                        onClick = {},
-                                        label = { Text("Playing", style = MaterialTheme.typography.labelSmall) },
-                                        leadingIcon = { Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(12.dp)) }
-                                    )
-                                }
-                            }
-                        },
-                        supportingContent = {
-                            Column {
-                                Text(song.artist)
-                                if (alternates.isNotEmpty()) {
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    AssistChip(
-                                        onClick = { songForAlternatesDialog = song },
-                                        label = { Text("Alternates (${alternates.size})") },
-                                        leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(16.dp)) }
-                                    )
-                                }
-                            }
-                        },
-                        leadingContent = {
-                            val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
-                                val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
-                                "https://i.ytimg.com/vi/$id/hqdefault.jpg"
-                            } else {
-                                song.thumbnailUrl
-                            }
-
-                            if (effectiveThumbnail.isNotBlank()) {
-                                AsyncImage(
-                                    model = effectiveThumbnail,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(48.dp)
-                                )
-                            } else {
-                                Box(modifier = Modifier.size(48.dp).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-                                    Icon(Icons.Default.MusicNote, contentDescription = null)
-                                }
-                            }
-                        }
-                    )
-                }
-            }
-        }
-    }
+    CommonSongListScreen(
+        title = "Disliked Songs",
+        searchLabel = "Search Disliked (Artist or Song)",
+        songs = dislikedSongs,
+        viewModel = viewModel,
+        emptyMessage = "No disliked songs.",
+        isFromLikedOrDisliked = true
+    )
 }
 
 @Composable
@@ -1430,4 +1238,174 @@ fun CompactCategoryChip(
             )
         }
     }
+}
+
+@Composable
+fun CommonSongListScreen(
+    title: String,
+    searchLabel: String,
+    songs: List<Song>,
+    viewModel: MusicViewModel,
+    emptyMessage: String = "No songs found.",
+    isFromLikedOrDisliked: Boolean = false,
+    onSongClick: ((Song, List<Song>) -> Unit)? = null,
+    trailingContent: (@Composable (Song) -> Unit)? = null
+) {
+    val currentlyPlayingId by viewModel.currentlyPlayingId.collectAsState()
+    var searchQuery by remember { mutableStateOf("") }
+    var songForAlternatesDialog by remember { mutableStateOf<Song?>(null) }
+
+    if (songForAlternatesDialog != null) {
+        AlternateVersionsDialog(
+            song = songForAlternatesDialog!!,
+            viewModel = viewModel,
+            onDismiss = { songForAlternatesDialog = null }
+        )
+    }
+
+    val filteredList = remember(songs, searchQuery) {
+        songs.filter {
+            it.title.contains(searchQuery, ignoreCase = true) ||
+            it.artist.contains(searchQuery, ignoreCase = true) ||
+            (it.rawTitle?.contains(searchQuery, ignoreCase = true) == true)
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        Text(
+            text = "$title (${filteredList.size})",
+            style = MaterialTheme.typography.titleLarge,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+        TextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            label = { Text(searchLabel) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+
+        if (filteredList.isEmpty()) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(emptyMessage)
+            }
+        } else {
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                items(filteredList) { song ->
+                    val isPlaying = currentlyPlayingId == song.id
+                    val alternates = song.getAlternateVersionsList()
+
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isPlaying) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clickable {
+                                if (onSongClick != null) {
+                                    onSongClick(song, filteredList)
+                                } else {
+                                    viewModel.playSongInContext(song, filteredList, isFromLikedOrDisliked = isFromLikedOrDisliked)
+                                }
+                            }
+                    ) {
+                        ListItem(
+                            colors = ListItemDefaults.colors(
+                                containerColor = Color.Transparent
+                            ),
+                            headlineContent = {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = song.title,
+                                        fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                    if (isPlaying) {
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        AssistChip(
+                                            onClick = {},
+                                            label = { Text("Playing", style = MaterialTheme.typography.labelSmall) },
+                                            leadingIcon = { Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(12.dp)) }
+                                        )
+                                    }
+                                }
+                            },
+                            supportingContent = {
+                                Column {
+                                    Text(song.artist.ifBlank { song.rawTitle ?: "Unknown Artist" })
+                                    if (alternates.isNotEmpty()) {
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        AssistChip(
+                                            onClick = { songForAlternatesDialog = song },
+                                            label = { Text("Alternate Versions (${alternates.size})") },
+                                            leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                                        )
+                                    }
+                                }
+                            },
+                            leadingContent = {
+                                val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
+                                    val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+                                    "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                                } else {
+                                    song.thumbnailUrl
+                                }
+
+                                if (effectiveThumbnail.isNotBlank()) {
+                                    AsyncImage(
+                                        model = effectiveThumbnail,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(48.dp)
+                                    )
+                                } else {
+                                    Box(modifier = Modifier.size(48.dp).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
+                                        Icon(Icons.Default.MusicNote, contentDescription = null)
+                                    }
+                                }
+                            },
+                            trailingContent = if (trailingContent != null) {
+                                { trailingContent(song) }
+                            } else null
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun NewSongsScreen(viewModel: MusicViewModel) {
+    val activePlayingList by viewModel.activePlayingList.collectAsState()
+    val playlistNewSongs by viewModel.playlistNewSongs.collectAsState()
+    val dbNewSongs by viewModel.newSongs.collectAsState(initial = emptyList())
+
+    val newSongsList = remember(dbNewSongs, playlistNewSongs, activePlayingList) {
+        val queueNew = playlistNewSongs.ifEmpty { activePlayingList.filter { !it.isLiked && !it.isDisliked } }
+        (dbNewSongs + queueNew)
+            .filter { !it.isLiked && !it.isDisliked }
+            .distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
+    }
+
+    CommonSongListScreen(
+        title = "New Songs",
+        searchLabel = "Search New Songs (Artist or Title)",
+        songs = newSongsList,
+        viewModel = viewModel,
+        emptyMessage = "No new songs in current queue.",
+        isFromLikedOrDisliked = false,
+        onSongClick = { song, _ ->
+            viewModel.jumpToSongInSwipeList(song)
+        },
+        trailingContent = { song ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { viewModel.likeSong(song, advance = false) }) {
+                    Icon(Icons.Default.ThumbUp, contentDescription = "Like", tint = MaterialTheme.colorScheme.primary)
+                }
+                IconButton(onClick = { viewModel.dislikeSong(song, advance = false) }) {
+                    Icon(Icons.Default.ThumbDown, contentDescription = "Dislike", tint = MaterialTheme.colorScheme.error)
+                }
+            }
+        }
+    )
 }

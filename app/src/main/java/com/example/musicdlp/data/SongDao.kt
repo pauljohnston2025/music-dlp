@@ -20,6 +20,12 @@ interface SongDao {
     @Query("SELECT * FROM songs WHERE isDisliked = 1 ORDER BY dislikedAt DESC")
     suspend fun getDislikedSongsList(): List<Song>
 
+    @Query("SELECT * FROM songs WHERE isLiked = 0 AND isDisliked = 0 ORDER BY updatedAt DESC")
+    fun getNewSongs(): Flow<List<Song>>
+
+    @Query("SELECT * FROM songs WHERE isLiked = 0 AND isDisliked = 0 ORDER BY updatedAt DESC")
+    suspend fun getNewSongsList(): List<Song>
+
     @Query("SELECT * FROM songs")
     suspend fun getAllSongs(): List<Song>
 

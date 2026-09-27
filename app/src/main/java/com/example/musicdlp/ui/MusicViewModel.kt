@@ -19,6 +19,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.example.musicdlp.MusicDLPApplication
 import com.example.musicdlp.data.AlternateVersion
+import com.example.musicdlp.data.SharedQueueHolder
 import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.SwipingMode
 import com.example.musicdlp.data.YoutubeDLRepository
@@ -173,6 +174,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     val likedSongs = songDao.getLikedSongs()
     val dislikedSongs = songDao.getDislikedSongs()
+    val newSongs = songDao.getNewSongs()
 
     val exoPlayer: Player?
         get() = controller
@@ -186,8 +188,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     val newIndex = intent.getIntExtra(MusicLibraryService.EXTRA_CURRENT_INDEX, 0)
                     val modeStr = intent.getStringExtra(MusicLibraryService.EXTRA_SWIPING_MODE)
                     val isBuffering = intent.getBooleanExtra(MusicLibraryService.EXTRA_IS_BUFFERING, false)
+                    val extraErr = intent.getStringExtra("extra_error")
 
-                    if (!queueJson.isNullOrBlank()) {
+                    val sharedQueue = SharedQueueHolder.getQueue()
+                    if (sharedQueue.isNotEmpty()) {
+                        _activePlayingList.value = sharedQueue
+                    } else if (!queueJson.isNullOrBlank()) {
                         try {
                             val updatedQueue = json.decodeFromString<List<Song>>(queueJson)
                             _activePlayingList.value = updatedQueue
@@ -200,6 +206,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         try { _swipingMode.value = SwipingMode.valueOf(modeStr) } catch (e: Exception) {}
                     }
                     _isBuffering.value = isBuffering
+                    if (!extraErr.isNullOrBlank()) {
+                        _errorMessage.value = extraErr
+                    }
 
                     val currentList = _activePlayingList.value
                     if (newIndex in currentList.indices) {
@@ -261,7 +270,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             override fun onPlayerError(error: PlaybackException) {
                 Napier.e("Player error: ${error.message}", tag = "DEBUG_METADATA")
                 _isSongLoading.value = false
-                _errorMessage.value = "Playback error: ${error.message}"
+                val streamErr = repository.lastStreamError
+                val causeMsg = error.cause?.message
+                val detailedMsg = when {
+                    !streamErr.isNullOrBlank() -> streamErr
+                    !causeMsg.isNullOrBlank() && causeMsg.contains("UnrecognizedInputFormatException") ->
+                        "Failed to parse audio stream. Check YouTube link or bot verification."
+                    !causeMsg.isNullOrBlank() -> causeMsg
+                    else -> "Playback error: ${error.message}"
+                }
+                _errorMessage.value = detailedMsg
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -562,69 +580,81 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     trimmedArtist.isNotBlank() &&
                     !trimmedArtist.equals("Unknown", ignoreCase = true)
 
-            val matchingLiked = if (hasValidTrimmed) {
-                allSongs.firstOrNull {
-                    it.isLiked &&
-                            it.title.equals(trimmedTitle, ignoreCase = true) &&
-                            it.artist.equals(trimmedArtist, ignoreCase = true)
+            if (!hasValidTrimmed) return@launch
+
+            // 1. Check if another song in DB matches this new title & artist
+            val matchingOtherSong = allSongs.firstOrNull {
+                it.id != song.id &&
+                        it.title.equals(trimmedTitle, ignoreCase = true) &&
+                        it.artist.equals(trimmedArtist, ignoreCase = true)
+            }
+
+            val finalSongToBroadcast: Song
+
+            if (matchingOtherSong != null) {
+                // Merge `song` as an alternate version on `matchingOtherSong`
+                val alternate = AlternateVersion(
+                    youtubeUrl = song.youtubeUrl,
+                    rawTitle = song.rawTitle ?: song.title,
+                    thumbnailUrl = song.thumbnailUrl
+                )
+                val updatedOther = matchingOtherSong.addAlternateVersion(alternate).copy(
+                    updatedAt = System.currentTimeMillis()
+                )
+                songDao.insertSong(updatedOther)
+
+                // If `song` existed as its own standalone row in DB, delete it
+                if (allSongs.any { it.id == song.id }) {
+                    songDao.deleteSongById(song.id)
                 }
+
+                // Clean up song from any other parent song's alternate list
+                allSongs.filter { it.id != matchingOtherSong.id && it.containsYoutubeUrlOrId(song.youtubeUrl) }.forEach { parent ->
+                    val cleanList = parent.getAlternateVersionsList().filter { it.youtubeUrl != song.youtubeUrl }
+                    songDao.insertSong(parent.copy(alternateYoutubeUrls = json.encodeToString(cleanList), updatedAt = System.currentTimeMillis()))
+                }
+
+                finalSongToBroadcast = updatedOther
             } else {
-                allSongs.firstOrNull { it.isLiked && it.id.isNotBlank() && it.id == song.id }
-            }
-
-            val matchingDisliked = if (matchingLiked == null) {
-                if (hasValidTrimmed) {
-                    allSongs.firstOrNull {
-                        it.isDisliked &&
-                                it.title.equals(trimmedTitle, ignoreCase = true) &&
-                                it.artist.equals(trimmedArtist, ignoreCase = true)
-                    }
-                } else {
-                    allSongs.firstOrNull { it.isDisliked && it.id.isNotBlank() && it.id == song.id }
+                // No existing song matches this name.
+                // If song was previously an alternate on a parent song, pull it out as its own thing!
+                allSongs.filter { it.id != song.id && it.containsYoutubeUrlOrId(song.youtubeUrl) }.forEach { parent ->
+                    val cleanList = parent.getAlternateVersionsList().filter { it.youtubeUrl != song.youtubeUrl }
+                    songDao.insertSong(parent.copy(alternateYoutubeUrls = json.encodeToString(cleanList), updatedAt = System.currentTimeMillis()))
                 }
-            } else null
 
-            val isLiked = matchingLiked != null || song.isLiked
-            val isDisliked = !isLiked && (matchingDisliked != null || song.isDisliked)
+                val updatedSong = song.copy(
+                    title = trimmedTitle,
+                    artist = trimmedArtist,
+                    metadataSource = "manual edit",
+                    isMetadataCleaned = true,
+                    updatedAt = System.currentTimeMillis()
+                )
 
-            if (matchingLiked != null) {
-                val updatedLiked = matchingLiked.addAlternateVersion(
-                    AlternateVersion(
-                        youtubeUrl = song.youtubeUrl,
-                        rawTitle = song.rawTitle ?: song.title,
-                        thumbnailUrl = song.thumbnailUrl
-                    )
-                )
-                songDao.insertSong(updatedLiked)
-            } else if (matchingDisliked != null) {
-                val updatedDisliked = matchingDisliked.addAlternateVersion(
-                    AlternateVersion(
-                        youtubeUrl = song.youtubeUrl,
-                        rawTitle = song.rawTitle ?: song.title,
-                        thumbnailUrl = song.thumbnailUrl
-                    )
-                )
-                songDao.insertSong(updatedDisliked)
+                songDao.insertSong(updatedSong)
+                finalSongToBroadcast = updatedSong
             }
-
-            val updatedSong = song.copy(
-                title = trimmedTitle,
-                artist = trimmedArtist,
-                metadataSource = "manual edit",
-                isMetadataCleaned = true,
-                isLiked = isLiked,
-                isDisliked = isDisliked
-            )
 
             val intent = Intent(MusicLibraryService.ACTION_UPDATE_SONG).apply {
                 setPackage(app.packageName)
-                putExtra(MusicLibraryService.EXTRA_SONG_JSON, json.encodeToString(updatedSong))
+                putExtra(MusicLibraryService.EXTRA_SONG_JSON, json.encodeToString(finalSongToBroadcast))
             }
             app.sendBroadcast(intent)
 
             withContext(Dispatchers.Main) {
                 _promptForSongName.value = null
             }
+        }
+    }
+
+    suspend fun isAlternateVersionInDb(song: Song): Boolean = withContext(Dispatchers.IO) {
+        val allSongs = songDao.getAllSongs()
+        val primaryMatch = allSongs.firstOrNull { it.id == song.id }
+        if (primaryMatch != null) return@withContext false
+        return@withContext allSongs.any { db ->
+            db.id != song.id && (
+                db.containsAlternateId(song.youtubeUrl)
+            )
         }
     }
 

@@ -4,6 +4,7 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import kotlinx.serialization.Serializable
@@ -41,10 +42,11 @@ data class Song(
     val likedAt: Long? = null,
     val dislikedAt: Long? = null,
     val metadataSource: String? = null,
-    // this really needs to be its own table with relations, or use the same table but have a "parent" link
-    // its really slow deserialising the string every time and makes lookups by id even harder because we can't just select where id or songname matches
-    // ie would be really nice to do containsYoutubeUrlOrId straight against the db, no hydration
-    val alternateYoutubeUrls: String? = null
+    val alternateYoutubeUrls: String? = null,
+    @ColumnInfo(defaultValue = "0")
+    val createdAt: Long = System.currentTimeMillis(),
+    @ColumnInfo(defaultValue = "0")
+    val updatedAt: Long = System.currentTimeMillis()
 ) {
     fun getAlternateVersionsList(json: Json = Json { ignoreUnknownKeys = true }): List<AlternateVersion> {
         if (alternateYoutubeUrls.isNullOrBlank()) return emptyList()
@@ -73,7 +75,17 @@ data class Song(
         if (cleanTarget.length < 5 || cleanTarget.contains("watch?v=null")) return false
 
         if (id.isNotBlank() && !id.startsWith("url_") && !id.startsWith("search_") && id == cleanTarget) return true
-        if (youtubeUrl.isNotBlank() && !youtubeUrl.contains("watch?v=null") && (youtubeUrl.contains(cleanTarget) || cleanTarget.contains(youtubeUrl))) return true
+        if (youtubeUrl.isNotBlank() && !youtubeUrl.contains("watch?v=null") && (youtubeUrl.contains(
+                cleanTarget
+            ) || cleanTarget.contains(youtubeUrl))
+        ) return true
+
+        return containsAlternateId(targetUrlOrId, json)
+    }
+
+    fun containsAlternateId(targetUrlOrId: String, json: Json = Json { ignoreUnknownKeys = true }): Boolean {
+        val cleanTarget = targetUrlOrId.trim()
+        if (cleanTarget.length < 5 || cleanTarget.contains("watch?v=null")) return false
 
         val alternates = getAlternateVersionsList(json)
         return alternates.any {
@@ -111,14 +123,6 @@ fun Song.toMediaItem(
     val itemExtras = Bundle().apply {
         putBoolean("isLiked", isLiked)
         putBoolean("isDisliked", isDisliked)
-        putBoolean("canGoPrevious", canGoPrevious)
-        putBoolean("canGoNext", canGoNext)
-        putString("swipingMode", swipingMode)
-        putString("songId", id)
-        putString("rawTitle", rawTitle)
-        putString("artist", artist)
-        putString("title", title)
-        putString("youtubeUrl", youtubeUrl)
         if (!parentId.isNullOrBlank()) {
             putString("parentId", parentId)
         }

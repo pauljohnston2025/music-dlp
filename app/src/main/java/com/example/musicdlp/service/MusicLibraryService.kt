@@ -37,6 +37,7 @@ import androidx.media3.session.SessionResult
 import com.example.musicdlp.MusicDLPApplication
 import com.example.musicdlp.R
 import com.example.musicdlp.data.AlternateVersion
+import com.example.musicdlp.data.SharedQueueHolder
 import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.YoutubeDLRepository
 import com.example.musicdlp.data.toMediaItem
@@ -160,6 +161,7 @@ class MusicLibraryService : MediaLibraryService() {
                         SwipingMode.ONLY_NEW
                     }
                     updateNotificationLayout(exoPlayer.currentMediaItem)
+                    notifyMediaBrowserChildrenChanged()
                     broadcastQueueChanged()
                 }
                 ACTION_CYCLE_MODE -> {
@@ -169,6 +171,7 @@ class MusicLibraryService : MediaLibraryService() {
                         SwipingMode.PLAY_ALL_RECATEGORISE -> SwipingMode.ONLY_NEW
                     }
                     updateNotificationLayout(exoPlayer.currentMediaItem)
+                    notifyMediaBrowserChildrenChanged()
                     broadcastQueueChanged()
                 }
                 ACTION_JUMP_TO_SONG -> {
@@ -412,17 +415,19 @@ class MusicLibraryService : MediaLibraryService() {
 
     private fun broadcastQueueChanged(notifyMediaBrowser: Boolean = true, overrideCurrentIndex: Int? = null) {
         val currentList = synchronized(queueLock) { activeQueue.toList() }
-        val queueJson = json.encodeToString(currentList)
+        SharedQueueHolder.setQueue(currentList)
         val currentIndex = overrideCurrentIndex ?: virtualCurrentIndex ?: (if (exoPlayer.mediaItemCount > 0) exoPlayer.currentMediaItemIndex else 0)
         val currentSongId = exoPlayer.currentMediaItem?.mediaId ?: ""
 
         val intent = Intent(ACTION_QUEUE_CHANGED).apply {
             setPackage(packageName)
-            putExtra(EXTRA_QUEUE_JSON, queueJson)
             putExtra(EXTRA_CURRENT_INDEX, currentIndex)
             putExtra(EXTRA_SONG_ID, currentSongId)
             putExtra(EXTRA_SWIPING_MODE, currentMode.name)
             putExtra(EXTRA_IS_BUFFERING, isProcessingQueue)
+            val app = application as MusicDLPApplication
+            val repository = YoutubeDLRepository(app)
+            repository.lastStreamError?.let { putExtra("extra_error", it) }
         }
         sendBroadcast(intent)
         if (notifyMediaBrowser) {
@@ -441,9 +446,11 @@ class MusicLibraryService : MediaLibraryService() {
             "NOW_PLAYING_DISLIKED",
             "NOW_PLAYING_NEW",
             "NOW_PLAYING_ALL",
+            "NEW",
             "LIKED",
             "DISLIKED",
-            "SETTINGS"
+            "SETTINGS",
+            "SETTINGS_PLAYBACK_MODE"
         )
 
         // Send notifications to default session and all active connected controllers
@@ -472,6 +479,7 @@ class MusicLibraryService : MediaLibraryService() {
         startIndex: Int,
         seekToMs: Long
     ) {
+        virtualCurrentIndex = null
         synchronized(queueLock) {
             activeQueue = queue.toMutableList()
         }
@@ -495,6 +503,7 @@ class MusicLibraryService : MediaLibraryService() {
     }
 
     private fun jumpToSong(song: Song?, songId: String?) {
+        virtualCurrentIndex = null
         val targetId = song?.id ?: songId ?: return
         val currentList = synchronized(queueLock) { activeQueue.toList() }
 
@@ -522,6 +531,10 @@ class MusicLibraryService : MediaLibraryService() {
     }
 
     private fun updateSongInQueue(updatedSong: Song) {
+        serviceScope.launch(Dispatchers.IO) {
+            val app = application as MusicDLPApplication
+            app.database.songDao().insertSong(updatedSong.copy(updatedAt = System.currentTimeMillis()))
+        }
         synchronized(queueLock) {
             activeQueue = activeQueue.map { if (it.id == updatedSong.id) updatedSong else it }.toMutableList()
         }
@@ -796,38 +809,58 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                     } else null
 
-                    // 2. Strict Title + Artist match (ignore "Unknown" fallback false-positives)
                     val hasValidArtist = cleanResult.artist.isNotBlank() && !cleanResult.artist.equals("Unknown", ignoreCase = true)
 
-                    val matchingExistingLiked = if (existingByIdOrUrl == null && hasValidArtist && cleanResult.title.isNotBlank()) {
+                    // 2. Strict Title + Artist match against ANY song in DB
+                    val matchingExistingSong = if (existingByIdOrUrl == null && hasValidArtist && cleanResult.title.isNotBlank()) {
                         allSongs.firstOrNull {
-                            it.isLiked &&
+                            it.id != songToProcess.id &&
                                     it.title.equals(cleanResult.title, ignoreCase = true) &&
                                     it.artist.equals(cleanResult.artist, ignoreCase = true)
                         }
                     } else null
 
-                    val matchingExistingDisliked = if (existingByIdOrUrl == null && matchingExistingLiked == null && hasValidArtist && cleanResult.title.isNotBlank()) {
-                        allSongs.firstOrNull {
-                            it.isDisliked &&
-                                    it.title.equals(cleanResult.title, ignoreCase = true) &&
-                                    it.artist.equals(cleanResult.artist, ignoreCase = true)
+                    val cleanedSong: Song
+
+                    if (matchingExistingSong != null) {
+                        val alternate = AlternateVersion(
+                            youtubeUrl = songToProcess.youtubeUrl,
+                            rawTitle = songToProcess.rawTitle ?: cleanResult.recoveredRawTitle ?: cleanResult.title,
+                            thumbnailUrl = songToProcess.thumbnailUrl
+                        )
+                        val updatedExisting = matchingExistingSong.addAlternateVersion(alternate).copy(
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        songDao.insertSong(updatedExisting)
+
+                        if (allSongs.any { it.id == songToProcess.id }) {
+                            songDao.deleteSongById(songToProcess.id)
                         }
-                    } else null
 
-                    // 3. Resolve flags safely
-                    val isLiked = existingByIdOrUrl?.isLiked == true || matchingExistingLiked != null
-                    val isDisliked = !isLiked && (existingByIdOrUrl?.isDisliked == true || matchingExistingDisliked != null)
-
-                    val cleanedSong = songToProcess.copy(
-                        artist = cleanResult.artist,
-                        title = cleanResult.title,
-                        rawTitle = if (songToProcess.rawTitle.isNullOrBlank() || songToProcess.rawTitle == "Loading...") finalRawTitle else songToProcess.rawTitle,
-                        metadataSource = cleanResult.source,
-                        isMetadataCleaned = true,
-                        isLiked = isLiked,
-                        isDisliked = isDisliked
-                    )
+                        cleanedSong = updatedExisting
+                    } else if (existingByIdOrUrl != null) {
+                        val updatedExisting = existingByIdOrUrl.copy(
+                            artist = cleanResult.artist,
+                            title = cleanResult.title,
+                            rawTitle = if (existingByIdOrUrl.rawTitle.isNullOrBlank()) (cleanResult.recoveredRawTitle ?: songToProcess.rawTitle) else existingByIdOrUrl.rawTitle,
+                            thumbnailUrl = if (songToProcess.thumbnailUrl.isNotBlank()) songToProcess.thumbnailUrl else existingByIdOrUrl.thumbnailUrl,
+                            isMetadataCleaned = true,
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        songDao.insertSong(updatedExisting)
+                        cleanedSong = updatedExisting
+                    } else {
+                        val newCleaned = songToProcess.copy(
+                            artist = cleanResult.artist,
+                            title = cleanResult.title,
+                            rawTitle = if (songToProcess.rawTitle.isNullOrBlank() || songToProcess.rawTitle == "Loading...") finalRawTitle else songToProcess.rawTitle,
+                            metadataSource = cleanResult.source,
+                            isMetadataCleaned = true,
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        songDao.insertSong(newCleaned)
+                        cleanedSong = newCleaned
+                    }
 
                     // Update activeQueue state in thread-safe block
                     synchronized(queueLock) {
@@ -1146,6 +1179,7 @@ class MusicLibraryService : MediaLibraryService() {
                     SwipingMode.PLAY_ALL_RECATEGORISE -> SwipingMode.ONLY_NEW
                 }
                 updateNotificationLayout(session.player.currentMediaItem)
+                notifyMediaBrowserChildrenChanged()
                 broadcastQueueChanged()
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             }
@@ -1206,8 +1240,9 @@ class MusicLibraryService : MediaLibraryService() {
                         "ROOT", "/", "MEDIA_ROOT" -> {
                             listOf(
                                 createBrowsableItem("NOW_PLAYING", "Now Playing"),
-                                createBrowsableItem("LIKED", "Liked"),
-                                createBrowsableItem("DISLIKED", "Disliked"),
+                                createBrowsableItem("NEW", "New Songs"),
+                                createBrowsableItem("LIKED", "Liked Songs"),
+                                createBrowsableItem("DISLIKED", "Disliked Songs"),
                                 createBrowsableItem("SETTINGS", "Settings")
                             )
                         }
@@ -1238,12 +1273,56 @@ class MusicLibraryService : MediaLibraryService() {
                         "NOW_PLAYING_ALL" -> {
                             currentList.map { it.toMediaItem(parentId = "NOW_PLAYING_ALL", swipingMode = currentMode.name) }
                         }
+                        "NEW" -> {
+                            val dbNew = app.database.songDao().getNewSongsList()
+                            val queueNew = currentList.filter { !it.isLiked && !it.isDisliked }
+                            val combinedNew = (dbNew + queueNew)
+                                .filter { !it.isLiked && !it.isDisliked }
+                                .distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
+                            combinedNew.map { it.toMediaItem(parentId = "NEW") }
+                        }
                         "SETTINGS" -> {
                             listOf(
-                                createPlayableSettingItem("MODE_ONLY_NEW", "Mode: ${SwipingMode.ONLY_NEW.displayName}", isSelected = currentMode == SwipingMode.ONLY_NEW),
-                                createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: ${SwipingMode.NEW_AND_LIKED.displayName}", isSelected = currentMode == SwipingMode.NEW_AND_LIKED),
-                                createPlayableSettingItem("MODE_PLAY_ALL", "Mode: ${SwipingMode.PLAY_ALL_RECATEGORISE.displayName}", isSelected = currentMode == SwipingMode.PLAY_ALL_RECATEGORISE)
+                                createBrowsableItem("SETTINGS_PLAYBACK_MODE", "Playback Mode", "Current: ${currentMode.displayName}")
                             )
+                        }
+                        "SETTINGS_PLAYBACK_MODE" -> {
+                            listOf(
+                                createPlayableSettingItem("MODE_ONLY_NEW", SwipingMode.ONLY_NEW.displayName, isSelected = currentMode == SwipingMode.ONLY_NEW),
+                                createPlayableSettingItem("MODE_NEW_AND_LIKED", SwipingMode.NEW_AND_LIKED.displayName, isSelected = currentMode == SwipingMode.NEW_AND_LIKED),
+                                createPlayableSettingItem("MODE_PLAY_ALL", SwipingMode.PLAY_ALL_RECATEGORISE.displayName, isSelected = currentMode == SwipingMode.PLAY_ALL_RECATEGORISE)
+                            )
+                        }
+                        "MODE_ONLY_NEW", "MODE_NEW_AND_LIKED", "MODE_PLAY_ALL" -> {
+                            val modeStr = when (parentId) {
+                                "MODE_NEW_AND_LIKED" -> "NEW_AND_LIKED"
+                                "MODE_PLAY_ALL" -> "PLAY_ALL_RECATEGORISE"
+                                else -> "ONLY_NEW"
+                            }
+                            currentMode = SwipingMode.valueOf(modeStr)
+
+                            val currentList = synchronized(queueLock) { activeQueue.toList() }
+                            val songSourceList = if (currentList.isNotEmpty()) {
+                                currentList
+                            } else {
+                                app.database.songDao().getAllSongs()
+                            }
+
+                            val filteredList = getFilteredQueueForMode(songSourceList, currentMode).ifEmpty { songSourceList }
+
+                            withContext(Dispatchers.Main) {
+                                if (filteredList.isNotEmpty()) {
+                                    synchronized(queueLock) {
+                                        activeQueue = filteredList.toMutableList()
+                                    }
+                                    updateNotificationLayout(exoPlayer.currentMediaItem)
+                                    broadcastQueueChanged()
+                                }
+                                notifyMediaBrowserChildrenChanged()
+                            }
+
+                            settableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE))
+                            return@launch
                         }
                         "LIKED" -> {
                             val liked = app.database.songDao().getLikedSongsList()
@@ -1309,10 +1388,40 @@ class MusicLibraryService : MediaLibraryService() {
                             else -> "ONLY_NEW"
                         }
                         currentMode = SwipingMode.valueOf(modeStr)
-                        updateNotificationLayout(exoPlayer.currentMediaItem)
-                        notifyMediaBrowserChildrenChanged()
-                        broadcastQueueChanged()
-                        settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
+
+                        val currentList = synchronized(queueLock) { activeQueue.toList() }
+                        val songSourceList = if (currentList.isNotEmpty()) {
+                            currentList
+                        } else {
+                            app.database.songDao().getAllSongs()
+                        }
+
+                        val filteredList = getFilteredQueueForMode(songSourceList, currentMode).ifEmpty { songSourceList }
+
+                        withContext(Dispatchers.Main) {
+                            updateNotificationLayout(exoPlayer.currentMediaItem)
+                            notifyMediaBrowserChildrenChanged()
+                            broadcastQueueChanged()
+
+                            if (filteredList.isNotEmpty()) {
+                                synchronized(queueLock) {
+                                    activeQueue = filteredList.toMutableList()
+                                }
+
+                                val resultItems = filteredList.map { it.toMediaItem(swipingMode = currentMode.name) }
+                                val currentPlayingId = exoPlayer.currentMediaItem?.mediaId
+                                val targetIndex = filteredList.indexOfFirst { it.id == currentPlayingId }.let { if (it != -1) it else 0 }
+                                val startPos = if (targetIndex >= 0) {
+                                    exoPlayer.currentPosition.coerceAtLeast(0L)
+                                } else {
+                                    0L
+                                }
+
+                                settableFuture.set(MediaSession.MediaItemsWithStartPosition(resultItems, targetIndex, startPos))
+                            } else {
+                                settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
+                            }
+                        }
                         return@launch
                     }
 
@@ -1321,6 +1430,13 @@ class MusicLibraryService : MediaLibraryService() {
                     val listToPlay = when (parentId) {
                         "LIKED" -> app.database.songDao().getLikedSongsList()
                         "DISLIKED" -> app.database.songDao().getDislikedSongsList()
+                        "NEW" -> {
+                            val dbNew = app.database.songDao().getNewSongsList()
+                            val queueNew = currentList.filter { !it.isLiked && !it.isDisliked }
+                            (dbNew + queueNew)
+                                .filter { !it.isLiked && !it.isDisliked }
+                                .distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
+                        }
                         "NOW_PLAYING_LIKED" -> currentList.filter { it.isLiked }.ifEmpty { app.database.songDao().getLikedSongsList() }
                         "NOW_PLAYING_DISLIKED" -> currentList.filter { it.isDisliked }.ifEmpty { app.database.songDao().getDislikedSongsList() }
                         "NOW_PLAYING_NEW" -> currentList.filter { !it.isLiked && !it.isDisliked }
@@ -1330,7 +1446,7 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                     }
 
-                    val modeToUse = if (parentId == "NOW_PLAYING_NEW") "ONLY_NEW" else "PLAY_ALL_RECATEGORISE"
+                    val modeToUse = if (parentId == "NEW" || parentId == "NOW_PLAYING_NEW") "ONLY_NEW" else "PLAY_ALL_RECATEGORISE"
                     currentMode = SwipingMode.valueOf(modeToUse)
 
                     val targetIndex = listToPlay.indexOfFirst { it.id == mediaId }.coerceAtLeast(0)
@@ -1366,12 +1482,14 @@ class MusicLibraryService : MediaLibraryService() {
                         "NOW_PLAYING_DISLIKED" -> createBrowsableItem("NOW_PLAYING_DISLIKED", "Disliked Songs")
                         "NOW_PLAYING_NEW" -> createBrowsableItem("NOW_PLAYING_NEW", "New Songs")
                         "NOW_PLAYING_ALL" -> createBrowsableItem("NOW_PLAYING_NEW", "All Songs")
+                        "NEW" -> createBrowsableItem("NEW", "New Songs")
                         "LIKED" -> createBrowsableItem("LIKED", "Liked Songs")
                         "DISLIKED" -> createBrowsableItem("DISLIKED", "Disliked Songs")
-                        "SETTINGS" -> createBrowsableItem("SETTINGS", "Settings / Playback Mode")
-                        "MODE_ONLY_NEW" -> createPlayableSettingItem("MODE_ONLY_NEW", "Mode: Only Categorise New")
-                        "MODE_NEW_AND_LIKED" -> createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: New and Liked")
-                        "MODE_PLAY_ALL" -> createPlayableSettingItem("MODE_PLAY_ALL", "Mode: Play All / Recateogise")
+                        "SETTINGS" -> createBrowsableItem("SETTINGS", "Settings")
+                        "SETTINGS_PLAYBACK_MODE" -> createBrowsableItem("SETTINGS_PLAYBACK_MODE", "Playback Mode")
+                        "MODE_ONLY_NEW" -> createPlayableSettingItem("MODE_ONLY_NEW", SwipingMode.ONLY_NEW.displayName, isSelected = currentMode == SwipingMode.ONLY_NEW)
+                        "MODE_NEW_AND_LIKED" -> createPlayableSettingItem("MODE_NEW_AND_LIKED", SwipingMode.NEW_AND_LIKED.displayName, isSelected = currentMode == SwipingMode.NEW_AND_LIKED)
+                        "MODE_PLAY_ALL" -> createPlayableSettingItem("MODE_PLAY_ALL", SwipingMode.PLAY_ALL_RECATEGORISE.displayName, isSelected = currentMode == SwipingMode.PLAY_ALL_RECATEGORISE)
                         else -> null
                     }
 
