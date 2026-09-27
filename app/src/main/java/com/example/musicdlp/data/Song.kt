@@ -41,6 +41,9 @@ data class Song(
     val likedAt: Long? = null,
     val dislikedAt: Long? = null,
     val metadataSource: String? = null,
+    // this really needs to be its own table with relations, or use the same table but have a "parent" link
+    // its really slow deserialising the string every time and makes lookups by id even harder because we can't just select where id or songname matches
+    // ie would be really nice to do containsYoutubeUrlOrId straight against the db, no hydration
     val alternateYoutubeUrls: String? = null
 ) {
     fun getAlternateVersionsList(json: Json = Json { ignoreUnknownKeys = true }): List<AlternateVersion> {
@@ -61,6 +64,9 @@ data class Song(
         return copy(alternateYoutubeUrls = encoded)
     }
 
+    // this really needs to be its own table with relations, or use the same table but have a "parent" link
+    // its really slow deserialising the string every time and makes lookups by id even harder because we can't just select where id or songname matches
+    // ie would be really nice to do containsYoutubeUrlOrId straight against the db, no hydration
     fun containsYoutubeUrlOrId(targetUrlOrId: String, json: Json = Json { ignoreUnknownKeys = true }): Boolean {
         if (targetUrlOrId.isBlank()) return false
         val cleanTarget = targetUrlOrId.trim()

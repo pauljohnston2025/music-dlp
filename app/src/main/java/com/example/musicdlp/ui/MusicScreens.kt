@@ -683,9 +683,9 @@ fun PlayerControls(
         ) {
             IconButton(onClick = { viewModel.cycleSwipingMode() }) {
                 val (modeIcon, modeTint) = when (swipingMode) {
-                    SwipingMode.ONLY_NEW -> Icons.Default.MusicNote to MaterialTheme.colorScheme.primary
-                    SwipingMode.NEW_AND_LIKED -> Icons.Default.Favorite to MaterialTheme.colorScheme.primary
-                    SwipingMode.PLAY_ALL_RECATEGORISE -> Icons.Default.Layers to MaterialTheme.colorScheme.secondary
+                    SwipingMode.ONLY_NEW -> Icons.Default.FiberNew to MaterialTheme.colorScheme.primary
+                    SwipingMode.NEW_AND_LIKED -> Icons.Default.ThumbUp to MaterialTheme.colorScheme.primary
+                    SwipingMode.PLAY_ALL_RECATEGORISE -> Icons.Default.Repeat to MaterialTheme.colorScheme.secondary
                 }
                 Icon(
                     imageVector = modeIcon,

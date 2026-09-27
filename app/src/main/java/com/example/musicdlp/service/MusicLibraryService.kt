@@ -313,7 +313,7 @@ class MusicLibraryService : MediaLibraryService() {
                 val builder = super.getAvailableCommands().buildUpon()
                 builder.add(COMMAND_SEEK_TO_NEXT).add(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
                 builder.add(COMMAND_SEEK_TO_PREVIOUS).add(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
-                builder.add(COMMAND_GET_TIMELINE)
+                builder.add(COMMAND_GET_TIMELINE) // shows the "queue" button in android auto
                 return builder.build()
             }
 
@@ -380,7 +380,7 @@ class MusicLibraryService : MediaLibraryService() {
 
         mediaSession = MediaLibrarySession.Builder(this, forwardingPlayer, LibrarySessionCallback())
             .setCustomLayout(buildCustomLayout(null))
-            .setPeriodicPositionUpdateEnabled(false)
+            .setPeriodicPositionUpdateEnabled(false) // stops the android auto "queue" COMMAND_GET_TIMELINE  from bouncing around
             .build()
 
         setMediaNotificationProvider(
@@ -430,27 +430,31 @@ class MusicLibraryService : MediaLibraryService() {
         }
     }
 
-    private fun notifyMediaBrowserChildrenChanged(folderId: String? = null) {
+    private fun notifyMediaBrowserChildrenChanged() {
         val session = mediaSession ?: return
 
-        if (!folderId.isNullOrBlank()) {
-            session.notifyChildrenChanged(folderId, 0, null)
-            return
-        }
-
-        // Only notify content folders that change (do NOT notify ROOT)
-        val queueFolders = listOf(
+        // Notify ALL folder IDs across the entire tree hierarchy
+        val targetFolders = listOf(
+            "ROOT",
             "NOW_PLAYING",
             "NOW_PLAYING_LIKED",
             "NOW_PLAYING_DISLIKED",
             "NOW_PLAYING_NEW",
             "NOW_PLAYING_ALL",
             "LIKED",
-            "DISLIKED"
+            "DISLIKED",
+            "SETTINGS"
         )
 
-        for (id in queueFolders) {
-            session.notifyChildrenChanged(id, 0, null)
+        // Send notifications to default session and all active connected controllers
+        for (folderId in targetFolders) {
+            session.notifyChildrenChanged(folderId, 0, null)
+        }
+
+        for (controller in session.connectedControllers) {
+            for (folderId in targetFolders) {
+                session.notifyChildrenChanged(controller, folderId, 0, null)
+            }
         }
     }
 
@@ -770,6 +774,10 @@ class MusicLibraryService : MediaLibraryService() {
                     val songDao = app.database.songDao()
                     val repository = YoutubeDLRepository(app)
 
+                    // should probably be selecting by id or name, rather than processing every possible song manually
+                    // a problem for a future date when perf becomes a problem (or we cant fit every song into memory)
+                    // might need to persist a row per song or something, or persist alternates to their own table so
+                    // we can just select onto them
                     val allSongs = songDao.getAllSongs()
 
                     val cleanResult = repository.cleanTitleAndArtist(
@@ -837,7 +845,9 @@ class MusicLibraryService : MediaLibraryService() {
                             exoPlayer.seekTo(idxInPlayer, currentPos)
                             if (isPlaying) exoPlayer.play()
                         }
-                        broadcastQueueChanged(notifyMediaBrowser = false)
+                        // we must update when name changes, otherwise we will not get the
+                        // category (liked/disliked/new) switch (it can make the ui a bit jumpy though)
+                        broadcastQueueChanged(notifyMediaBrowser = true)
                     }
 
                     // PRE-BUFFERING GUARD: Only pre-buffer audio if within 5 tracks ahead
@@ -857,7 +867,8 @@ class MusicLibraryService : MediaLibraryService() {
         } finally {
             isProcessingQueue = false
             withContext(Dispatchers.Main) {
-                broadcastQueueChanged(notifyMediaBrowser = false)
+                // update the ui one final time just incase
+                broadcastQueueChanged(notifyMediaBrowser = true)
             }
             processMutex.unlock()
         }
@@ -1193,10 +1204,10 @@ class MusicLibraryService : MediaLibraryService() {
                     val children = when (parentId.uppercase()) {
                         "ROOT", "/", "MEDIA_ROOT" -> {
                             listOf(
-                                createBrowsableItem("NOW_PLAYING", "Queue / Up Next"),
-                                createBrowsableItem("LIKED", "Liked Songs"),
-                                createBrowsableItem("DISLIKED", "Disliked Songs"),
-                                createBrowsableItem("SETTINGS", "Playback Settings")
+                                createBrowsableItem("NOW_PLAYING", "Now Playing"),
+                                createBrowsableItem("LIKED", "Liked"),
+                                createBrowsableItem("DISLIKED", "Disliked"),
+                                createBrowsableItem("SETTINGS", "Settings")
                             )
                         }
                         "NOW_PLAYING" -> {
@@ -1228,9 +1239,9 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         "SETTINGS" -> {
                             listOf(
-                                createPlayableSettingItem("MODE_ONLY_NEW", "Mode: Only Categorise New", isSelected = currentMode == SwipingMode.ONLY_NEW),
-                                createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: New and Liked", isSelected = currentMode == SwipingMode.NEW_AND_LIKED),
-                                createPlayableSettingItem("MODE_PLAY_ALL", "Mode: Play All / Recategorise", isSelected = currentMode == SwipingMode.PLAY_ALL_RECATEGORISE)
+                                createPlayableSettingItem("MODE_ONLY_NEW", "Mode: ${SwipingMode.ONLY_NEW.displayName}", isSelected = currentMode == SwipingMode.ONLY_NEW),
+                                createPlayableSettingItem("MODE_NEW_AND_LIKED", "Mode: ${SwipingMode.NEW_AND_LIKED.displayName}", isSelected = currentMode == SwipingMode.NEW_AND_LIKED),
+                                createPlayableSettingItem("MODE_PLAY_ALL", "Mode: ${SwipingMode.PLAY_ALL_RECATEGORISE.displayName}", isSelected = currentMode == SwipingMode.PLAY_ALL_RECATEGORISE)
                             )
                         }
                         "LIKED" -> {
@@ -1298,7 +1309,7 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         currentMode = SwipingMode.valueOf(modeStr)
                         updateNotificationLayout(exoPlayer.currentMediaItem)
-                        notifyMediaBrowserChildrenChanged("SETTINGS")
+                        notifyMediaBrowserChildrenChanged()
                         broadcastQueueChanged()
                         settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
                         return@launch
@@ -1471,8 +1482,8 @@ class MusicLibraryService : MediaLibraryService() {
 
         @Suppress("DEPRECATION")
         private fun createPlayableSettingItem(id: String, title: String, isSelected: Boolean = false): MediaItem {
-            val displayTitle = if (isSelected) "✓ $title" else "  $title"
-            val displaySubtitle = if (isSelected) "● ACTIVE MODE" else "Tap to select mode"
+            val displayTitle = "$title"
+            val displaySubtitle = if (isSelected) "● ACTIVE" else "Tap to select"
 
             val itemExtras = Bundle().apply {
                 putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
