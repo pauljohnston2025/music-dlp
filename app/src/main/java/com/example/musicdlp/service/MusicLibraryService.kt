@@ -836,14 +836,15 @@ class MusicLibraryService : MediaLibraryService() {
 
                     withContext(Dispatchers.Main) {
                         val idxInPlayer = activeQueue.indexOfFirst { it.id == cleanedSong.id }
-                        val isCurrentlyPlaying = exoPlayer.currentMediaItemIndex == idxInPlayer
-                        if (isCurrentlyPlaying && idxInPlayer >= 0 && idxInPlayer < exoPlayer.mediaItemCount) {
-                            val currentPos = exoPlayer.currentPosition
+                        if (idxInPlayer >= 0 && idxInPlayer < exoPlayer.mediaItemCount) {
+                            val currentPos = if (exoPlayer.currentMediaItemIndex == idxInPlayer) exoPlayer.currentPosition else 0L
                             val isPlaying = exoPlayer.isPlaying
                             val mediaItem = cleanedSong.toMediaItem(swipingMode = currentMode.name)
                             exoPlayer.replaceMediaItem(idxInPlayer, mediaItem)
-                            exoPlayer.seekTo(idxInPlayer, currentPos)
-                            if (isPlaying) exoPlayer.play()
+                            if (exoPlayer.currentMediaItemIndex == idxInPlayer) {
+                                exoPlayer.seekTo(idxInPlayer, currentPos)
+                                if (isPlaying) exoPlayer.play()
+                            }
                         }
                         // we must update when name changes, otherwise we will not get the
                         // category (liked/disliked/new) switch (it can make the ui a bit jumpy though)
