@@ -4,6 +4,8 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.MediaConstants
 import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
@@ -95,12 +97,12 @@ data class Song(
     }
 }
 
+@UnstableApi
 fun Song.toMediaItem(
     playableUri: String? = null,
     parentId: String? = null,
-    canGoPrevious: Boolean = false,
-    canGoNext: Boolean = false,
-    swipingMode: String = "ONLY_NEW"
+    isCurrentSong: Boolean = false,
+    completionPercentage: Double? = null
 ): MediaItem {
     val artworkUri = if (thumbnailUrl.isNotBlank()) {
         Uri.parse(thumbnailUrl)
@@ -126,11 +128,41 @@ fun Song.toMediaItem(
         if (!parentId.isNullOrBlank()) {
             putString("parentId", parentId)
         }
+        // absolutely no idea why the below seems inverted, the below give s green dot next to the
+        // artist name thats playing, making it look like its playing
+        // if I invert it all the songs get a green dot and the one thats playing is empty (i guess to indicate you can click it?)
+        if (isCurrentSong) {
+            putInt("android.media.extra.PLAYBACK_STATUS", 0)
+            putBoolean("android.media.extra.IS_PLAYING", false) // this seems to not be needed if PLAYBACK_STATUS is supplied (or takes over if it is supplied, but its still inverted?)
+            // this seems to do nothing
+            putInt(
+                MediaConstants.EXTRAS_KEY_COMPLETION_STATUS,
+                MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_NOT_PLAYED
+            )
+        } else {
+            putInt("android.media.extra.PLAYBACK_STATUS", 1)
+            putBoolean("android.media.extra.IS_PLAYING", true) // this seems to not be needed if PLAYBACK_STATUS is supplied (or takes over if it is supplied, but its still inverted?)
+            // this seems to do nothing
+            putInt(
+                MediaConstants.EXTRAS_KEY_COMPLETION_STATUS,
+                MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_PARTIALLY_PLAYED
+            )
+            putDouble(
+                MediaConstants.EXTRAS_KEY_COMPLETION_PERCENTAGE,
+                completionPercentage ?: 0.5
+            )
+        }
     }
 
     return MediaItem.Builder()
         .setMediaId(id)
         .setUri(uriToUse)
+        .setRequestMetadata(
+            MediaItem.RequestMetadata.Builder()
+                .setMediaUri(uriToUse)
+                .setExtras(itemExtras)
+                .build()
+        )
         .setMediaMetadata(
             MediaMetadata.Builder()
                 .setTitle(title.ifBlank { "Unknown Title" })

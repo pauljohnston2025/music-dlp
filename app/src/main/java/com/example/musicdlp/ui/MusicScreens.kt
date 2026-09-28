@@ -4,7 +4,7 @@ import com.example.musicdlp.data.SwipingMode
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -14,9 +14,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FiberNew
@@ -180,6 +182,35 @@ fun SwipingScreen(viewModel: MusicViewModel) {
                     customArtist = ""
                 }) {
                     Text("Cancel")
+                }
+            }
+        )
+    }
+
+    val mergeConflict by viewModel.mergeConflict.collectAsState()
+
+    if (mergeConflict != null) {
+        val conflict = mergeConflict!!
+        AlertDialog(
+            onDismissRequest = { viewModel.clearMergeConflict() },
+            title = { Text("Duplicate Song Name") },
+            text = {
+                Text("A song named \"${conflict.targetSong.artist} - ${conflict.targetSong.title}\" is already in your library.\n\nWould you like to merge \"${conflict.songToMerge.title}\" into it as an alternate version?")
+            },
+            confirmButton = {
+                TextButton(onClick = { viewModel.confirmMergeConflict() }) {
+                    Text("Merge as Alternate")
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { viewModel.keepSeparateConflict() }) {
+                        Text("Keep Separate")
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    TextButton(onClick = { viewModel.clearMergeConflict() }) {
+                        Text("Cancel")
+                    }
                 }
             }
         )
@@ -526,39 +557,70 @@ fun TinderCard(
                 }
 
                 val isCleaned = song.isMetadataCleaned == true
+                val isChanged = editableTitle.trim() != song.title.trim() || editableArtist.trim() != song.artist.trim()
 
                 OutlinedTextField(
                     value = editableTitle,
-                    onValueChange = {
-                        editableTitle = it
-                        viewModel.updateSongNameAndArtist(song, it, editableArtist)
-                    },
+                    onValueChange = { editableTitle = it },
                     enabled = isCleaned,
                     label = { Text(if (isCleaned) "Song Name" else "Song Name (Cleaning...)") },
                     trailingIcon = {
                         if (!isCleaned) {
                             CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        } else if (isChanged) {
+                            IconButton(onClick = {
+                                viewModel.updateSongNameAndArtist(song, editableTitle, editableArtist)
+                            }) {
+                                Icon(Icons.Default.Check, contentDescription = "Save Title", tint = MaterialTheme.colorScheme.primary)
+                            }
                         }
                     },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = {
+                        if (isChanged && isCleaned) {
+                            viewModel.updateSongNameAndArtist(song, editableTitle, editableArtist)
+                        }
+                    }),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = editableArtist,
-                    onValueChange = {
-                        editableArtist = it
-                        viewModel.updateSongNameAndArtist(song, editableTitle, it)
-                    },
+                    onValueChange = { editableArtist = it },
                     enabled = isCleaned,
                     label = { Text(if (isCleaned) "Artist Name" else "Artist Name (Cleaning...)") },
                     trailingIcon = {
                         if (!isCleaned) {
                             CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        } else if (isChanged) {
+                            IconButton(onClick = {
+                                viewModel.updateSongNameAndArtist(song, editableTitle, editableArtist)
+                            }) {
+                                Icon(Icons.Default.Check, contentDescription = "Save Artist", tint = MaterialTheme.colorScheme.primary)
+                            }
                         }
                     },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = {
+                        if (isChanged && isCleaned) {
+                            viewModel.updateSongNameAndArtist(song, editableTitle, editableArtist)
+                        }
+                    }),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                if (isChanged && isCleaned) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Button(
+                        onClick = { viewModel.updateSongNameAndArtist(song, editableTitle, editableArtist) },
+                        modifier = Modifier.align(Alignment.End)
+                    ) {
+                        Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Save Changes")
+                    }
+                }
 
                 if (errorMessage?.contains("Playback error") == true) {
                     TextButton(onClick = { viewModel.playPreview(song) }) {
@@ -1145,13 +1207,7 @@ fun FilteredSongsDialog(
                                     Spacer(modifier = Modifier.width(12.dp))
 
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text(text = song.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                            if (isPlaying) {
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(14.dp))
-                                            }
-                                        }
+                                        Text(text = song.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
                                         Text(text = song.artist, style = MaterialTheme.typography.bodySmall)
 
                                         if (alternates.isNotEmpty()) {
@@ -1162,6 +1218,14 @@ fun FilteredSongsDialog(
                                                 leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(14.dp)) }
                                             )
                                         }
+                                    }
+
+                                    if (isPlaying) {
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        AssistChip(
+                                            onClick = {},
+                                            label = { AnimatedEqualizer(color = MaterialTheme.colorScheme.primary) }
+                                        )
                                     }
                                 }
                             }
@@ -1315,20 +1379,10 @@ fun CommonSongListScreen(
                                 containerColor = Color.Transparent
                             ),
                             headlineContent = {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        text = song.title,
-                                        fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.Normal
-                                    )
-                                    if (isPlaying) {
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        AssistChip(
-                                            onClick = {},
-                                            label = { Text("Playing", style = MaterialTheme.typography.labelSmall) },
-                                            leadingIcon = { Icon(Icons.Default.Favorite, contentDescription = "Playing", tint = Color.Red, modifier = Modifier.size(12.dp)) }
-                                        )
-                                    }
-                                }
+                                Text(
+                                    text = song.title,
+                                    fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.Normal
+                                )
                             },
                             supportingContent = {
                                 Column {
@@ -1363,9 +1417,22 @@ fun CommonSongListScreen(
                                     }
                                 }
                             },
-                            trailingContent = if (trailingContent != null) {
-                                { trailingContent(song) }
-                            } else null
+                            trailingContent = {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (isPlaying) {
+                                        AssistChip(
+                                            onClick = {},
+                                            label = { AnimatedEqualizer(color = MaterialTheme.colorScheme.primary) }
+                                        )
+                                        if (trailingContent != null) {
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                        }
+                                    }
+                                    if (trailingContent != null) {
+                                        trailingContent(song)
+                                    }
+                                }
+                            }
                         )
                     }
                 }
@@ -1393,19 +1460,60 @@ fun NewSongsScreen(viewModel: MusicViewModel) {
         songs = newSongsList,
         viewModel = viewModel,
         emptyMessage = "No new songs in current queue.",
-        isFromLikedOrDisliked = false,
-        onSongClick = { song, _ ->
-            viewModel.jumpToSongInSwipeList(song)
-        },
-        trailingContent = { song ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { viewModel.likeSong(song, advance = false) }) {
-                    Icon(Icons.Default.ThumbUp, contentDescription = "Like", tint = MaterialTheme.colorScheme.primary)
-                }
-                IconButton(onClick = { viewModel.dislikeSong(song, advance = false) }) {
-                    Icon(Icons.Default.ThumbDown, contentDescription = "Dislike", tint = MaterialTheme.colorScheme.error)
-                }
-            }
-        }
+        isFromLikedOrDisliked = true,
     )
+}
+
+@Composable
+fun AnimatedEqualizer(
+    modifier: Modifier = Modifier,
+    color: Color = MaterialTheme.colorScheme.primary,
+    barCount: Int = 3
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "equalizer")
+
+    val height1 by infiniteTransition.animateFloat(
+        initialValue = 0.25f,
+        targetValue = 0.95f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 400, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "bar1"
+    )
+    val height2 by infiniteTransition.animateFloat(
+        initialValue = 0.85f,
+        targetValue = 0.20f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 300, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "bar2"
+    )
+    val height3 by infiniteTransition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.00f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 500, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "bar3"
+    )
+
+    val heights = listOf(height1, height2, height3)
+
+    Row(
+        modifier = modifier.height(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        heights.take(barCount).forEach { fraction ->
+            Box(
+                modifier = Modifier
+                    .width(3.dp)
+                    .fillMaxHeight(fraction)
+                    .background(color = color, shape = RoundedCornerShape(1.dp))
+            )
+        }
+    }
 }

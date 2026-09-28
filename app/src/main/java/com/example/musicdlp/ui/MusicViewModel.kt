@@ -160,6 +160,42 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _promptForSongName = MutableStateFlow<Song?>(null)
     val promptForSongName: StateFlow<Song?> = _promptForSongName
 
+    data class MergeConflict(
+        val songToMerge: Song,
+        val targetSong: Song,
+        val newTitle: String,
+        val newArtist: String
+    )
+
+    private val _mergeConflict = MutableStateFlow<MergeConflict?>(null)
+    val mergeConflict: StateFlow<MergeConflict?> = _mergeConflict.asStateFlow()
+
+    fun clearMergeConflict() {
+        _mergeConflict.value = null
+    }
+
+    fun confirmMergeConflict() {
+        val conflict = _mergeConflict.value ?: return
+        _mergeConflict.value = null
+        updateSongNameAndArtist(
+            song = conflict.songToMerge,
+            newTitle = conflict.newTitle,
+            newArtist = conflict.newArtist,
+            isConfirmedMerge = true
+        )
+    }
+
+    fun keepSeparateConflict() {
+        val conflict = _mergeConflict.value ?: return
+        _mergeConflict.value = null
+        updateSongNameAndArtist(
+            song = conflict.songToMerge,
+            newTitle = conflict.newTitle,
+            newArtist = conflict.newArtist,
+            bypassMerge = true
+        )
+    }
+
     private val _suggestedTitle = MutableStateFlow("")
     val suggestedTitle: StateFlow<String> = _suggestedTitle
 
@@ -568,7 +604,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun updateSongNameAndArtist(song: Song, newTitle: String, newArtist: String) {
+    fun updateSongNameAndArtist(
+        song: Song,
+        newTitle: String,
+        newArtist: String,
+        isConfirmedMerge: Boolean = false,
+        bypassMerge: Boolean = false
+    ) {
         val trimmedTitle = newTitle.trim()
         val trimmedArtist = newArtist.trim()
 
@@ -583,10 +625,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             if (!hasValidTrimmed) return@launch
 
             // 1. Check if another song in DB matches this new title & artist
-            val matchingOtherSong = allSongs.firstOrNull {
+            val matchingOtherSong = if (bypassMerge) null else allSongs.firstOrNull {
                 it.id != song.id &&
                         it.title.equals(trimmedTitle, ignoreCase = true) &&
                         it.artist.equals(trimmedArtist, ignoreCase = true)
+            }
+
+            if (matchingOtherSong != null && !isConfirmedMerge) {
+                _mergeConflict.value = MergeConflict(song, matchingOtherSong, trimmedTitle, trimmedArtist)
+                return@launch
             }
 
             val finalSongToBroadcast: Song
@@ -598,25 +645,43 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     rawTitle = song.rawTitle ?: song.title,
                     thumbnailUrl = song.thumbnailUrl
                 )
-                val updatedOther = matchingOtherSong.addAlternateVersion(alternate).copy(
+
+                var updatedOther = matchingOtherSong.addAlternateVersion(alternate).copy(
                     updatedAt = System.currentTimeMillis()
                 )
+                for (songAlternate in song.getAlternateVersionsList()) {
+                    updatedOther = updatedOther.addAlternateVersion(songAlternate)
+                }
+
                 songDao.insertSong(updatedOther)
+
+                // Clean up song from any other parent song's alternate list
+                allSongs.filter { it.id != matchingOtherSong.id && it.id != song.id && it.containsYoutubeUrlOrId(song.youtubeUrl) }.forEach { parent ->
+                    val cleanList = parent.getAlternateVersionsList().filter { it.youtubeUrl != song.youtubeUrl }
+                    songDao.insertSong(parent.copy(alternateYoutubeUrls = json.encodeToString(cleanList), updatedAt = System.currentTimeMillis()))
+                }
+
+                // Delete downloaded MP3 for `song` if it exists
+                val safeArtist = song.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                val safeTitle = song.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                if (safeArtist.isNotBlank() && safeTitle.isNotBlank()) {
+                    val finalFileName = "$safeArtist - $safeTitle.mp3"
+                    val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                    val downloadDir = File(publicMusicDir, "MusicDLP")
+                    val targetFile = File(downloadDir, finalFileName)
+                    if (targetFile.exists()) {
+                        targetFile.delete()
+                    }
+                }
 
                 // If `song` existed as its own standalone row in DB, delete it
                 if (allSongs.any { it.id == song.id }) {
                     songDao.deleteSongById(song.id)
                 }
 
-                // Clean up song from any other parent song's alternate list
-                allSongs.filter { it.id != matchingOtherSong.id && it.containsYoutubeUrlOrId(song.youtubeUrl) }.forEach { parent ->
-                    val cleanList = parent.getAlternateVersionsList().filter { it.youtubeUrl != song.youtubeUrl }
-                    songDao.insertSong(parent.copy(alternateYoutubeUrls = json.encodeToString(cleanList), updatedAt = System.currentTimeMillis()))
-                }
-
                 finalSongToBroadcast = updatedOther
             } else {
-                // No existing song matches this name.
+                // No existing song matches this name or bypass merge requested.
                 // If song was previously an alternate on a parent song, pull it out as its own thing!
                 allSongs.filter { it.id != song.id && it.containsYoutubeUrlOrId(song.youtubeUrl) }.forEach { parent ->
                     val cleanList = parent.getAlternateVersionsList().filter { it.youtubeUrl != song.youtubeUrl }
@@ -638,6 +703,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val intent = Intent(MusicLibraryService.ACTION_UPDATE_SONG).apply {
                 setPackage(app.packageName)
                 putExtra(MusicLibraryService.EXTRA_SONG_JSON, json.encodeToString(finalSongToBroadcast))
+                if (matchingOtherSong != null) {
+                    putExtra(MusicLibraryService.EXTRA_DELETED_SONG_ID, song.id)
+                }
             }
             app.sendBroadcast(intent)
 

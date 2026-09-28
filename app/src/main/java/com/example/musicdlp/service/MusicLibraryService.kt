@@ -89,6 +89,7 @@ class MusicLibraryService : MediaLibraryService() {
         const val EXTRA_ADVANCE = "extra_advance"
         const val EXTRA_IS_BUFFERING = "extra_is_buffering"
         const val EXTRA_SEEK_TO_MS = "extra_seek_to_ms"
+        const val EXTRA_DELETED_SONG_ID = "extra_deleted_song_id"
     }
 
     private var mediaSession: MediaLibrarySession? = null
@@ -185,9 +186,10 @@ class MusicLibraryService : MediaLibraryService() {
                 }
                 ACTION_UPDATE_SONG -> {
                     val songJson = intent.getStringExtra(EXTRA_SONG_JSON) ?: return
+                    val deletedSongId = intent.getStringExtra(EXTRA_DELETED_SONG_ID)
                     try {
                         val updatedSong = json.decodeFromString<Song>(songJson)
-                        updateSongInQueue(updatedSong)
+                        updateSongInQueue(updatedSong, deletedSongId)
                     } catch (e: Exception) {
                         Napier.e("Failed to update song: ${e.message}", e)
                     }
@@ -291,6 +293,23 @@ class MusicLibraryService : MediaLibraryService() {
                 if (mediaItem != null) {
                     val mediaId = mediaItem.mediaId
                     if (mediaId != "ROOT" && mediaId != "no_more_songs") {
+                        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                            val currentList = synchronized(queueLock) { activeQueue.toList() }
+                            val currentIndex = exoPlayer.currentMediaItemIndex
+                            val currentSong = currentList.getOrNull(currentIndex)
+                            if (currentSong != null && !isSongPlayableInMode(currentSong, currentMode)) {
+                                val nextIdx = getNextSongIndex(currentList, currentIndex - 1, currentMode)
+                                if (nextIdx != -1 && nextIdx < exoPlayer.mediaItemCount) {
+                                    exoPlayer.seekTo(nextIdx, 0L)
+                                    return
+                                } else {
+                                    virtualCurrentIndex = currentList.size
+                                    exoPlayer.pause()
+                                    broadcastQueueChanged(overrideCurrentIndex = currentList.size)
+                                    return
+                                }
+                            }
+                        }
                         broadcastQueueChanged()
                         triggerProcessQueue()
                     }
@@ -465,11 +484,11 @@ class MusicLibraryService : MediaLibraryService() {
         }
     }
 
-    private fun getFilteredQueueForMode(queue: List<Song>, mode: SwipingMode): List<Song> {
+    private fun isSongPlayableInMode(song: Song, mode: SwipingMode): Boolean {
         return when (mode) {
-            SwipingMode.ONLY_NEW -> queue.filter { !it.isLiked && !it.isDisliked }
-            SwipingMode.NEW_AND_LIKED -> queue.filter { !it.isDisliked }
-            SwipingMode.PLAY_ALL_RECATEGORISE -> queue
+            SwipingMode.ONLY_NEW -> !song.isLiked && !song.isDisliked
+            SwipingMode.NEW_AND_LIKED -> !song.isDisliked
+            SwipingMode.PLAY_ALL_RECATEGORISE -> true
         }
     }
 
@@ -484,15 +503,18 @@ class MusicLibraryService : MediaLibraryService() {
             activeQueue = queue.toMutableList()
         }
 
-        val playableQueue = getFilteredQueueForMode(queue, currentMode).ifEmpty { queue }
-
         val targetIndex = if (!targetSongId.isNullOrBlank()) {
-            playableQueue.indexOfFirst { it.id == targetSongId }.let { if (it != -1) it else 0 }
+            activeQueue.indexOfFirst { it.id == targetSongId }.let { if (it != -1) it else 0 }
         } else {
-            startIndex.coerceIn(0, (playableQueue.size - 1).coerceAtLeast(0))
+            startIndex.coerceIn(0, (activeQueue.size - 1).coerceAtLeast(0))
         }
 
-        val mediaItems = playableQueue.map { it.toMediaItem(swipingMode = currentMode.name) }
+        val currentPlayingId = if (activeQueue.isNotEmpty() && targetIndex in activeQueue.indices) activeQueue[targetIndex].id else null
+        val mediaItems = activeQueue.map {
+            it.toMediaItem(
+                isCurrentSong = (it.id == currentPlayingId)
+            )
+        }
 
         exoPlayer.setMediaItems(mediaItems, targetIndex, seekToMs)
         exoPlayer.prepare()
@@ -517,7 +539,12 @@ class MusicLibraryService : MediaLibraryService() {
                 activeQueue.add(0, song)
             }
             index = 0
-            val mediaItems = activeQueue.map { it.toMediaItem(swipingMode = currentMode.name) }
+            val currentPlayingId = exoPlayer.currentMediaItem?.mediaId
+            val mediaItems = activeQueue.map {
+                it.toMediaItem(
+                    isCurrentSong = (it.id == currentPlayingId)
+                )
+            }
             exoPlayer.setMediaItems(mediaItems, 0, 0L)
         } else if (index != -1) {
             exoPlayer.seekTo(index, 0L)
@@ -530,24 +557,42 @@ class MusicLibraryService : MediaLibraryService() {
         triggerProcessQueue()
     }
 
-    private fun updateSongInQueue(updatedSong: Song) {
+    private fun updateSongInQueue(updatedSong: Song, deletedSongId: String? = null) {
         serviceScope.launch(Dispatchers.IO) {
             val app = application as MusicDLPApplication
             app.database.songDao().insertSong(updatedSong.copy(updatedAt = System.currentTimeMillis()))
-        }
-        synchronized(queueLock) {
-            activeQueue = activeQueue.map { if (it.id == updatedSong.id) updatedSong else it }.toMutableList()
-        }
-
-        val idxInPlayer = activeQueue.indexOfFirst { it.id == updatedSong.id }
-        if (idxInPlayer >= 0 && idxInPlayer < exoPlayer.mediaItemCount) {
-            val currentPos = if (exoPlayer.currentMediaItemIndex == idxInPlayer) exoPlayer.currentPosition else 0L
-            val mediaItem = updatedSong.toMediaItem(swipingMode = currentMode.name)
-            exoPlayer.replaceMediaItem(idxInPlayer, mediaItem)
-            if (exoPlayer.currentMediaItemIndex == idxInPlayer) {
-                exoPlayer.seekTo(idxInPlayer, currentPos)
+            if (!deletedSongId.isNullOrBlank()) {
+                app.database.songDao().deleteSongById(deletedSongId)
             }
         }
+        synchronized(queueLock) {
+            val newQueue = mutableListOf<Song>()
+            var updatedAdded = false
+            for (item in activeQueue) {
+                if (item.id == updatedSong.id) {
+                    newQueue.add(updatedSong)
+                    updatedAdded = true
+                } else if (!deletedSongId.isNullOrBlank() && item.id == deletedSongId) {
+                    if (!updatedAdded && activeQueue.none { it.id == updatedSong.id }) {
+                        newQueue.add(updatedSong)
+                        updatedAdded = true
+                    }
+                } else {
+                    newQueue.add(item)
+                }
+            }
+            activeQueue = newQueue
+        }
+
+        val currentPlayingId = exoPlayer.currentMediaItem?.mediaId
+        val mediaItems = activeQueue.map {
+            it.toMediaItem(
+                isCurrentSong = (it.id == currentPlayingId)
+            )
+        }
+        val currentPos = exoPlayer.currentPosition
+        val currentIdx = exoPlayer.currentMediaItemIndex
+        exoPlayer.setMediaItems(mediaItems, currentIdx.coerceIn(0, (mediaItems.size - 1).coerceAtLeast(0)), currentPos)
 
         broadcastQueueChanged()
         triggerProcessQueue()
@@ -565,9 +610,15 @@ class MusicLibraryService : MediaLibraryService() {
     fun likeSong(targetSong: Song?, advance: Boolean = false) {
         serviceScope.launch(Dispatchers.Main) {
             val currentList = synchronized(queueLock) { activeQueue.toList() }
+            val currentMediaId = exoPlayer.currentMediaItem?.mediaId
+
             val songToLike = targetSong
+                ?: currentList.firstOrNull { it.id == currentMediaId }
                 ?: currentList.getOrNull(exoPlayer.currentMediaItemIndex)
-                ?: currentList.firstOrNull { it.id == exoPlayer.currentMediaItem?.mediaId }
+                ?: withContext(Dispatchers.IO) {
+                    val app = application as MusicDLPApplication
+                    if (!currentMediaId.isNullOrBlank()) app.database.songDao().getSongById(currentMediaId) else null
+                }
                 ?: return@launch
 
             withContext(Dispatchers.IO) {
@@ -618,9 +669,24 @@ class MusicLibraryService : MediaLibraryService() {
                 }
             }
 
-            updateNotificationLayout(exoPlayer.currentMediaItem)
+            val updatedSong = songToLike.copy(isLiked = true, isDisliked = false)
+            val currentIdx = exoPlayer.currentMediaItemIndex
+            val currentMediaItemInPlayer = if (currentIdx in 0 until exoPlayer.mediaItemCount) exoPlayer.getMediaItemAt(currentIdx) else null
+            val existingUri = currentMediaItemInPlayer?.localConfiguration?.uri?.toString()
+            val updatedMediaItem = updatedSong.toMediaItem(playableUri = existingUri, isCurrentSong = true)
+
+            if (currentIdx in 0 until exoPlayer.mediaItemCount && currentMediaItemInPlayer?.mediaId == songToLike.id) {
+                val currentPos = exoPlayer.currentPosition
+                val isPlaying = exoPlayer.isPlaying
+                exoPlayer.replaceMediaItem(currentIdx, updatedMediaItem)
+                exoPlayer.seekTo(currentIdx, currentPos)
+                if (isPlaying) exoPlayer.play()
+            }
+
+            updateNotificationLayout(updatedMediaItem)
+            notifyMediaBrowserChildrenChanged()
             broadcastQueueChanged()
-            if (advance) {
+            if (advance || !isSongPlayableInMode(updatedSong, currentMode)) {
                 forwardingPlayer.seekToNextMediaItem()
             }
             triggerProcessQueue()
@@ -630,9 +696,15 @@ class MusicLibraryService : MediaLibraryService() {
     fun dislikeSong(targetSong: Song?, advance: Boolean = false) {
         serviceScope.launch(Dispatchers.Main) {
             val currentList = synchronized(queueLock) { activeQueue.toList() }
+            val currentMediaId = exoPlayer.currentMediaItem?.mediaId
+
             val songToDislike = targetSong
+                ?: currentList.firstOrNull { it.id == currentMediaId }
                 ?: currentList.getOrNull(exoPlayer.currentMediaItemIndex)
-                ?: currentList.firstOrNull { it.id == exoPlayer.currentMediaItem?.mediaId }
+                ?: withContext(Dispatchers.IO) {
+                    val app = application as MusicDLPApplication
+                    if (!currentMediaId.isNullOrBlank()) app.database.songDao().getSongById(currentMediaId) else null
+                }
                 ?: return@launch
 
             withContext(Dispatchers.IO) {
@@ -690,9 +762,24 @@ class MusicLibraryService : MediaLibraryService() {
                 }
             }
 
-            updateNotificationLayout(exoPlayer.currentMediaItem)
+            val updatedSong = songToDislike.copy(isLiked = false, isDisliked = true)
+            val currentIdx = exoPlayer.currentMediaItemIndex
+            val currentMediaItemInPlayer = if (currentIdx in 0 until exoPlayer.mediaItemCount) exoPlayer.getMediaItemAt(currentIdx) else null
+            val existingUri = currentMediaItemInPlayer?.localConfiguration?.uri?.toString()
+            val updatedMediaItem = updatedSong.toMediaItem(playableUri = existingUri, isCurrentSong = true)
+
+            if (currentIdx in 0 until exoPlayer.mediaItemCount && currentMediaItemInPlayer?.mediaId == songToDislike.id) {
+                val currentPos = exoPlayer.currentPosition
+                val isPlaying = exoPlayer.isPlaying
+                exoPlayer.replaceMediaItem(currentIdx, updatedMediaItem)
+                exoPlayer.seekTo(currentIdx, currentPos)
+                if (isPlaying) exoPlayer.play()
+            }
+
+            updateNotificationLayout(updatedMediaItem)
+            notifyMediaBrowserChildrenChanged()
             broadcastQueueChanged()
-            if (advance) {
+            if (advance || !isSongPlayableInMode(updatedSong, currentMode)) {
                 forwardingPlayer.seekToNextMediaItem()
             }
             triggerProcessQueue()
@@ -872,7 +959,9 @@ class MusicLibraryService : MediaLibraryService() {
                         if (idxInPlayer >= 0 && idxInPlayer < exoPlayer.mediaItemCount) {
                             val currentPos = if (exoPlayer.currentMediaItemIndex == idxInPlayer) exoPlayer.currentPosition else 0L
                             val isPlaying = exoPlayer.isPlaying
-                            val mediaItem = cleanedSong.toMediaItem(swipingMode = currentMode.name)
+                            val currentItemInPlayer = exoPlayer.getMediaItemAt(idxInPlayer)
+                            val existingUri = currentItemInPlayer.localConfiguration?.uri?.toString()
+                            val mediaItem = cleanedSong.toMediaItem(playableUri = existingUri)
                             exoPlayer.replaceMediaItem(idxInPlayer, mediaItem)
                             if (exoPlayer.currentMediaItemIndex == idxInPlayer) {
                                 exoPlayer.seekTo(idxInPlayer, currentPos)
@@ -1081,7 +1170,8 @@ class MusicLibraryService : MediaLibraryService() {
 
     private fun updateNotificationLayout(mediaItem: MediaItem?) {
         val session = mediaSession ?: return
-        session.setCustomLayout(buildCustomLayout(mediaItem))
+        val layout = buildCustomLayout(mediaItem)
+        session.setCustomLayout(layout)
 
         val updatedCommands = forwardingPlayer.availableCommands
         // Copy the connectedControllers list to avoid ConcurrentModificationException
@@ -1089,6 +1179,7 @@ class MusicLibraryService : MediaLibraryService() {
 
         for (controller in controllers) {
             try {
+                session.setCustomLayout(controller, layout)
                 session.setAvailableCommands(
                     controller,
                     MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
@@ -1232,6 +1323,7 @@ class MusicLibraryService : MediaLibraryService() {
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
             val settableFuture = SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
+            val currentPlayingId = exoPlayer.currentMediaItem?.mediaId
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val app = application as MusicDLPApplication
@@ -1247,31 +1339,33 @@ class MusicLibraryService : MediaLibraryService() {
                             )
                         }
                         "NOW_PLAYING" -> {
-                            val likedList = currentList.filter { it.isLiked }
-                            val dislikedList = currentList.filter { it.isDisliked }
-                            val newList = currentList.filter { !it.isLiked && !it.isDisliked }
+                            val songList = currentList.ifEmpty { app.database.songDao().getAllSongs() }
+                            val likedList = songList.filter { it.isLiked }
+                            val dislikedList = songList.filter { it.isDisliked }
+                            val newList = songList.filter { !it.isLiked && !it.isDisliked }
 
                             listOf(
                                 createBrowsableItem("NOW_PLAYING_LIKED", "Now Playing (Liked)", "${likedList.size} songs"),
                                 createBrowsableItem("NOW_PLAYING_DISLIKED", "Now Playing (Disliked)", "${dislikedList.size} songs"),
                                 createBrowsableItem("NOW_PLAYING_NEW", "Now Playing (New)", "${newList.size} songs"),
-                                createBrowsableItem("NOW_PLAYING_ALL", "Now Playing (All)", "${currentList.size} songs")
+                                createBrowsableItem("NOW_PLAYING_ALL", "Now Playing (All)", "${songList.size} songs")
                             )
                         }
                         "NOW_PLAYING_LIKED" -> {
-                            val liked = currentList.filter { it.isLiked }
-                            liked.map { it.toMediaItem(parentId = "NOW_PLAYING_LIKED") }
+                            val liked = currentList.filter { it.isLiked }.ifEmpty { app.database.songDao().getLikedSongsList() }
+                            liked.map { it.toMediaItem(parentId = "NOW_PLAYING_LIKED", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NOW_PLAYING_DISLIKED" -> {
-                            val disliked = currentList.filter { it.isDisliked }
-                            disliked.map { it.toMediaItem(parentId = "NOW_PLAYING_DISLIKED") }
+                            val disliked = currentList.filter { it.isDisliked }.ifEmpty { app.database.songDao().getDislikedSongsList() }
+                            disliked.map { it.toMediaItem(parentId = "NOW_PLAYING_DISLIKED", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NOW_PLAYING_NEW" -> {
-                            val newSongs = currentList.filter { !it.isLiked && !it.isDisliked }
-                            newSongs.map { it.toMediaItem(parentId = "NOW_PLAYING_NEW") }
+                            val newSongs = currentList.filter { !it.isLiked && !it.isDisliked }.ifEmpty { app.database.songDao().getNewSongsList() }
+                            newSongs.map { it.toMediaItem(parentId = "NOW_PLAYING_NEW", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NOW_PLAYING_ALL" -> {
-                            currentList.map { it.toMediaItem(parentId = "NOW_PLAYING_ALL", swipingMode = currentMode.name) }
+                            val songList = currentList.ifEmpty { app.database.songDao().getAllSongs() }
+                            songList.map { it.toMediaItem(parentId = "NOW_PLAYING_ALL", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NEW" -> {
                             val dbNew = app.database.songDao().getNewSongsList()
@@ -1279,7 +1373,7 @@ class MusicLibraryService : MediaLibraryService() {
                             val combinedNew = (dbNew + queueNew)
                                 .filter { !it.isLiked && !it.isDisliked }
                                 .distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
-                            combinedNew.map { it.toMediaItem(parentId = "NEW") }
+                            combinedNew.map { it.toMediaItem(parentId = "NEW", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "SETTINGS" -> {
                             listOf(
@@ -1308,12 +1402,10 @@ class MusicLibraryService : MediaLibraryService() {
                                 app.database.songDao().getAllSongs()
                             }
 
-                            val filteredList = getFilteredQueueForMode(songSourceList, currentMode).ifEmpty { songSourceList }
-
                             withContext(Dispatchers.Main) {
-                                if (filteredList.isNotEmpty()) {
+                                if (songSourceList.isNotEmpty()) {
                                     synchronized(queueLock) {
-                                        activeQueue = filteredList.toMutableList()
+                                        activeQueue = songSourceList.toMutableList()
                                     }
                                     updateNotificationLayout(exoPlayer.currentMediaItem)
                                     broadcastQueueChanged()
@@ -1326,18 +1418,18 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         "LIKED" -> {
                             val liked = app.database.songDao().getLikedSongsList()
-                            liked.map { it.toMediaItem(parentId = "LIKED") }
+                            liked.map { it.toMediaItem(parentId = "LIKED", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "DISLIKED" -> {
                             val disliked = app.database.songDao().getDislikedSongsList()
-                            disliked.map { it.toMediaItem(parentId = "DISLIKED") }
+                            disliked.map { it.toMediaItem(parentId = "DISLIKED", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         else -> emptyList()
                     }
 
                     val paginatedChildren = if (pageSize > 0 && page >= 0) {
-                        val fromIndex = (page * pageSize).coerceAtMost(children.size)
-                        val toIndex = (fromIndex + pageSize).coerceAtMost(children.size)
+                        val fromIndex = (page.toLong() * pageSize.toLong()).coerceIn(0L, children.size.toLong()).toInt()
+                        val toIndex = (fromIndex.toLong() + pageSize.toLong()).coerceIn(fromIndex.toLong(), children.size.toLong()).toInt()
                         children.subList(fromIndex, toIndex)
                     } else {
                         children
@@ -1379,7 +1471,8 @@ class MusicLibraryService : MediaLibraryService() {
                     }
 
                     val mediaId = clickedItem.mediaId
-                    val parentId = clickedItem.requestMetadata.extras?.getString("parentId")?.uppercase() ?: ""
+                    val parentId = (clickedItem.mediaMetadata.extras?.getString("parentId")
+                        ?: clickedItem.requestMetadata.extras?.getString("parentId"))?.uppercase() ?: ""
 
                     if (mediaId.startsWith("MODE_")) {
                         val modeStr = when (mediaId) {
@@ -1396,21 +1489,23 @@ class MusicLibraryService : MediaLibraryService() {
                             app.database.songDao().getAllSongs()
                         }
 
-                        val filteredList = getFilteredQueueForMode(songSourceList, currentMode).ifEmpty { songSourceList }
-
                         withContext(Dispatchers.Main) {
                             updateNotificationLayout(exoPlayer.currentMediaItem)
                             notifyMediaBrowserChildrenChanged()
                             broadcastQueueChanged()
 
-                            if (filteredList.isNotEmpty()) {
+                            if (songSourceList.isNotEmpty()) {
                                 synchronized(queueLock) {
-                                    activeQueue = filteredList.toMutableList()
+                                    activeQueue = songSourceList.toMutableList()
                                 }
 
-                                val resultItems = filteredList.map { it.toMediaItem(swipingMode = currentMode.name) }
                                 val currentPlayingId = exoPlayer.currentMediaItem?.mediaId
-                                val targetIndex = filteredList.indexOfFirst { it.id == currentPlayingId }.let { if (it != -1) it else 0 }
+                                val resultItems = songSourceList.map {
+                                    it.toMediaItem(
+                                        isCurrentSong = (it.id == currentPlayingId)
+                                    )
+                                }
+                                val targetIndex = songSourceList.indexOfFirst { it.id == currentPlayingId }.let { if (it != -1) it else 0 }
                                 val startPos = if (targetIndex >= 0) {
                                     exoPlayer.currentPosition.coerceAtLeast(0L)
                                 } else {
@@ -1439,18 +1534,28 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         "NOW_PLAYING_LIKED" -> currentList.filter { it.isLiked }.ifEmpty { app.database.songDao().getLikedSongsList() }
                         "NOW_PLAYING_DISLIKED" -> currentList.filter { it.isDisliked }.ifEmpty { app.database.songDao().getDislikedSongsList() }
-                        "NOW_PLAYING_NEW" -> currentList.filter { !it.isLiked && !it.isDisliked }
-                        "NOW_PLAYING_ALL" -> currentList
-                        else -> currentList.ifEmpty {
-                            app.database.songDao().getSongById(mediaId)?.let { listOf(it) } ?: emptyList()
+                        "NOW_PLAYING_NEW" -> currentList.filter { !it.isLiked && !it.isDisliked }.ifEmpty { app.database.songDao().getNewSongsList() }
+                        "NOW_PLAYING_ALL" -> currentList.ifEmpty { app.database.songDao().getAllSongs() }
+                        else -> {
+                            if (currentList.any { it.id == mediaId }) {
+                                currentList
+                            } else {
+                                val allDb = app.database.songDao().getAllSongs()
+                                if (allDb.any { it.id == mediaId }) allDb else app.database.songDao().getSongById(mediaId)?.let { listOf(it) } ?: emptyList()
+                            }
                         }
                     }
 
-                    val modeToUse = if (parentId == "NEW" || parentId == "NOW_PLAYING_NEW") "ONLY_NEW" else "PLAY_ALL_RECATEGORISE"
+                    val modeToUse = if (parentId == "NEW" || parentId == "NOW_PLAYING_NEW") "ONLY_NEW" else currentMode.name
                     currentMode = SwipingMode.valueOf(modeToUse)
 
                     val targetIndex = listToPlay.indexOfFirst { it.id == mediaId }.coerceAtLeast(0)
-                    val resultItems = listToPlay.map { it.toMediaItem(swipingMode = currentMode.name) }
+                    val resultItems = listToPlay.map {
+                        it.toMediaItem(
+                            parentId = parentId,
+                            isCurrentSong = (it.id == mediaId)
+                        )
+                    }
 
                     withContext(Dispatchers.Main) {
                         setQueueAndPlay(listToPlay, mediaId, targetIndex, 0L)
@@ -1481,7 +1586,7 @@ class MusicLibraryService : MediaLibraryService() {
                         "NOW_PLAYING_LIKED" -> createBrowsableItem("NOW_PLAYING_LIKED", "Liked Songs")
                         "NOW_PLAYING_DISLIKED" -> createBrowsableItem("NOW_PLAYING_DISLIKED", "Disliked Songs")
                         "NOW_PLAYING_NEW" -> createBrowsableItem("NOW_PLAYING_NEW", "New Songs")
-                        "NOW_PLAYING_ALL" -> createBrowsableItem("NOW_PLAYING_NEW", "All Songs")
+                        "NOW_PLAYING_ALL" -> createBrowsableItem("NOW_PLAYING_ALL", "All Songs")
                         "NEW" -> createBrowsableItem("NEW", "New Songs")
                         "LIKED" -> createBrowsableItem("LIKED", "Liked Songs")
                         "DISLIKED" -> createBrowsableItem("DISLIKED", "Disliked Songs")
@@ -1503,7 +1608,7 @@ class MusicLibraryService : MediaLibraryService() {
                         ?: currentList.firstOrNull { it.id == mediaId }
 
                     if (dbSong != null) {
-                        val item = dbSong.toMediaItem(swipingMode = currentMode.name)
+                        val item = dbSong.toMediaItem()
                         settableFuture.set(LibraryResult.ofItem(item, null))
                     } else {
                         settableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE))
@@ -1546,7 +1651,7 @@ class MusicLibraryService : MediaLibraryService() {
                     val combinedResults = likedMatches + dislikedMatches + filteredOnline
 
                     if (combinedResults.isNotEmpty()) {
-                        val mediaItems = combinedResults.map { it.toMediaItem(swipingMode = currentMode.name) }
+                        val mediaItems = combinedResults.map { it.toMediaItem() }
                         searchResultsCache[query] = mediaItems
                         session.notifySearchResultChanged(browser, query, mediaItems.size, params)
 
