@@ -85,41 +85,50 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _swipingMode = MutableStateFlow(SwipingMode.ONLY_NEW)
     val swipingMode: StateFlow<SwipingMode> = _swipingMode
 
-    private fun isValidTitleAndArtist(song: Song): Boolean {
-        return song.title.isNotBlank() &&
-                !song.title.equals("Unknown Title", ignoreCase = true) &&
-                !song.title.equals("Loading...", ignoreCase = true) &&
-                song.artist.isNotBlank() &&
-                !song.artist.equals("Unknown", ignoreCase = true)
-    }
-
     // Derived Flows directly linked to DB and active queue
     val playlistLikedSongs: StateFlow<List<Song>> = combine(_activePlayingList, dbLikedSongsFlow) { queue, dbLiked ->
         queue.filter { song ->
-            song.isLiked || dbLiked.any { db ->
-                (db.id.isNotBlank() && db.id == song.id) ||
-                        (isValidTitleAndArtist(song) && isValidTitleAndArtist(db) &&
-                                db.title.equals(song.title, ignoreCase = true) &&
-                                db.artist.equals(song.artist, ignoreCase = true))
+            val isAlternate = dbLiked.any { db ->
+                db.id != song.id && db.youtubeUrl != song.youtubeUrl && db.containsAlternateId(song.youtubeUrl)
             }
+            val isPrimaryLiked = song.isLiked || dbLiked.any { db ->
+                (db.id.isNotBlank() && db.id == song.id) ||
+                        (db.youtubeUrl.isNotBlank() && db.youtubeUrl == song.youtubeUrl)
+            }
+            isPrimaryLiked && !isAlternate
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val playlistDislikedSongs: StateFlow<List<Song>> = combine(_activePlayingList, dbDislikedSongsFlow) { queue, dbDisliked ->
         queue.filter { song ->
-            song.isDisliked || dbDisliked.any { db ->
-                (db.id.isNotBlank() && db.id == song.id) ||
-                        (isValidTitleAndArtist(song) && isValidTitleAndArtist(db) &&
-                                db.title.equals(song.title, ignoreCase = true) &&
-                                db.artist.equals(song.artist, ignoreCase = true))
+            val isAlternate = dbDisliked.any { db ->
+                db.id != song.id && db.youtubeUrl != song.youtubeUrl && db.containsAlternateId(song.youtubeUrl)
             }
+            val isPrimaryDisliked = song.isDisliked || dbDisliked.any { db ->
+                (db.id.isNotBlank() && db.id == song.id) ||
+                        (db.youtubeUrl.isNotBlank() && db.youtubeUrl == song.youtubeUrl)
+            }
+            isPrimaryDisliked && !isAlternate
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    val playlistNewSongs: StateFlow<List<Song>> = combine(_activePlayingList, playlistLikedSongs, playlistDislikedSongs) { queue, liked, disliked ->
-        val likedIds = liked.map { it.id }.toSet()
-        val dislikedIds = disliked.map { it.id }.toSet()
-        queue.filter { song -> song.id !in likedIds && song.id !in dislikedIds }
+    val playlistNewSongs: StateFlow<List<Song>> = combine(_activePlayingList, dbLikedSongsFlow, dbDislikedSongsFlow) { queue, dbLiked, dbDisliked ->
+        queue.filter { song ->
+            val isLikedAlternate = dbLiked.any { db ->
+                db.id != song.id && db.youtubeUrl != song.youtubeUrl && db.containsAlternateId(song.youtubeUrl)
+            }
+            val isDislikedAlternate = dbDisliked.any { db ->
+                db.id != song.id && db.youtubeUrl != song.youtubeUrl && db.containsAlternateId(song.youtubeUrl)
+            }
+            val isLikedPrimary = song.isLiked || dbLiked.any { db ->
+                (db.id.isNotBlank() && db.id == song.id) || (db.youtubeUrl.isNotBlank() && db.youtubeUrl == song.youtubeUrl)
+            }
+            val isDislikedPrimary = song.isDisliked || dbDisliked.any { db ->
+                (db.id.isNotBlank() && db.id == song.id) || (db.youtubeUrl.isNotBlank() && db.youtubeUrl == song.youtubeUrl)
+            }
+
+            !isLikedPrimary && !isDislikedPrimary && !isLikedAlternate && !isDislikedAlternate
+        }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     private val _isBuffering = MutableStateFlow(false)
@@ -716,11 +725,32 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     suspend fun isAlternateVersionInDb(song: Song): Boolean = withContext(Dispatchers.IO) {
+        if (song.youtubeUrl.isBlank()) return@withContext false
         val allSongs = songDao.getAllSongs()
-        val primaryMatch = allSongs.firstOrNull { it.id == song.id }
-        if (primaryMatch != null) return@withContext false
         return@withContext allSongs.any { db ->
-            db.id != song.id && (
+            db.youtubeUrl != song.youtubeUrl && db.containsAlternateId(song.youtubeUrl)
+        }
+    }
+
+    suspend fun isParentLikedInDb(song: Song): Boolean = withContext(Dispatchers.IO) {
+        if (song.isLiked) return@withContext true
+        val allSongs = songDao.getAllSongs()
+        return@withContext allSongs.any { db ->
+            db.isLiked && (
+                db.id == song.id ||
+                db.youtubeUrl == song.youtubeUrl ||
+                db.containsAlternateId(song.youtubeUrl)
+            )
+        }
+    }
+
+    suspend fun isParentDislikedInDb(song: Song): Boolean = withContext(Dispatchers.IO) {
+        if (song.isDisliked) return@withContext true
+        val allSongs = songDao.getAllSongs()
+        return@withContext allSongs.any { db ->
+            db.isDisliked && (
+                db.id == song.id ||
+                db.youtubeUrl == song.youtubeUrl ||
                 db.containsAlternateId(song.youtubeUrl)
             )
         }

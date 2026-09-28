@@ -4,7 +4,12 @@ import com.example.musicdlp.data.SwipingMode
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.*
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -20,6 +25,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FiberNew
 import androidx.compose.material.icons.filled.FolderOpen
@@ -512,12 +519,19 @@ fun TinderCard(
                     maxLines = 3,
                     modifier = Modifier.alpha(0.7f).fillMaxWidth()
                 )
-                if (song.isLiked || song.isDisliked) {
-                    val isDownloaded = viewModel.isSongDownloaded(song)
-                    val isAlternate by produceState(initialValue = false, song.id) {
-                        value = viewModel.isAlternateVersionInDb(song)
-                    }
-                    val labelText = if (song.isLiked) {
+                val isDownloaded = viewModel.isSongDownloaded(song)
+                val isAlternate by produceState(initialValue = false, song.id, song.youtubeUrl) {
+                    value = viewModel.isAlternateVersionInDb(song)
+                }
+                val isParentLiked by produceState(initialValue = song.isLiked, song.id, song.youtubeUrl) {
+                    value = viewModel.isParentLikedInDb(song)
+                }
+                val isParentDisliked by produceState(initialValue = song.isDisliked, song.id, song.youtubeUrl) {
+                    value = viewModel.isParentDislikedInDb(song)
+                }
+
+                if (isParentLiked || isParentDisliked || isAlternate) {
+                    val labelText = if (isParentLiked) {
                         if (!isAlternate && isDownloaded) "Already Liked" else "Already Liked (Alternate)"
                     } else {
                         if (!isAlternate && isDownloaded) "Already Disliked" else "Already Disliked (Alternate)"
@@ -528,9 +542,9 @@ fun TinderCard(
                         label = { Text(labelText) },
                         leadingIcon = {
                             Icon(
-                                imageVector = if (song.isLiked) Icons.Default.ThumbUp else Icons.Default.ThumbDown,
+                                imageVector = if (isParentLiked) Icons.Default.ThumbUp else Icons.Default.ThumbDown,
                                 contentDescription = null,
-                                tint = if (song.isLiked) Color.Red else Color.Gray,
+                                tint = if (isParentLiked) Color.Red else Color.Gray,
                                 modifier = Modifier.size(14.dp)
                             )
                         },
@@ -1144,15 +1158,7 @@ fun FilteredSongsDialog(
     onDismiss: () -> Unit
 ) {
     val currentlyPlayingId by viewModel.currentlyPlayingId.collectAsState()
-    var songForAlternatesDialog by remember { mutableStateOf<Song?>(null) }
-
-    if (songForAlternatesDialog != null) {
-        AlternateVersionsDialog(
-            song = songForAlternatesDialog!!,
-            viewModel = viewModel,
-            onDismiss = { songForAlternatesDialog = null }
-        )
-    }
+    var expandedSongId by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1166,10 +1172,11 @@ fun FilteredSongsDialog(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
 
-                LazyColumn(modifier = Modifier.heightIn(max = 350.dp)) {
+                LazyColumn(modifier = Modifier.heightIn(max = 380.dp)) {
                     itemsIndexed(songs) { i, song ->
                         val isPlaying = currentlyPlayingId == song.id
                         val alternates = song.getAlternateVersionsList()
+                        val isExpanded = expandedSongId == song.id
 
                         Column {
                             Card(
@@ -1181,51 +1188,136 @@ fun FilteredSongsDialog(
                                         viewModel.jumpToSongInSwipeList(song)
                                     }
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
-                                        val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
-                                        "https://i.ytimg.com/vi/$id/hqdefault.jpg"
-                                    } else {
-                                        song.thumbnailUrl
-                                    }
-
-                                    if (effectiveThumbnail.isNotBlank()) {
-                                        AsyncImage(
-                                            model = effectiveThumbnail,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(48.dp)
-                                        )
-                                    } else {
-                                        Box(modifier = Modifier.size(48.dp).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-                                            Icon(Icons.Default.MusicNote, contentDescription = null)
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        val effectiveThumbnail = if (song.thumbnailUrl.isBlank() && song.youtubeUrl.contains("watch?v=")) {
+                                            val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+                                            "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                                        } else {
+                                            song.thumbnailUrl
                                         }
-                                    }
 
-                                    Spacer(modifier = Modifier.width(12.dp))
+                                        if (effectiveThumbnail.isNotBlank()) {
+                                            AsyncImage(
+                                                model = effectiveThumbnail,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(48.dp)
+                                            )
+                                        } else {
+                                            Box(modifier = Modifier.size(48.dp).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
+                                                Icon(Icons.Default.MusicNote, contentDescription = null)
+                                            }
+                                        }
 
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(text = song.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                        Text(text = song.artist, style = MaterialTheme.typography.bodySmall)
+                                        Spacer(modifier = Modifier.width(12.dp))
 
-                                        if (alternates.isNotEmpty()) {
-                                            Spacer(modifier = Modifier.height(4.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(text = song.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                                            Text(text = song.artist, style = MaterialTheme.typography.bodySmall)
+
+                                            if (alternates.isNotEmpty()) {
+                                                Spacer(modifier = Modifier.height(4.dp))
+                                                AssistChip(
+                                                    onClick = {
+                                                        expandedSongId = if (isExpanded) null else song.id
+                                                    },
+                                                    label = { Text("Alternates (${alternates.size})") },
+                                                    leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(14.dp)) },
+                                                    trailingIcon = {
+                                                        Icon(
+                                                            imageVector = if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                                            contentDescription = null,
+                                                            modifier = Modifier.size(14.dp)
+                                                        )
+                                                    }
+                                                )
+                                            }
+                                        }
+
+                                        if (isPlaying) {
+                                            Spacer(modifier = Modifier.width(8.dp))
                                             AssistChip(
-                                                onClick = { songForAlternatesDialog = song },
-                                                label = { Text("Alternates (${alternates.size})") },
-                                                leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(14.dp)) }
+                                                onClick = {},
+                                                label = { AnimatedEqualizer(color = MaterialTheme.colorScheme.primary) }
                                             )
                                         }
                                     }
 
-                                    if (isPlaying) {
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        AssistChip(
-                                            onClick = {},
-                                            label = { AnimatedEqualizer(color = MaterialTheme.colorScheme.primary) }
-                                        )
+                                    // Inline Alternate Versions list
+                                    AnimatedVisibility(
+                                        visible = isExpanded && alternates.isNotEmpty(),
+                                        enter = fadeIn() + expandVertically(),
+                                        exit = fadeOut() + shrinkVertically()
+                                    ) {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(top = 8.dp)
+                                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), MaterialTheme.shapes.small)
+                                                .padding(8.dp)
+                                        ) {
+                                            Text(
+                                                text = "Alternate Versions",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            alternates.forEach { version ->
+                                                val previewId = "preview_${version.youtubeUrl.hashCode()}"
+                                                val isPreviewPlaying = currentlyPlayingId == previewId
+
+                                                Card(
+                                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                                                ) {
+                                                    Column(modifier = Modifier.padding(8.dp)) {
+                                                        Text(
+                                                            text = version.rawTitle ?: "Alternate Version",
+                                                            style = MaterialTheme.typography.bodySmall,
+                                                            fontWeight = FontWeight.Bold,
+                                                            maxLines = 2
+                                                        )
+                                                        Text(
+                                                            text = version.youtubeUrl,
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            maxLines = 1
+                                                        )
+                                                        Spacer(modifier = Modifier.height(6.dp))
+                                                        Row(
+                                                            modifier = Modifier.fillMaxWidth(),
+                                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                                            verticalAlignment = Alignment.CenterVertically
+                                                        ) {
+                                                            OutlinedButton(
+                                                                onClick = { viewModel.playPreviewByUrl(version.youtubeUrl, version.rawTitle ?: song.title) },
+                                                                modifier = Modifier.height(32.dp)
+                                                            ) {
+                                                                Icon(
+                                                                    imageVector = if (isPreviewPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                                                    contentDescription = null,
+                                                                    modifier = Modifier.size(14.dp)
+                                                                )
+                                                                Spacer(modifier = Modifier.width(4.dp))
+                                                                Text(if (isPreviewPlaying) "Pause" else "Preview", fontSize = 11.sp)
+                                                            }
+
+                                                            Button(
+                                                                onClick = {
+                                                                    viewModel.replaceLikedSongWithAlternateVersion(song, version)
+                                                                },
+                                                                modifier = Modifier.height(32.dp)
+                                                            ) {
+                                                                Text("Replace Download", fontSize = 11.sp)
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

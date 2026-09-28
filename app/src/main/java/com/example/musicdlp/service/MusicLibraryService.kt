@@ -107,6 +107,14 @@ class MusicLibraryService : MediaLibraryService() {
     private val processMutex = Mutex()
     private val downloadSemaphore = Semaphore(2)
     private val json = Json { ignoreUnknownKeys = true }
+    private var cachedDbSongs: List<Song> = emptyList()
+
+    private fun refreshDbCache() {
+        serviceScope.launch(Dispatchers.IO) {
+            val app = application as? MusicDLPApplication ?: return@launch
+            cachedDbSongs = app.database.songDao().getAllSongs()
+        }
+    }
 
     private val customCommandLike = SessionCommand(CUSTOM_ACTION_LIKE, Bundle.EMPTY)
     private val customCommandDislike = SessionCommand(CUSTOM_ACTION_DISLIKE, Bundle.EMPTY)
@@ -211,6 +219,7 @@ class MusicLibraryService : MediaLibraryService() {
 
     override fun onCreate() {
         super.onCreate()
+        refreshDbCache()
 
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
@@ -485,10 +494,28 @@ class MusicLibraryService : MediaLibraryService() {
     }
 
     private fun isSongPlayableInMode(song: Song, mode: SwipingMode): Boolean {
+        if (mode == SwipingMode.PLAY_ALL_RECATEGORISE) return true
+
+        val allSongs = cachedDbSongs
+
+        val isAlternate = if (song.youtubeUrl.isNotBlank()) {
+            allSongs.any { db ->
+                db.id != song.id && db.youtubeUrl != song.youtubeUrl && db.containsAlternateId(song.youtubeUrl)
+            }
+        } else false
+
+        val isPrimaryLiked = (song.isLiked || allSongs.any { db ->
+            db.isLiked && (db.id == song.id || (db.youtubeUrl.isNotBlank() && db.youtubeUrl == song.youtubeUrl))
+        }) && !isAlternate
+
+        val isPrimaryDisliked = (song.isDisliked || allSongs.any { db ->
+            db.isDisliked && (db.id == song.id || (db.youtubeUrl.isNotBlank() && db.youtubeUrl == song.youtubeUrl))
+        }) && !isAlternate
+
         return when (mode) {
-            SwipingMode.ONLY_NEW -> !song.isLiked && !song.isDisliked
-            SwipingMode.NEW_AND_LIKED -> !song.isDisliked
-            SwipingMode.PLAY_ALL_RECATEGORISE -> true
+            SwipingMode.ONLY_NEW -> !isPrimaryLiked && !isPrimaryDisliked && !isAlternate
+            SwipingMode.NEW_AND_LIKED -> !isPrimaryDisliked && !isAlternate
+            else -> true
         }
     }
 
@@ -498,6 +525,7 @@ class MusicLibraryService : MediaLibraryService() {
         startIndex: Int,
         seekToMs: Long
     ) {
+        refreshDbCache()
         virtualCurrentIndex = null
         synchronized(queueLock) {
             activeQueue = queue.toMutableList()
@@ -685,6 +713,7 @@ class MusicLibraryService : MediaLibraryService() {
 
             updateNotificationLayout(updatedMediaItem)
             notifyMediaBrowserChildrenChanged()
+            refreshDbCache()
             broadcastQueueChanged()
             if (advance || !isSongPlayableInMode(updatedSong, currentMode)) {
                 forwardingPlayer.seekToNextMediaItem()
@@ -778,6 +807,7 @@ class MusicLibraryService : MediaLibraryService() {
 
             updateNotificationLayout(updatedMediaItem)
             notifyMediaBrowserChildrenChanged()
+            refreshDbCache()
             broadcastQueueChanged()
             if (advance || !isSongPlayableInMode(updatedSong, currentMode)) {
                 forwardingPlayer.seekToNextMediaItem()
@@ -920,11 +950,33 @@ class MusicLibraryService : MediaLibraryService() {
                         )
                         songDao.insertSong(updatedExisting)
 
+                        // Clean up standalone MP3 file for songToProcess if it existed on disk
+                        val safeArtist = songToProcess.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                        val safeTitle = songToProcess.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                        if (safeArtist.isNotBlank() && safeTitle.isNotBlank()) {
+                            val finalFileName = "$safeArtist - $safeTitle.mp3"
+                            val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                            val downloadDir = File(publicMusicDir, "MusicDLP")
+                            val targetFile = File(downloadDir, finalFileName)
+                            if (targetFile.exists()) {
+                                targetFile.delete()
+                            }
+                        }
+
                         if (allSongs.any { it.id == songToProcess.id }) {
                             songDao.deleteSongById(songToProcess.id)
                         }
 
-                        cleanedSong = updatedExisting
+                        cleanedSong = songToProcess.copy(
+                            artist = cleanResult.artist,
+                            title = cleanResult.title,
+                            rawTitle = if (songToProcess.rawTitle.isNullOrBlank() || songToProcess.rawTitle == "Loading...") finalRawTitle else songToProcess.rawTitle,
+                            metadataSource = cleanResult.source,
+                            isLiked = matchingExistingSong.isLiked,
+                            isDisliked = matchingExistingSong.isDisliked,
+                            isMetadataCleaned = true,
+                            updatedAt = System.currentTimeMillis()
+                        )
                     } else if (existingByIdOrUrl != null) {
                         val updatedExisting = existingByIdOrUrl.copy(
                             artist = cleanResult.artist,
@@ -970,6 +1022,7 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         // we must update when name changes, otherwise we will not get the
                         // category (liked/disliked/new) switch (it can make the ui a bit jumpy though)
+                        refreshDbCache()
                         broadcastQueueChanged(notifyMediaBrowser = true)
                     }
 
