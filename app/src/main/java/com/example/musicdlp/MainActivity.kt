@@ -66,22 +66,60 @@ import com.example.musicdlp.ui.SettingsScreen
 import io.github.aakira.napier.Napier
 import kotlinx.coroutines.delay
 
+import android.content.Intent
+
 class MainActivity : ComponentActivity() {
+    private var sharedUrlState = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        handleIntent(intent)
+
         setContent {
             MusicDLPTheme {
-                MainScreen()
+                MainScreen(
+                    sharedUrl = sharedUrlState.value,
+                    onSharedUrlConsumed = { sharedUrlState.value = null }
+                )
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent == null) return
+        if (intent.action == Intent.ACTION_SEND) {
+            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT) ?: intent.getStringExtra(Intent.EXTRA_SUBJECT)
+            if (!sharedText.isNullOrBlank()) {
+                sharedUrlState.value = sharedText
+            }
+        } else if (intent.action == Intent.ACTION_VIEW) {
+            val dataString = intent.dataString
+            if (!dataString.isNullOrBlank()) {
+                sharedUrlState.value = dataString
             }
         }
     }
 }
 
 @Composable
-fun MainScreen() {
+fun MainScreen(sharedUrl: String? = null, onSharedUrlConsumed: () -> Unit = {}) {
     val navController = rememberNavController()
     val viewModel: MusicViewModel = viewModel()
+
+    LaunchedEffect(sharedUrl) {
+        if (!sharedUrl.isNullOrBlank()) {
+            viewModel.handleSharedUrl(sharedUrl)
+            onSharedUrlConsumed()
+        }
+    }
     val snackbarHostState = remember { SnackbarHostState() }
     val errorMessage by viewModel.errorMessage.collectAsState()
     val currentPlayingSong by viewModel.currentPlayingSong.collectAsState()

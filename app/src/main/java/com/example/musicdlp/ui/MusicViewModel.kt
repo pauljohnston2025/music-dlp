@@ -19,6 +19,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.example.musicdlp.MusicDLPApplication
 import com.example.musicdlp.data.AlternateVersion
+import com.example.musicdlp.data.PlaylistSearchResult
 import com.example.musicdlp.data.SharedQueueHolder
 import com.example.musicdlp.data.Song
 import com.example.musicdlp.data.SwipingMode
@@ -217,6 +218,21 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _similarPlaylists = MutableStateFlow<List<String>>(emptyList())
     val similarPlaylists: StateFlow<List<String>> = _similarPlaylists
 
+    private val _searchResults = MutableStateFlow<List<Song>>(emptyList())
+    val searchResults: StateFlow<List<Song>> = _searchResults
+
+    private val _playlistSearchResults = MutableStateFlow<List<PlaylistSearchResult>>(emptyList())
+    val playlistSearchResults: StateFlow<List<PlaylistSearchResult>> = _playlistSearchResults.asStateFlow()
+
+    private val _isSearching = MutableStateFlow(false)
+    val isSearching: StateFlow<Boolean> = _isSearching
+
+    private val _showSearchResultDialog = MutableStateFlow(false)
+    val showSearchResultDialog: StateFlow<Boolean> = _showSearchResultDialog
+
+    private val _lastSearchQuery = MutableStateFlow("")
+    val lastSearchQuery: StateFlow<String> = _lastSearchQuery
+
     val likedSongs = songDao.getLikedSongs()
     val dislikedSongs = songDao.getDislikedSongs()
     val newSongs = songDao.getNewSongs()
@@ -261,8 +277,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         _currentlyPlayingId.value = currentSong.id
                         _currentPlayingSong.value = currentSong
                     } else {
-                        _currentlyPlayingId.value = null
-                        _currentPlayingSong.value = null
+                        val noMoreSong = Song(
+                            id = "no_more_songs",
+                            title = "No more songs for playback mode: ${_swipingMode.value.displayName}",
+                            artist = "MusicDLP",
+                            thumbnailUrl = "",
+                            youtubeUrl = ""
+                        )
+                        _currentlyPlayingId.value = "no_more_songs"
+                        _currentPlayingSong.value = noMoreSong
                     }
                 }
             }
@@ -473,39 +496,75 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun searchPlaylists(query: String) {
-        if (query.isBlank()) return
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return
+
+        _lastSearchQuery.value = cleanQuery
+        _isSearching.value = true
+        _isPlaylistLoading.value = true
+        _errorMessage.value = "Searching for \"$cleanQuery\"..."
+
         viewModelScope.launch {
-            _isPlaylistLoading.value = true
             try {
-                val allDbSongs = songDao.getAllSongs()
+                val playlists = repository.searchPlaylists(cleanQuery)
+                _playlistSearchResults.value = playlists
 
-                val likedMatches = allDbSongs.filter {
-                    it.isLiked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true) || (it.rawTitle?.contains(query, ignoreCase = true) == true))
-                }
-
-                val dislikedMatches = allDbSongs.filter {
-                    it.isDisliked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true) || (it.rawTitle?.contains(query, ignoreCase = true) == true))
-                }
-
-                val onlineResults = repository.searchSongsOrPlaylists(query)
-
-                val likedOrDislikedIds = (likedMatches + dislikedMatches).map { it.id }.toSet()
-                val filteredOnline = onlineResults.filter { it.id !in likedOrDislikedIds }
-
-                val combinedResults = likedMatches + dislikedMatches + filteredOnline
-                _playlistTotal.value = combinedResults.size
-
-                val intent = Intent(MusicLibraryService.ACTION_SET_QUEUE).apply {
-                    setPackage(app.packageName)
-                    putExtra(MusicLibraryService.EXTRA_QUEUE_JSON, json.encodeToString(combinedResults))
-                    putExtra(MusicLibraryService.EXTRA_START_INDEX, 0)
-                }
-                app.sendBroadcast(intent)
-            } catch (e: Exception) {
-                _errorMessage.value = "Search failed: ${e.message}"
-            } finally {
+                val onlineResults = repository.searchSongsOrPlaylists(cleanQuery)
+                _searchResults.value = onlineResults
+                _isSearching.value = false
                 _isPlaylistLoading.value = false
+
+                if (onlineResults.isNotEmpty() || playlists.isNotEmpty()) {
+                    _showSearchResultDialog.value = true
+                } else {
+                    _errorMessage.value = "No search results found for \"$cleanQuery\""
+                }
+            } catch (e: Exception) {
+                _isSearching.value = false
+                _isPlaylistLoading.value = false
+                _errorMessage.value = "Search failed: ${e.message}"
             }
+        }
+    }
+
+    fun selectSearchResult(song: Song) {
+        _showSearchResultDialog.value = false
+        if (song.youtubeUrl.contains("list=") || song.id.startsWith("PL") || song.id.startsWith("RD") || song.id.startsWith("OLAK")) {
+            loadPlaylist(song.youtubeUrl)
+        } else {
+            val songsList = _searchResults.value.filter { !it.youtubeUrl.contains("list=") }.ifEmpty { listOf(song) }
+            _activePlayingList.value = songsList
+            val targetIdx = songsList.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
+
+            SharedQueueHolder.setQueue(songsList)
+            val intent = Intent(MusicLibraryService.ACTION_SET_QUEUE).apply {
+                setPackage(app.packageName)
+                putExtra(MusicLibraryService.EXTRA_QUEUE_JSON, json.encodeToString(songsList))
+                putExtra(MusicLibraryService.EXTRA_START_INDEX, targetIdx)
+            }
+            app.sendBroadcast(intent)
+        }
+    }
+
+    fun dismissSearchResultDialog() {
+        _showSearchResultDialog.value = false
+    }
+
+    fun handleSharedUrl(sharedText: String) {
+        val urlRegex = Regex("""(https?://[^\s"'<>]+)""")
+        val match = urlRegex.find(sharedText)
+        var extractedUrl = match?.value ?: sharedText.trim()
+        extractedUrl = extractedUrl.trimEnd('.', ',', ')', ']', '}', '>', '!', '?')
+
+        if (extractedUrl.isBlank()) return
+
+        _errorMessage.value = "Processing shared link..."
+        if (extractedUrl.contains("list=") || extractedUrl.contains("playlist")) {
+            loadPlaylist(extractedUrl)
+        } else if (extractedUrl.contains("watch?v=") || extractedUrl.contains("youtu.be/")) {
+            playPreviewByUrl(extractedUrl, title = "Shared Song")
+        } else {
+            searchPlaylists(extractedUrl)
         }
     }
 
@@ -513,16 +572,25 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (url.isBlank()) return
         viewModelScope.launch {
             _isPlaylistLoading.value = true
+            _errorMessage.value = "Loading playlist..."
             try {
                 val playlistSongs = repository.getPlaylistSongs(url)
                 _playlistTotal.value = playlistSongs.size
 
-                val intent = Intent(MusicLibraryService.ACTION_SET_QUEUE).apply {
-                    setPackage(app.packageName)
-                    putExtra(MusicLibraryService.EXTRA_QUEUE_JSON, json.encodeToString(playlistSongs))
-                    putExtra(MusicLibraryService.EXTRA_START_INDEX, 0)
+                if (playlistSongs.isNotEmpty()) {
+                    _activePlayingList.value = playlistSongs
+                    SharedQueueHolder.setQueue(playlistSongs)
+
+                    val intent = Intent(MusicLibraryService.ACTION_SET_QUEUE).apply {
+                        setPackage(app.packageName)
+                        putExtra(MusicLibraryService.EXTRA_QUEUE_JSON, json.encodeToString(playlistSongs))
+                        putExtra(MusicLibraryService.EXTRA_START_INDEX, 0)
+                    }
+                    app.sendBroadcast(intent)
+                    _errorMessage.value = "Loaded playlist (${playlistSongs.size} songs)"
+                } else {
+                    _errorMessage.value = "No songs found in playlist"
                 }
-                app.sendBroadcast(intent)
             } catch (e: Exception) {
                 _errorMessage.value = "Failed to load playlist: ${e.message}"
             } finally {

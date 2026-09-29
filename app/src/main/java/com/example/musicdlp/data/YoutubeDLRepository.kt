@@ -60,6 +60,16 @@ data class GeminiGuessResult(
 )
 
 @Serializable
+data class PlaylistSearchResult(
+    val id: String,
+    val title: String,
+    val uploader: String,
+    val songCount: Int? = null,
+    val thumbnailUrl: String,
+    val playlistUrl: String
+)
+
+@Serializable
 data class YtDlpPlaylist(
     val entries: List<YtDlpEntry>? = null
 )
@@ -76,7 +86,10 @@ data class YtDlpEntry(
     val duration: Double? = null,
     val isrc: String? = null,
     val artist: String? = null,
-    val track: String? = null
+    val track: String? = null,
+    @SerialName("_type") val type: String? = null,
+    @SerialName("playlist_count") val playlistCount: Int? = null,
+    @SerialName("entry_count") val entryCount: Int? = null
 )
 
 class YoutubeDLRepository(private val context: Context) {
@@ -514,32 +527,160 @@ class YoutubeDLRepository(private val context: Context) {
         return CleanMetadataResult(regA, regT, "regex (guess)", regScore, recoveredRawTitle)
     }
 
+    suspend fun searchPlaylists(query: String): List<PlaylistSearchResult> = withContext(Dispatchers.IO) {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank() || cleanQuery.startsWith("http://") || cleanQuery.startsWith("https://")) {
+            return@withContext emptyList()
+        }
+
+        val searchUrl = "https://www.youtube.com/results?search_query=${URLEncoder.encode(cleanQuery, "UTF-8")}&sp=EgIQAw%3D%3D"
+        Napier.d("Searching playlists with query: $cleanQuery (URL: $searchUrl)", tag = "DEBUG_METADATA")
+
+        fun parsePlaylistJson(jsonString: String): List<PlaylistSearchResult> {
+            if (!jsonString.startsWith("{")) return emptyList()
+            val jsonNode = json.decodeFromString<JsonElement>(jsonString).jsonObject
+            val rawEntries = if (jsonNode.containsKey("entries")) {
+                json.decodeFromString<YtDlpPlaylist>(jsonString).entries ?: emptyList()
+            } else {
+                listOf(json.decodeFromString<YtDlpEntry>(jsonString))
+            }
+
+            val results = mutableListOf<PlaylistSearchResult>()
+            for (entry in rawEntries) {
+                val rawTitle = entry.title ?: continue
+                val rawId = entry.id ?: entry.url ?: continue
+                if (rawTitle.isBlank() || rawId.isBlank()) continue
+
+                val uploader = entry.channel ?: entry.uploader ?: entry.creator ?: "YouTube"
+                val count = entry.playlistCount ?: entry.entryCount
+                val playlistId = when {
+                    rawId.contains("list=") -> rawId.substringAfter("list=").substringBefore("&").substringBefore("?")
+                    rawId.startsWith("/playlist?list=") -> rawId.substringAfter("/playlist?list=")
+                    else -> rawId
+                }
+                val thumbnail = if (!entry.thumbnail.isNullOrBlank()) {
+                    entry.thumbnail
+                } else if (playlistId.isNotBlank() && !playlistId.startsWith("http")) {
+                    "https://i.ytimg.com/vi/$playlistId/hqdefault.jpg"
+                } else {
+                    ""
+                }
+                val playlistUrl = if (playlistId.startsWith("http")) playlistId else "https://www.youtube.com/playlist?list=$playlistId"
+
+                results.add(
+                    PlaylistSearchResult(
+                        id = playlistId,
+                        title = rawTitle,
+                        uploader = uploader,
+                        songCount = count,
+                        thumbnailUrl = thumbnail,
+                        playlistUrl = playlistUrl
+                    )
+                )
+            }
+            return results
+        }
+
+        try {
+            val request = YoutubeDLRequest(searchUrl)
+            request.addOption("--flat-playlist")
+            request.addOption("--dump-single-json")
+            val response = YoutubeDL.getInstance().execute(request)
+            var results = parsePlaylistJson(response.out.trim())
+
+            if (results.isEmpty()) {
+                Napier.d("Web search returned 0 playlists, trying ytsearch10 fallback...", tag = "DEBUG_METADATA")
+                val fallbackReq = YoutubeDLRequest("ytsearch10:$cleanQuery playlist")
+                fallbackReq.addOption("--flat-playlist")
+                fallbackReq.addOption("--dump-single-json")
+                val fallbackResp = YoutubeDL.getInstance().execute(fallbackReq)
+                results = parsePlaylistJson(fallbackResp.out.trim())
+            }
+
+            Napier.i("Playlist search returned ${results.size} playlists", tag = "DEBUG_METADATA")
+            results
+        } catch (e: Exception) {
+            Napier.e("Playlist search failed: ${e.message}", tag = "DEBUG_METADATA")
+            emptyList()
+        }
+    }
+
     suspend fun searchSongsOrPlaylists(query: String): List<Song> = withContext(Dispatchers.IO) {
-        val searchUrl = "ytsearch15:$query"
-        Napier.d("Searching with query: $query (URL: $searchUrl)", tag = "DEBUG_METADATA")
+        val cleanQuery = query.trim()
+        val isUrl = cleanQuery.startsWith("http://") || cleanQuery.startsWith("https://") ||
+                cleanQuery.contains("youtube.com") || cleanQuery.contains("youtu.be")
+
+        val searchUrl = if (isUrl) {
+            cleanQuery
+        } else {
+            "ytmusicsearch20:$cleanQuery"
+        }
+
+        Napier.d("Searching with query: $cleanQuery (URL: $searchUrl)", tag = "DEBUG_METADATA")
         val request = YoutubeDLRequest(searchUrl)
         request.addOption("--flat-playlist")
         request.addOption("--dump-single-json")
+
         try {
             val response = YoutubeDL.getInstance().execute(request)
-            val jsonString = response.out
-            val trimmed = jsonString.trim()
-            val songs = mutableListOf<Song>()
-            
-            Napier.d("Search response length: ${jsonString.length}", tag = "DEBUG_METADATA")
+            var jsonString = response.out.trim()
 
-            if (trimmed.startsWith("{")) {
-                val jsonNode = json.decodeFromString<JsonElement>(trimmed).jsonObject
-                
+            // Fallback to ytsearch if ytmusicsearch returned empty/non-JSON response
+            if (!isUrl && (jsonString.isBlank() || !jsonString.startsWith("{"))) {
+                Napier.d("ytmusicsearch returned empty/non-JSON, falling back to ytsearch20", tag = "DEBUG_METADATA")
+                val fallbackUrl = "ytsearch20:$cleanQuery music"
+                val fallbackReq = YoutubeDLRequest(fallbackUrl)
+                fallbackReq.addOption("--flat-playlist")
+                fallbackReq.addOption("--dump-single-json")
+                try {
+                    jsonString = YoutubeDL.getInstance().execute(fallbackReq).out.trim()
+                } catch (e: Exception) {
+                    Napier.w("Fallback ytsearch failed: ${e.message}", tag = "DEBUG_METADATA")
+                }
+            }
+
+            val songs = mutableListOf<Song>()
+            val nonMusicKeywords = setOf(
+                "gameplay", "walkthrough", "playthrough", "full episode",
+                "unboxing", "tutorial", "reaction", "review", "vlog",
+                "news", "interview", "documentary", "speedrun", "trailer", "asmr",
+                "modding", "let's play", "lets play", "guide", "comparison"
+            )
+
+            if (jsonString.startsWith("{")) {
+                val jsonNode = json.decodeFromString<JsonElement>(jsonString).jsonObject
+
                 val rawEntries = if (jsonNode.containsKey("entries")) {
-                    json.decodeFromString<YtDlpPlaylist>(trimmed).entries ?: emptyList()
+                    json.decodeFromString<YtDlpPlaylist>(jsonString).entries ?: emptyList()
                 } else {
-                    listOf(json.decodeFromString<YtDlpEntry>(trimmed))
+                    listOf(json.decodeFromString<YtDlpEntry>(jsonString))
                 }
 
                 for ((index, entry) in rawEntries.withIndex()) {
                     val rawTitle = entry.title ?: ""
-                    val artist = entry.uploader?.replace(Regex("(?i)vevo|official|channel|music"), "")?.trim() ?: "Unknown"
+                    val titleLower = rawTitle.lowercase()
+
+                    // Filter out non-music keyword titles unless explicitly searched
+                    val containsNonMusicKeyword = nonMusicKeywords.any { kw ->
+                        titleLower.contains(kw) && !cleanQuery.lowercase().contains(kw)
+                    }
+                    if (containsNonMusicKeyword) {
+                        continue
+                    }
+
+                    // Filter out long videos > 20 mins (1200s) unless explicitly requested
+                    val duration = entry.duration ?: 0.0
+                    if (duration > 1200.0 && !cleanQuery.lowercase().contains("album") &&
+                        !cleanQuery.lowercase().contains("mix") && !cleanQuery.lowercase().contains("podcast")) {
+                        continue
+                    }
+
+                    val titleToUse = entry.track?.ifBlank { null } ?: rawTitle
+                    val artistToUse = entry.artist?.ifBlank { null }
+                        ?: entry.creator?.ifBlank { null }
+                        ?: entry.uploader?.replace(Regex("(?i)vevo|official|channel|music|- topic|topic"), "")?.trim()
+                        ?: "Unknown"
+
                     val thumbnail = if (!entry.thumbnail.isNullOrBlank()) {
                         entry.thumbnail
                     } else if (!entry.id.isNullOrBlank()) {
@@ -559,14 +700,15 @@ class YoutubeDLRepository(private val context: Context) {
                     val songId = if (!rawId.isNullOrBlank() && !isPlaylistId) {
                         rawId
                     } else {
-                        "search_${query.hashCode()}_$index"
+                        "search_${cleanQuery.hashCode()}_$index"
                     }
+
                     if (videoOrPlaylistUrl.isNotBlank() || songId.isNotBlank()) {
                         songs.add(
                             Song(
                                 id = songId,
-                                title = rawTitle.ifBlank { "Unknown Title" },
-                                artist = artist.ifBlank { "Unknown" },
+                                title = titleToUse.ifBlank { "Unknown Title" },
+                                artist = artistToUse.ifBlank { "Unknown" },
                                 thumbnailUrl = thumbnail,
                                 youtubeUrl = if (videoOrPlaylistUrl.isNotBlank()) videoOrPlaylistUrl else "https://www.youtube.com/watch?v=$songId",
                                 isLiked = false,
@@ -579,8 +721,8 @@ class YoutubeDLRepository(private val context: Context) {
                     }
                 }
             } else {
-                Napier.w("Search response does not look like JSON: ${trimmed.take(100)}", tag = "DEBUG_METADATA")
-                trimmed.lines().forEach { line ->
+                Napier.w("Search response does not look like JSON: ${jsonString.take(100)}", tag = "DEBUG_METADATA")
+                jsonString.lines().forEach { line ->
                     if (line.contains("watch?v=")) {
                         val videoId = line.substringAfter("watch?v=").substringBefore("&").trim()
                         if (videoId.isNotBlank()) {
@@ -599,6 +741,55 @@ class YoutubeDLRepository(private val context: Context) {
                     }
                 }
             }
+
+            // If query is not a URL and no playlists were in the top results, query for playlists specifically
+            val hasPlaylists = songs.any { it.youtubeUrl.contains("list=") }
+            if (!isUrl && !hasPlaylists) {
+                try {
+                    val playlistSearchUrl = "ytsearch10:$cleanQuery playlist"
+                    val plReq = YoutubeDLRequest(playlistSearchUrl)
+                    plReq.addOption("--flat-playlist")
+                    plReq.addOption("--dump-single-json")
+                    val plJson = YoutubeDL.getInstance().execute(plReq).out.trim()
+                    if (plJson.startsWith("{")) {
+                        val plNode = json.decodeFromString<JsonElement>(plJson).jsonObject
+                        val plEntries = if (plNode.containsKey("entries")) {
+                            json.decodeFromString<YtDlpPlaylist>(plJson).entries ?: emptyList()
+                        } else {
+                            listOf(json.decodeFromString<YtDlpEntry>(plJson))
+                        }
+                        for ((index, entry) in plEntries.withIndex()) {
+                            val rawTitle = entry.title ?: ""
+                            val rawId = entry.id
+                            val url = entry.url ?: ""
+                            val playlistId = when {
+                                !rawId.isNullOrBlank() && (rawId.startsWith("PL") || rawId.startsWith("RD") || rawId.startsWith("OLAK")) -> rawId
+                                url.contains("list=") -> url.substringAfter("list=").substringBefore("&").substringBefore("?")
+                                else -> null
+                            }
+                            if (!playlistId.isNullOrBlank()) {
+                                val plUrl = "https://www.youtube.com/playlist?list=$playlistId"
+                                if (songs.none { it.youtubeUrl == plUrl }) {
+                                    songs.add(
+                                        0,
+                                        Song(
+                                            id = playlistId,
+                                            title = rawTitle.ifBlank { "Playlist" },
+                                            artist = entry.uploader ?: "YouTube Playlist",
+                                            thumbnailUrl = entry.thumbnail ?: "https://i.ytimg.com/vi/$playlistId/hqdefault.jpg",
+                                            youtubeUrl = plUrl,
+                                            rawTitle = rawTitle
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Napier.w("Playlist search fallback exception: ${e.message}", tag = "DEBUG_METADATA")
+                }
+            }
+
             Napier.i("Search returned ${songs.size} results", tag = "DEBUG_METADATA")
             songs
         } catch (e: Exception) {
@@ -747,14 +938,63 @@ class YoutubeDLRepository(private val context: Context) {
     ): String = withContext(Dispatchers.IO) {
         val request = YoutubeDLRequest(song.youtubeUrl)
         request.addOption("-o", File(downloadDir, "%(id)s.%(ext)s").absolutePath)
-        request.addOption("-f", "bestaudio")
+        request.addOption("-f", "bestaudio/best")
         request.addOption("-x")
         request.addOption("--audio-format", "mp3")
-        request.addOption("--user-agent", USER_AGENT)
-        
-        YoutubeDL.getInstance().execute(request) { progress, _, _ ->
-            onProgress(progress / 100f)
+        request.addOption("--add-metadata")
+        request.addOption("--embed-thumbnail")
+        request.addOption("--convert-thumbnails", "jpg")
+
+        val cleanTitle = song.title.replace("\"", "\\\"").replace("\n", " ").trim()
+        val cleanArtist = song.artist.replace("\"", "\\\"").replace("\n", " ").trim()
+        val cleanAlbum = "MusicDLP"
+
+        var tempThumbFile: File? = null
+        val effectiveThumbUrl = if (song.thumbnailUrl.isNotBlank()) {
+            song.thumbnailUrl
+        } else if (song.youtubeUrl.contains("watch?v=")) {
+            val vId = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+            "https://i.ytimg.com/vi/$vId/hqdefault.jpg"
+        } else null
+
+        if (!effectiveThumbUrl.isNullOrBlank()) {
+            try {
+                val tempThumb = File(downloadDir, "${song.id}_thumb.jpg")
+                val conn = URL(effectiveThumbUrl).openConnection() as HttpURLConnection
+                conn.connectTimeout = 5000
+                conn.readTimeout = 5000
+                conn.inputStream.use { input ->
+                    tempThumb.outputStream().use { output -> input.copyTo(output) }
+                }
+                if (tempThumb.exists() && tempThumb.length() > 0) {
+                    tempThumbFile = tempThumb
+                }
+            } catch (e: Exception) {
+                Napier.w("Thumbnail download for embedding failed: ${e.message}", tag = "DEBUG_METADATA")
+            }
         }
+
+        if (tempThumbFile != null) {
+            request.addOption(
+                "--postprocessor-args",
+                "ffmpeg:-i \"${tempThumbFile.absolutePath}\" -map 0:a -map 1:v -c:a copy -c:v mjpeg -metadata:s:v title=\"Album cover\" -metadata:s:v comment=\"Cover (front)\" -metadata title=\"$cleanTitle\" -metadata artist=\"$cleanArtist\" -metadata album=\"$cleanAlbum\" -id3v2_version 3"
+            )
+        } else {
+            request.addOption(
+                "--postprocessor-args",
+                "ffmpeg:-metadata title=\"$cleanTitle\" -metadata artist=\"$cleanArtist\" -metadata album=\"$cleanAlbum\" -id3v2_version 3"
+            )
+        }
+        request.addOption("--user-agent", USER_AGENT)
+
+        try {
+            YoutubeDL.getInstance().execute(request) { progress, _, _ ->
+                onProgress(progress / 100f)
+            }
+        } finally {
+            tempThumbFile?.delete()
+        }
+
         val downloaded = downloadDir.listFiles()?.firstOrNull { 
             it.name.startsWith(song.id) && (it.extension == "mp3" || it.extension == "m4a" || it.extension == "webm")
         }

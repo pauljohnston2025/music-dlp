@@ -165,24 +165,20 @@ class MusicLibraryService : MediaLibraryService() {
                 }
                 ACTION_SET_MODE -> {
                     val modeStr = intent.getStringExtra("mode") ?: intent.getStringExtra(EXTRA_SWIPING_MODE) ?: SwipingMode.ONLY_NEW.name
-                    currentMode = try {
+                    val newMode = try {
                         SwipingMode.valueOf(modeStr)
                     } catch (e: Exception) {
                         SwipingMode.ONLY_NEW
                     }
-                    updateNotificationLayout(exoPlayer.currentMediaItem)
-                    notifyMediaBrowserChildrenChanged()
-                    broadcastQueueChanged()
+                    handleModeChange(newMode)
                 }
                 ACTION_CYCLE_MODE -> {
-                    currentMode = when (currentMode) {
+                    val newMode = when (currentMode) {
                         SwipingMode.ONLY_NEW -> SwipingMode.NEW_AND_LIKED
                         SwipingMode.NEW_AND_LIKED -> SwipingMode.PLAY_ALL_RECATEGORISE
                         SwipingMode.PLAY_ALL_RECATEGORISE -> SwipingMode.ONLY_NEW
                     }
-                    updateNotificationLayout(exoPlayer.currentMediaItem)
-                    notifyMediaBrowserChildrenChanged()
-                    broadcastQueueChanged()
+                    handleModeChange(newMode)
                 }
                 ACTION_JUMP_TO_SONG -> {
                     val songJson = intent.getStringExtra(EXTRA_SONG_JSON)
@@ -373,9 +369,7 @@ class MusicLibraryService : MediaLibraryService() {
             }
 
             override fun hasNextMediaItem(): Boolean {
-                val currentList = synchronized(queueLock) { activeQueue.toList() }
-                val startIdx = virtualCurrentIndex ?: currentMediaItemIndex
-                return getNextSongIndex(currentList, startIdx, currentMode) != -1
+                return true
             }
 
             override fun hasPreviousMediaItem(): Boolean {
@@ -395,10 +389,8 @@ class MusicLibraryService : MediaLibraryService() {
                 if (nextIdx != -1 && nextIdx < mediaItemCount) {
                     virtualCurrentIndex = null
                     seekTo(nextIdx, 0L)
-                } else if (nextIdx == -1) {
-                    virtualCurrentIndex = currentList.size
-                    exoPlayer.pause()
-                    broadcastQueueChanged(overrideCurrentIndex = currentList.size)
+                } else {
+                    showNoMoreSongsState()
                 }
             }
 
@@ -598,6 +590,78 @@ class MusicLibraryService : MediaLibraryService() {
             for (folderId in targetFolders) {
                 session.notifyChildrenChanged(controller, folderId, 0, null)
             }
+        }
+    }
+
+    private fun createNoMoreSongsMediaItem(mode: SwipingMode): MediaItem {
+        val messageTitle = "No more songs for playback mode: ${mode.displayName}"
+        val itemExtras = Bundle().apply {
+            putBoolean("isLiked", false)
+            putBoolean("isDisliked", false)
+            putInt("android.media.extra.PLAYBACK_STATUS", 1)
+            putBoolean("android.media.extra.IS_PLAYING", false)
+        }
+
+        return MediaItem.Builder()
+            .setMediaId("no_more_songs")
+            .setUri(Uri.parse("http://dummy/no_more_songs"))
+            .setRequestMetadata(
+                MediaItem.RequestMetadata.Builder()
+                    .setMediaUri(Uri.parse("http://dummy/no_more_songs"))
+                    .setExtras(itemExtras)
+                    .build()
+            )
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(messageTitle)
+                    .setArtist("MusicDLP")
+                    .setIsBrowsable(false)
+                    .setIsPlayable(false)
+                    .setFolderType(MediaMetadata.FOLDER_TYPE_NONE)
+                    .setExtras(itemExtras)
+                    .build()
+            )
+            .build()
+    }
+
+    private fun showNoMoreSongsState() {
+        val currentList = synchronized(queueLock) { activeQueue.toList() }
+        virtualCurrentIndex = currentList.size
+
+        val noMoreSongsItem = createNoMoreSongsMediaItem(currentMode)
+        exoPlayer.setMediaItem(noMoreSongsItem)
+        exoPlayer.prepare()
+        exoPlayer.pause()
+
+        savePlaybackState()
+        broadcastQueueChanged(overrideCurrentIndex = currentList.size)
+    }
+
+    private fun handleModeChange(newMode: SwipingMode) {
+        currentMode = newMode
+        val currentList = synchronized(queueLock) { activeQueue.toList() }
+        val isNoMoreSongs = exoPlayer.currentMediaItem?.mediaId == "no_more_songs" || virtualCurrentIndex != null
+
+        if (isNoMoreSongs) {
+            val firstPlayableIdx = getNextSongIndex(currentList, -1, currentMode)
+            if (firstPlayableIdx != -1) {
+                virtualCurrentIndex = null
+                val currentPlayingId = currentList.getOrNull(firstPlayableIdx)?.id
+                val mediaItems = currentList.map {
+                    it.toMediaItem(isCurrentSong = (it.id == currentPlayingId))
+                }
+                exoPlayer.setMediaItems(mediaItems, firstPlayableIdx, 0L)
+                exoPlayer.prepare()
+                exoPlayer.play()
+                savePlaybackState()
+                broadcastQueueChanged()
+            } else {
+                showNoMoreSongsState()
+            }
+        } else {
+            updateNotificationLayout(exoPlayer.currentMediaItem)
+            notifyMediaBrowserChildrenChanged()
+            broadcastQueueChanged()
         }
     }
 
@@ -961,6 +1025,7 @@ class MusicLibraryService : MediaLibraryService() {
                         put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
                         put(MediaStore.Audio.Media.ARTIST, song.artist)
                         put(MediaStore.Audio.Media.TITLE, song.title)
+                        put(MediaStore.Audio.Media.ALBUM, "MusicDLP")
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/MusicDLP")
                             put(MediaStore.Audio.Media.IS_PENDING, 1)
@@ -1522,14 +1587,12 @@ class MusicLibraryService : MediaLibraryService() {
                 dislikeSong(null, advance = false)
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             } else if (action == CUSTOM_ACTION_CYCLE_MODE || action == ACTION_CYCLE_MODE) {
-                currentMode = when (currentMode) {
+                val newMode = when (currentMode) {
                     SwipingMode.ONLY_NEW -> SwipingMode.NEW_AND_LIKED
                     SwipingMode.NEW_AND_LIKED -> SwipingMode.PLAY_ALL_RECATEGORISE
                     SwipingMode.PLAY_ALL_RECATEGORISE -> SwipingMode.ONLY_NEW
                 }
-                updateNotificationLayout(session.player.currentMediaItem)
-                notifyMediaBrowserChildrenChanged()
-                broadcastQueueChanged()
+                handleModeChange(newMode)
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             }
             return super.onCustomCommand(session, controller, customCommand, args)

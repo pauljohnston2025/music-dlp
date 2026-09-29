@@ -1,5 +1,6 @@
 package com.example.musicdlp.ui
 
+import com.example.musicdlp.data.PlaylistSearchResult
 import com.example.musicdlp.data.SwipingMode
 
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -18,6 +19,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -70,6 +74,7 @@ import kotlin.math.roundToInt
 fun SwipingScreen(viewModel: MusicViewModel) {
     val activePlayingList by viewModel.activePlayingList.collectAsState()
     val currentIndex by viewModel.currentIndex.collectAsState()
+    val swipingMode by viewModel.swipingMode.collectAsState()
 
     val currentSong = remember(activePlayingList, currentIndex) {
         if (currentIndex in activePlayingList.indices) activePlayingList[currentIndex] else null
@@ -135,6 +140,25 @@ fun SwipingScreen(viewModel: MusicViewModel) {
             songs = uniqueAll,
             viewModel = viewModel,
             onDismiss = { showAllPlaylistDialog = false }
+        )
+    }
+
+    val showSearchResultDialog by viewModel.showSearchResultDialog.collectAsState()
+    val searchResults by viewModel.searchResults.collectAsState()
+    val playlistSearchResults by viewModel.playlistSearchResults.collectAsState()
+    val lastSearchQuery by viewModel.lastSearchQuery.collectAsState()
+
+    if (showSearchResultDialog && (searchResults.isNotEmpty() || playlistSearchResults.isNotEmpty())) {
+        SearchResultsDialog(
+            query = lastSearchQuery,
+            playlistResults = playlistSearchResults,
+            results = searchResults,
+            onSelectPlaylist = { pl ->
+                viewModel.loadPlaylist(pl.playlistUrl)
+                viewModel.dismissSearchResultDialog()
+            },
+            onSelect = { viewModel.selectSearchResult(it) },
+            onDismiss = { viewModel.dismissSearchResultDialog() }
         )
     }
 
@@ -369,7 +393,7 @@ fun SwipingScreen(viewModel: MusicViewModel) {
                 }
             } else if (activePlayingList.isEmpty() && isBuffering) {
                 CircularProgressIndicator()
-            } else if (currentSong != null) {
+            } else if (currentSong != null && currentSong.id != "no_more_songs") {
                 key(currentIndex, currentSong.id) {
                     TinderCard(
                         song = currentSong,
@@ -379,7 +403,11 @@ fun SwipingScreen(viewModel: MusicViewModel) {
                     )
                 }
             } else {
-                Text("No more songs to swipe!")
+                Text(
+                    text = "No more songs for playback mode: ${swipingMode.displayName}",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }
@@ -1608,4 +1636,184 @@ fun AnimatedEqualizer(
             )
         }
     }
+}
+
+@Composable
+fun SearchResultsDialog(
+    query: String,
+    playlistResults: List<PlaylistSearchResult> = emptyList(),
+    results: List<Song>,
+    onSelectPlaylist: (PlaylistSearchResult) -> Unit = {},
+    onSelect: (Song) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val songPlaylists = remember(results) { results.filter { it.youtubeUrl.contains("list=") } }
+    val songs = remember(results) { results.filter { !it.youtubeUrl.contains("list=") } }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text("Search Results for \"$query\"", style = MaterialTheme.typography.titleLarge)
+        },
+        text = {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 450.dp)
+            ) {
+                if (playlistResults.isNotEmpty() || songPlaylists.isNotEmpty()) {
+                    item {
+                        Text(
+                            "Playlists & Mixes",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        )
+                    }
+                    items(playlistResults) { pl ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clickable { onSelectPlaylist(pl) },
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AsyncImage(
+                                    model = pl.thumbnailUrl,
+                                    contentDescription = pl.title,
+                                    modifier = Modifier
+                                        .size(56.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        pl.title,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    val subtitle = buildString {
+                                        append(pl.uploader.ifBlank { "YouTube Playlist" })
+                                        if (pl.songCount != null && pl.songCount > 0) {
+                                            append(" • ${pl.songCount} songs")
+                                        }
+                                    }
+                                    Text(
+                                        subtitle,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                TextButton(onClick = { onSelectPlaylist(pl) }) {
+                                    Text("Load")
+                                }
+                            }
+                        }
+                    }
+                    items(songPlaylists) { pl ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clickable { onSelect(pl) },
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AsyncImage(
+                                    model = pl.thumbnailUrl,
+                                    contentDescription = pl.title,
+                                    modifier = Modifier
+                                        .size(56.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        pl.title,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        pl.artist.ifBlank { "YouTube Playlist" },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                TextButton(onClick = { onSelect(pl) }) {
+                                    Text("Load")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (songs.isNotEmpty()) {
+                    item {
+                        Text(
+                            "Tracks & Songs",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        )
+                    }
+                    items(songs) { song ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clickable { onSelect(song) },
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AsyncImage(
+                                    model = song.thumbnailUrl,
+                                    contentDescription = song.title,
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        song.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        song.artist,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                TextButton(onClick = { onSelect(song) }) {
+                                    Text("Play")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
 }
