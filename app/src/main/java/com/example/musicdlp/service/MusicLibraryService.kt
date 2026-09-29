@@ -29,6 +29,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaConstants
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionCommand
@@ -310,15 +311,18 @@ class MusicLibraryService : MediaLibraryService() {
                                 val nextIdx = getNextSongIndex(currentList, currentIndex - 1, currentMode)
                                 if (nextIdx != -1 && nextIdx < exoPlayer.mediaItemCount) {
                                     exoPlayer.seekTo(nextIdx, 0L)
+                                    savePlaybackState()
                                     return
                                 } else {
                                     virtualCurrentIndex = currentList.size
                                     exoPlayer.pause()
+                                    savePlaybackState()
                                     broadcastQueueChanged(overrideCurrentIndex = currentList.size)
                                     return
                                 }
                             }
                         }
+                        savePlaybackState()
                         broadcastQueueChanged()
                         triggerProcessQueue()
                     }
@@ -332,8 +336,12 @@ class MusicLibraryService : MediaLibraryService() {
 
             override fun onEvents(player: Player, events: Player.Events) {
                 if (events.contains(Player.EVENT_MEDIA_METADATA_CHANGED) ||
-                    events.contains(Player.EVENT_TIMELINE_CHANGED)) {
+                    events.contains(Player.EVENT_TIMELINE_CHANGED) ||
+                    events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION) ||
+                    events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED) ||
+                    events.contains(Player.EVENT_POSITION_DISCONTINUITY)) {
                     updateNotificationLayout(player.currentMediaItem)
+                    savePlaybackState()
                     broadcastQueueChanged()
                 }
             }
@@ -439,6 +447,106 @@ class MusicLibraryService : MediaLibraryService() {
             addAction(CUSTOM_ACTION_CYCLE_MODE)
         }
         ContextCompat.registerReceiver(this, serviceCommandReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+
+        // Pre-restore saved queue and playback position if player is empty
+        serviceScope.launch(Dispatchers.IO) {
+            val app = application as? MusicDLPApplication ?: return@launch
+            val restored = restorePlaybackState(app)
+            if (restored.queue.isNotEmpty()) {
+                withContext(Dispatchers.Main) {
+                    if (exoPlayer.mediaItemCount == 0) {
+                        synchronized(queueLock) {
+                            activeQueue = restored.queue.toMutableList()
+                        }
+                        currentMode = restored.mode
+                        val currentPlayingId = restored.queue.getOrNull(restored.targetIndex)?.id
+                        val mediaItems = restored.queue.map {
+                            it.toMediaItem(isCurrentSong = (it.id == currentPlayingId))
+                        }
+                        exoPlayer.setMediaItems(mediaItems, restored.targetIndex, restored.startPositionMs)
+                        exoPlayer.prepare()
+                        broadcastQueueChanged()
+                    }
+                }
+            }
+        }
+    }
+
+    private data class RestoredPlaybackState(
+        val queue: List<Song>,
+        val targetIndex: Int,
+        val startPositionMs: Long,
+        val mode: SwipingMode
+    )
+
+    private fun savePlaybackState() {
+        try {
+            val app = application as? MusicDLPApplication ?: return
+            val prefs = app.getSharedPreferences("musicdlp_prefs", MODE_PRIVATE)
+            val currentList = synchronized(queueLock) { activeQueue.toList() }
+
+            val currentSongId = exoPlayer.currentMediaItem?.mediaId ?: ""
+            val currentIndex = if (exoPlayer.mediaItemCount > 0) exoPlayer.currentMediaItemIndex else 0
+            val currentPosition = if (exoPlayer.mediaItemCount > 0) exoPlayer.currentPosition else 0L
+            val queueIds = currentList.joinToString(",") { it.id }
+
+            prefs.edit()
+                .putString("last_played_song_id", currentSongId)
+                .putInt("last_played_index", currentIndex)
+                .putLong("last_played_position_ms", currentPosition.coerceAtLeast(0L))
+                .putString("last_played_mode", currentMode.name)
+                .putString("last_played_queue_ids", queueIds)
+                .apply()
+        } catch (e: Exception) {
+            Napier.w("Failed to save playback state: ${e.message}", tag = "DEBUG_METADATA")
+        }
+    }
+
+    private suspend fun restorePlaybackState(app: MusicDLPApplication): RestoredPlaybackState {
+        val prefs = app.getSharedPreferences("musicdlp_prefs", MODE_PRIVATE)
+        val savedSongId = prefs.getString("last_played_song_id", null)
+        val savedIndex = prefs.getInt("last_played_index", 0)
+        val savedPos = prefs.getLong("last_played_position_ms", 0L)
+        val savedModeStr = prefs.getString("last_played_mode", SwipingMode.ONLY_NEW.name) ?: SwipingMode.ONLY_NEW.name
+        val savedQueueIdsStr = prefs.getString("last_played_queue_ids", null)
+
+        val restoredMode = try {
+            SwipingMode.valueOf(savedModeStr)
+        } catch (e: Exception) {
+            SwipingMode.ONLY_NEW
+        }
+
+        val dbSongs = app.database.songDao().getAllSongs()
+        val restoredQueue = mutableListOf<Song>()
+
+        if (!savedQueueIdsStr.isNullOrBlank()) {
+            val ids = savedQueueIdsStr.split(",").map { it.trim() }.filter { it.isNotBlank() }
+            val dbMap = dbSongs.associateBy { it.id }
+            for (id in ids) {
+                dbMap[id]?.let { restoredQueue.add(it) }
+            }
+        }
+
+        val finalQueue = if (restoredQueue.isNotEmpty()) {
+            restoredQueue
+        } else if (dbSongs.isNotEmpty()) {
+            dbSongs
+        } else {
+            emptyList()
+        }
+
+        val targetIndex = if (!savedSongId.isNullOrBlank()) {
+            finalQueue.indexOfFirst { it.id == savedSongId }.let { if (it != -1) it else savedIndex }
+        } else {
+            savedIndex
+        }.coerceIn(0, (finalQueue.size - 1).coerceAtLeast(0))
+
+        return RestoredPlaybackState(
+            queue = finalQueue,
+            targetIndex = targetIndex,
+            startPositionMs = savedPos.coerceAtLeast(0L),
+            mode = restoredMode
+        )
     }
 
     private fun broadcastQueueChanged(notifyMediaBrowser: Boolean = true, overrideCurrentIndex: Int? = null) {
@@ -548,6 +656,7 @@ class MusicLibraryService : MediaLibraryService() {
         exoPlayer.prepare()
         exoPlayer.play()
 
+        savePlaybackState()
         broadcastQueueChanged()
         triggerProcessQueue()
     }
@@ -715,7 +824,7 @@ class MusicLibraryService : MediaLibraryService() {
             notifyMediaBrowserChildrenChanged()
             refreshDbCache()
             broadcastQueueChanged()
-            if (advance || !isSongPlayableInMode(updatedSong, currentMode)) {
+            if (advance) {
                 forwardingPlayer.seekToNextMediaItem()
             }
             triggerProcessQueue()
@@ -1254,6 +1363,7 @@ class MusicLibraryService : MediaLibraryService() {
     }
 
     override fun onDestroy() {
+        savePlaybackState()
         try { unregisterReceiver(serviceCommandReceiver) } catch (e: Exception) {}
 
         serviceScope.cancel()
@@ -1277,6 +1387,32 @@ class MusicLibraryService : MediaLibraryService() {
             session: MediaSession,
             controller: MediaSession.ControllerInfo
         ): MediaSession.ConnectionResult {
+            Napier.d("Controller connected: ${controller.packageName}", tag = "DEBUG_METADATA")
+
+            if (exoPlayer.mediaItemCount == 0) {
+                serviceScope.launch(Dispatchers.IO) {
+                    val app = application as? MusicDLPApplication ?: return@launch
+                    val restored = restorePlaybackState(app)
+                    if (restored.queue.isNotEmpty()) {
+                        withContext(Dispatchers.Main) {
+                            if (exoPlayer.mediaItemCount == 0) {
+                                synchronized(queueLock) {
+                                    activeQueue = restored.queue.toMutableList()
+                                }
+                                currentMode = restored.mode
+                                val currentPlayingId = restored.queue.getOrNull(restored.targetIndex)?.id
+                                val mediaItems = restored.queue.map {
+                                    it.toMediaItem(isCurrentSong = (it.id == currentPlayingId))
+                                }
+                                exoPlayer.setMediaItems(mediaItems, restored.targetIndex, restored.startPositionMs)
+                                exoPlayer.prepare()
+                                broadcastQueueChanged()
+                            }
+                        }
+                    }
+                }
+            }
+
             val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
                 .add(customCommandLike)
                 .add(customCommandDislike)
@@ -1292,6 +1428,75 @@ class MusicLibraryService : MediaLibraryService() {
                 .setAvailablePlayerCommands(playerCommands)
                 .setCustomLayout(layout)
                 .build()
+        }
+
+        @Suppress("DEPRECATION")
+        @OptIn(UnstableApi::class)
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            Napier.d("onPlaybackResumption requested by ${controller.packageName}", tag = "DEBUG_METADATA")
+            val settableFuture = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
+
+            serviceScope.launch(Dispatchers.IO) {
+                try {
+                    val app = application as MusicDLPApplication
+                    val currentList = synchronized(queueLock) { activeQueue.toList() }
+
+                    if (currentList.isNotEmpty() && exoPlayer.mediaItemCount > 0) {
+                        withContext(Dispatchers.Main) {
+                            val currentPlayingId = exoPlayer.currentMediaItem?.mediaId
+                            val currentIdx = exoPlayer.currentMediaItemIndex.coerceIn(0, currentList.size - 1)
+                            val currentPos = exoPlayer.currentPosition.coerceAtLeast(0L)
+
+                            val resultItems = currentList.map {
+                                it.toMediaItem(isCurrentSong = (it.id == currentPlayingId))
+                            }
+
+                            if (!exoPlayer.isPlaying) {
+                                exoPlayer.prepare()
+                                exoPlayer.play()
+                            }
+
+                            settableFuture.set(MediaSession.MediaItemsWithStartPosition(resultItems, currentIdx, currentPos))
+                        }
+                    } else {
+                        val restored = restorePlaybackState(app)
+                        val restoredQueue = restored.queue
+                        val targetIndex = restored.targetIndex
+                        val startPos = restored.startPositionMs
+                        val currentPlayingId = restoredQueue.getOrNull(targetIndex)?.id
+
+                        val resultItems = restoredQueue.map {
+                            it.toMediaItem(isCurrentSong = (it.id == currentPlayingId))
+                        }
+
+                        withContext(Dispatchers.Main) {
+                            if (restoredQueue.isNotEmpty()) {
+                                synchronized(queueLock) {
+                                    activeQueue = restoredQueue.toMutableList()
+                                }
+                                currentMode = restored.mode
+                                exoPlayer.setMediaItems(resultItems, targetIndex, startPos)
+                                exoPlayer.prepare()
+                                exoPlayer.play()
+
+                                settableFuture.set(MediaSession.MediaItemsWithStartPosition(resultItems, targetIndex, startPos))
+                                broadcastQueueChanged()
+                                triggerProcessQueue()
+                            } else {
+                                settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Napier.e("onPlaybackResumption failed: ${t.message}", t, tag = "DEBUG_METADATA")
+                    settableFuture.set(MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L))
+                }
+            }
+
+            return settableFuture
         }
 
         override fun onDisconnected(
@@ -1341,6 +1546,8 @@ class MusicLibraryService : MediaLibraryService() {
                 putBoolean("CONTENT_STYLE_SUPPORTED", true)
                 putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
                 putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
+                putBoolean("android.media.browse.EXTRA_RECENT", true)
+                putBoolean("EXTRA_RECENT", true)
             }
 
             if (params?.extras != null) {
@@ -1390,6 +1597,10 @@ class MusicLibraryService : MediaLibraryService() {
                                 createBrowsableItem("DISLIKED", "Disliked Songs"),
                                 createBrowsableItem("SETTINGS", "Settings")
                             )
+                        }
+                        "RECENT", "RECENTLY_PLAYED" -> {
+                            val songList = currentList.ifEmpty { app.database.songDao().getAllSongs() }
+                            songList.map { it.toMediaItem(parentId = "RECENT", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NOW_PLAYING" -> {
                             val songList = currentList.ifEmpty { app.database.songDao().getAllSongs() }
