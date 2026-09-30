@@ -75,6 +75,11 @@ data class YtDlpPlaylist(
 )
 
 @Serializable
+data class YtDlpThumbnail(
+    val url: String? = null
+)
+
+@Serializable
 data class YtDlpEntry(
     val id: String? = null,
     val url: String? = null,
@@ -83,6 +88,8 @@ data class YtDlpEntry(
     val creator: String? = null,
     val channel: String? = null,
     val thumbnail: String? = null,
+    val thumbnails: List<YtDlpThumbnail>? = null,
+    val entries: List<YtDlpEntry>? = null,
     val duration: Double? = null,
     val isrc: String? = null,
     val artist: String? = null,
@@ -558,13 +565,36 @@ class YoutubeDLRepository(private val context: Context) {
                     rawId.startsWith("/playlist?list=") -> rawId.substringAfter("/playlist?list=")
                     else -> rawId
                 }
-                val thumbnail = if (!entry.thumbnail.isNullOrBlank()) {
-                    entry.thumbnail
-                } else if (playlistId.isNotBlank() && !playlistId.startsWith("http")) {
-                    "https://i.ytimg.com/vi/$playlistId/hqdefault.jpg"
-                } else {
-                    ""
+
+                var foundThumb = ""
+
+                // 1. Check entry.thumbnails for a valid video thumbnail (contains /vi/ and 11-char video ID)
+                entry.thumbnails?.mapNotNull { it.url }?.forEach { url ->
+                    if (foundThumb.isBlank() && url.contains("/vi/") && !url.contains("/vi/PL") && !url.contains("/vi/RD") && !url.contains("/vi/OLAK")) {
+                        foundThumb = url
+                    }
                 }
+
+                // 2. Check entry.thumbnail
+                if (foundThumb.isBlank() && !entry.thumbnail.isNullOrBlank()) {
+                    val t = entry.thumbnail
+                    if (!t.contains("/vi/PL") && !t.contains("/vi/RD") && !t.contains("/vi/OLAK")) {
+                        foundThumb = t
+                    }
+                }
+
+                // 3. Check entry.url or entry.id for a video ID
+                if (foundThumb.isBlank()) {
+                    val videoId = when {
+                        !entry.id.isNullOrBlank() && entry.id.length == 11 && !entry.id.startsWith("PL") && !entry.id.startsWith("RD") -> entry.id
+                        entry.url?.contains("watch?v=") == true -> entry.url.substringAfter("watch?v=").substringBefore("&").substringBefore("?")
+                        else -> ""
+                    }
+                    if (videoId.isNotBlank()) {
+                        foundThumb = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+                    }
+                }
+
                 val playlistUrl = if (playlistId.startsWith("http")) playlistId else "https://www.youtube.com/playlist?list=$playlistId"
 
                 results.add(
@@ -573,7 +603,7 @@ class YoutubeDLRepository(private val context: Context) {
                         title = rawTitle,
                         uploader = uploader,
                         songCount = count,
-                        thumbnailUrl = thumbnail,
+                        thumbnailUrl = foundThumb,
                         playlistUrl = playlistUrl
                     )
                 )
@@ -584,21 +614,39 @@ class YoutubeDLRepository(private val context: Context) {
         try {
             val request = YoutubeDLRequest(searchUrl)
             request.addOption("--flat-playlist")
+            request.addOption("--playlist-end", "5")
             request.addOption("--dump-single-json")
             val response = YoutubeDL.getInstance().execute(request)
-            var results = parsePlaylistJson(response.out.trim())
+            var results = parsePlaylistJson(response.out.trim()).take(5)
 
             if (results.isEmpty()) {
-                Napier.d("Web search returned 0 playlists, trying ytsearch10 fallback...", tag = "DEBUG_METADATA")
-                val fallbackReq = YoutubeDLRequest("ytsearch10:$cleanQuery playlist")
+                Napier.d("Web search returned 0 playlists, trying ytsearch5 fallback...", tag = "DEBUG_METADATA")
+                val fallbackReq = YoutubeDLRequest("ytsearch5:$cleanQuery playlist")
                 fallbackReq.addOption("--flat-playlist")
+                fallbackReq.addOption("--playlist-end", "5")
                 fallbackReq.addOption("--dump-single-json")
                 val fallbackResp = YoutubeDL.getInstance().execute(fallbackReq)
-                results = parsePlaylistJson(fallbackResp.out.trim())
+                results = parsePlaylistJson(fallbackResp.out.trim()).take(5)
             }
 
-            Napier.i("Playlist search returned ${results.size} playlists", tag = "DEBUG_METADATA")
-            results
+            // Enrich missing thumbnails by loading the first song's thumbnail for any playlist with empty thumbnailUrl
+            val enrichedResults = results.map { pl ->
+                if (pl.thumbnailUrl.isNotBlank()) {
+                    pl
+                } else {
+                    try {
+                        val firstSong = getPlaylistSongs(pl.playlistUrl).firstOrNull()
+                        if (firstSong != null && firstSong.thumbnailUrl.isNotBlank()) {
+                            pl.copy(thumbnailUrl = firstSong.thumbnailUrl)
+                        } else pl
+                    } catch (e: Exception) {
+                        pl
+                    }
+                }
+            }
+
+            Napier.i("Playlist search returned ${enrichedResults.size} playlists", tag = "DEBUG_METADATA")
+            enrichedResults
         } catch (e: Exception) {
             Napier.e("Playlist search failed: ${e.message}", tag = "DEBUG_METADATA")
             emptyList()
@@ -613,7 +661,7 @@ class YoutubeDLRepository(private val context: Context) {
         val searchUrl = if (isUrl) {
             cleanQuery
         } else {
-            "ytmusicsearch20:$cleanQuery"
+            "ytsearch20:$cleanQuery"
         }
 
         Napier.d("Searching with query: $cleanQuery (URL: $searchUrl)", tag = "DEBUG_METADATA")
@@ -715,7 +763,8 @@ class YoutubeDLRepository(private val context: Context) {
                                 isDisliked = false,
                                 isrc = entry.isrc,
                                 rawTitle = rawTitle.ifBlank { "Unknown Title" },
-                                isMetadataCleaned = false
+                                isMetadataCleaned = false,
+                                durationSeconds = entry.duration
                             )
                         )
                     }
@@ -739,54 +788,6 @@ class YoutubeDLRepository(private val context: Context) {
                             )
                         }
                     }
-                }
-            }
-
-            // If query is not a URL and no playlists were in the top results, query for playlists specifically
-            val hasPlaylists = songs.any { it.youtubeUrl.contains("list=") }
-            if (!isUrl && !hasPlaylists) {
-                try {
-                    val playlistSearchUrl = "ytsearch10:$cleanQuery playlist"
-                    val plReq = YoutubeDLRequest(playlistSearchUrl)
-                    plReq.addOption("--flat-playlist")
-                    plReq.addOption("--dump-single-json")
-                    val plJson = YoutubeDL.getInstance().execute(plReq).out.trim()
-                    if (plJson.startsWith("{")) {
-                        val plNode = json.decodeFromString<JsonElement>(plJson).jsonObject
-                        val plEntries = if (plNode.containsKey("entries")) {
-                            json.decodeFromString<YtDlpPlaylist>(plJson).entries ?: emptyList()
-                        } else {
-                            listOf(json.decodeFromString<YtDlpEntry>(plJson))
-                        }
-                        for ((index, entry) in plEntries.withIndex()) {
-                            val rawTitle = entry.title ?: ""
-                            val rawId = entry.id
-                            val url = entry.url ?: ""
-                            val playlistId = when {
-                                !rawId.isNullOrBlank() && (rawId.startsWith("PL") || rawId.startsWith("RD") || rawId.startsWith("OLAK")) -> rawId
-                                url.contains("list=") -> url.substringAfter("list=").substringBefore("&").substringBefore("?")
-                                else -> null
-                            }
-                            if (!playlistId.isNullOrBlank()) {
-                                val plUrl = "https://www.youtube.com/playlist?list=$playlistId"
-                                if (songs.none { it.youtubeUrl == plUrl }) {
-                                    songs.add(
-                                        0,
-                                        Song(
-                                            id = playlistId,
-                                            title = rawTitle.ifBlank { "Playlist" },
-                                            artist = entry.uploader ?: "YouTube Playlist",
-                                            thumbnailUrl = entry.thumbnail ?: "https://i.ytimg.com/vi/$playlistId/hqdefault.jpg",
-                                            youtubeUrl = plUrl,
-                                            rawTitle = rawTitle
-                                        )
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    Napier.w("Playlist search fallback exception: ${e.message}", tag = "DEBUG_METADATA")
                 }
             }
 
@@ -854,7 +855,8 @@ class YoutubeDLRepository(private val context: Context) {
                             isLiked = false,
                             isDisliked = false,
                             isrc = entry.isrc,
-                            rawTitle = rawTitle.ifBlank { "Unknown Title" }
+                            rawTitle = rawTitle.ifBlank { "Unknown Title" },
+                            durationSeconds = entry.duration
                         )
                     )
                 }
@@ -936,7 +938,14 @@ class YoutubeDLRepository(private val context: Context) {
         downloadDir: File, 
         onProgress: (Float) -> Unit
     ): String = withContext(Dispatchers.IO) {
-        val request = YoutubeDLRequest(song.youtubeUrl)
+        val cleanUrl = if (song.youtubeUrl.contains("watch?v=")) {
+            val videoId = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+            "https://www.youtube.com/watch?v=$videoId"
+        } else {
+            song.youtubeUrl
+        }
+        val request = YoutubeDLRequest(cleanUrl)
+        request.addOption("--no-playlist")
         request.addOption("-o", File(downloadDir, "%(id)s.%(ext)s").absolutePath)
         request.addOption("-f", "bestaudio/best")
         request.addOption("-x")
@@ -945,54 +954,23 @@ class YoutubeDLRepository(private val context: Context) {
         request.addOption("--embed-thumbnail")
         request.addOption("--convert-thumbnails", "jpg")
 
-        val cleanTitle = song.title.replace("\"", "\\\"").replace("\n", " ").trim()
-        val cleanArtist = song.artist.replace("\"", "\\\"").replace("\n", " ").trim()
+        val cleanTitle = song.title.replace("\"", "'").replace("\n", " ").trim()
+        val cleanArtist = song.artist.replace("\"", "'").replace("\n", " ").trim()
         val cleanAlbum = "MusicDLP"
 
-        var tempThumbFile: File? = null
-        val effectiveThumbUrl = if (song.thumbnailUrl.isNotBlank()) {
-            song.thumbnailUrl
-        } else if (song.youtubeUrl.contains("watch?v=")) {
-            val vId = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
-            "https://i.ytimg.com/vi/$vId/hqdefault.jpg"
-        } else null
-
-        if (!effectiveThumbUrl.isNullOrBlank()) {
-            try {
-                val tempThumb = File(downloadDir, "${song.id}_thumb.jpg")
-                val conn = URL(effectiveThumbUrl).openConnection() as HttpURLConnection
-                conn.connectTimeout = 5000
-                conn.readTimeout = 5000
-                conn.inputStream.use { input ->
-                    tempThumb.outputStream().use { output -> input.copyTo(output) }
-                }
-                if (tempThumb.exists() && tempThumb.length() > 0) {
-                    tempThumbFile = tempThumb
-                }
-            } catch (e: Exception) {
-                Napier.w("Thumbnail download for embedding failed: ${e.message}", tag = "DEBUG_METADATA")
-            }
-        }
-
-        if (tempThumbFile != null) {
-            request.addOption(
-                "--postprocessor-args",
-                "ffmpeg:-i \"${tempThumbFile.absolutePath}\" -map 0:a -map 1:v -c:a copy -c:v mjpeg -metadata:s:v title=\"Album cover\" -metadata:s:v comment=\"Cover (front)\" -metadata title=\"$cleanTitle\" -metadata artist=\"$cleanArtist\" -metadata album=\"$cleanAlbum\" -id3v2_version 3"
-            )
-        } else {
-            request.addOption(
-                "--postprocessor-args",
-                "ffmpeg:-metadata title=\"$cleanTitle\" -metadata artist=\"$cleanArtist\" -metadata album=\"$cleanAlbum\" -id3v2_version 3"
-            )
-        }
+        request.addOption(
+            "--postprocessor-args",
+            "ffmpeg_o:-metadata title=\"$cleanTitle\" -metadata artist=\"$cleanArtist\" -metadata album=\"$cleanAlbum\" -id3v2_version 3"
+        )
         request.addOption("--user-agent", USER_AGENT)
 
         try {
             YoutubeDL.getInstance().execute(request) { progress, _, _ ->
                 onProgress(progress / 100f)
             }
-        } finally {
-            tempThumbFile?.delete()
+        } catch (e: Exception) {
+            Napier.e("Download failed for ${song.title}: ${e.message}", e, tag = "DEBUG_METADATA")
+            throw e
         }
 
         val downloaded = downloadDir.listFiles()?.firstOrNull { 

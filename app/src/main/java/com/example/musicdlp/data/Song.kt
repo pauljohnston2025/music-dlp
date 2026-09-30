@@ -12,6 +12,7 @@ import androidx.room.PrimaryKey
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.util.Locale
 
 @Serializable
 enum class SwipingMode(val displayName: String) {
@@ -40,16 +41,37 @@ data class Song(
     val isDisliked: Boolean = false,
     val isrc: String? = null,
     val rawTitle: String? = null,
+    @ColumnInfo(defaultValue = "NULL")
     val isMetadataCleaned: Boolean? = false,
+    @ColumnInfo(defaultValue = "NULL")
     val likedAt: Long? = null,
+    @ColumnInfo(defaultValue = "NULL")
     val dislikedAt: Long? = null,
+    @ColumnInfo(defaultValue = "NULL")
     val metadataSource: String? = null,
+    @ColumnInfo(defaultValue = "NULL")
     val alternateYoutubeUrls: String? = null,
     @ColumnInfo(defaultValue = "0")
     val createdAt: Long = System.currentTimeMillis(),
     @ColumnInfo(defaultValue = "0")
-    val updatedAt: Long = System.currentTimeMillis()
+    val updatedAt: Long = System.currentTimeMillis(),
+    @ColumnInfo(defaultValue = "NULL")
+    val durationSeconds: Double? = null
 ) {
+    fun getFormattedDuration(): String? {
+        val sec = durationSeconds ?: return null
+        if (sec <= 0) return null
+        val totalSec = sec.toLong()
+        val mins = totalSec / 60
+        val secs = totalSec % 60
+        val hours = mins / 60
+        val remMins = mins % 60
+        return if (hours > 0) {
+            String.format(Locale.US, "%d:%02d:%02d", hours, remMins, secs)
+        } else {
+            String.format(Locale.US, "%d:%02d", remMins, secs)
+        }
+    }
     fun getAlternateVersionsList(json: Json = Json { ignoreUnknownKeys = true }): List<AlternateVersion> {
         if (alternateYoutubeUrls.isNullOrBlank()) return emptyList()
         return try {
@@ -128,6 +150,17 @@ fun Song.toMediaItem(
         if (!parentId.isNullOrBlank()) {
             putString("parentId", parentId)
         }
+        putBoolean("CONTENT_STYLE_SUPPORTED", true)
+        putInt("CONTENT_STYLE_BROWSABLE_HINT", 2)
+        putInt("CONTENT_STYLE_PLAYABLE_HINT", 2)
+        putInt(
+            MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
+            MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM
+        )
+        putInt(
+            MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
+            MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM
+        )
         // absolutely no idea why the below seems inverted, the below give s green dot next to the
         // artist name thats playing, making it look like its playing
         // if I invert it all the songs get a green dot and the one thats playing is empty (i guess to indicate you can click it?)

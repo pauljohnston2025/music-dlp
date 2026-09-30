@@ -80,6 +80,8 @@ class MusicLibraryService : MediaLibraryService() {
         const val ACTION_PLAY_PAUSE = "com.example.musicdlp.ACTION_PLAY_PAUSE"
         const val ACTION_NEXT = "com.example.musicdlp.ACTION_NEXT"
         const val ACTION_PREVIOUS = "com.example.musicdlp.ACTION_PREVIOUS"
+        const val ACTION_DOWNLOAD_PROGRESS = "com.example.musicdlp.ACTION_DOWNLOAD_PROGRESS"
+        const val ACTION_RETRY_DOWNLOAD = "com.example.musicdlp.ACTION_RETRY_DOWNLOAD"
 
         const val EXTRA_QUEUE_JSON = "extra_queue_json"
         const val EXTRA_SONG_JSON = "extra_song_json"
@@ -91,6 +93,9 @@ class MusicLibraryService : MediaLibraryService() {
         const val EXTRA_IS_BUFFERING = "extra_is_buffering"
         const val EXTRA_SEEK_TO_MS = "extra_seek_to_ms"
         const val EXTRA_DELETED_SONG_ID = "extra_deleted_song_id"
+        const val EXTRA_DOWNLOAD_SONG_ID = "extra_download_song_id"
+        const val EXTRA_DOWNLOAD_PROGRESS = "extra_download_progress"
+        const val EXTRA_DOWNLOAD_COMPLETED = "extra_download_completed"
     }
 
     private var mediaSession: MediaLibrarySession? = null
@@ -122,6 +127,9 @@ class MusicLibraryService : MediaLibraryService() {
     private val customCommandCycleMode = SessionCommand(CUSTOM_ACTION_CYCLE_MODE, Bundle.EMPTY)
 
     private val searchResultsCache = mutableMapOf<String, List<MediaItem>>()
+    private val searchResultsSongsCache = mutableMapOf<String, List<MediaItem>>()
+    private val searchResultsPlaylistsCache = mutableMapOf<String, List<MediaItem>>()
+    private val playlistCache = mutableMapOf<String, List<Song>>()
     private val bufferedStreamUrls = mutableMapOf<String, String>()
 
     private val serviceCommandReceiver = object : BroadcastReceiver() {
@@ -209,6 +217,16 @@ class MusicLibraryService : MediaLibraryService() {
                 ACTION_PREVIOUS -> forwardingPlayer.seekToPreviousMediaItem()
                 ACTION_PLAY_PAUSE -> {
                     if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+                }
+                ACTION_RETRY_DOWNLOAD -> {
+                    val songJson = intent.getStringExtra(EXTRA_SONG_JSON)
+                    val songToRetry = if (!songJson.isNullOrBlank()) {
+                        try { json.decodeFromString<Song>(songJson) } catch (e: Exception) { null }
+                    } else null
+
+                    if (songToRetry != null) {
+                        retryDownloadSong(songToRetry)
+                    }
                 }
             }
         }
@@ -434,6 +452,7 @@ class MusicLibraryService : MediaLibraryService() {
             addAction(ACTION_PLAY_PAUSE)
             addAction(ACTION_NEXT)
             addAction(ACTION_PREVIOUS)
+            addAction(ACTION_RETRY_DOWNLOAD)
             addAction(CUSTOM_ACTION_LIKE)
             addAction(CUSTOM_ACTION_DISLIKE)
             addAction(CUSTOM_ACTION_CYCLE_MODE)
@@ -858,6 +877,7 @@ class MusicLibraryService : MediaLibraryService() {
                         )
                     )
                     songDao.insertSong(updated)
+                    saveLikedSong(updated)
                 } else {
                     val newLiked = songToLike.copy(isLiked = true, isDisliked = false, likedAt = System.currentTimeMillis())
                     songDao.insertSong(newLiked)
@@ -892,6 +912,37 @@ class MusicLibraryService : MediaLibraryService() {
                 forwardingPlayer.seekToNextMediaItem()
             }
             triggerProcessQueue()
+        }
+    }
+
+    fun retryDownloadSong(targetSong: Song) {
+        serviceScope.launch(Dispatchers.IO) {
+            val app = application as MusicDLPApplication
+            val songDao = app.database.songDao()
+
+            val updatedSong = targetSong.copy(isLiked = true, isDisliked = false)
+            songDao.insertSong(updatedSong)
+
+            val tempDir = File(app.cacheDir, "downloads")
+            if (tempDir.exists()) {
+                tempDir.listFiles()?.filter { it.name.contains(targetSong.id) }?.forEach {
+                    try { it.delete() } catch (e: Exception) {}
+                }
+            }
+
+            broadcastDownloadProgress(targetSong.id, 0.01f, isCompleted = false)
+            saveLikedSong(updatedSong)
+        }
+    }
+
+    private fun createGridExtras(): Bundle {
+        return Bundle().apply {
+            putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM)
+            putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM)
+            putInt("CONTENT_STYLE_BROWSABLE_HINT", 2)
+            putInt("CONTENT_STYLE_PLAYABLE_HINT", 2)
+            putBoolean("CONTENT_STYLE_SUPPORTED", true)
+            putBoolean("android.media.browse.CONTENT_STYLE_SUPPORTED", true)
         }
     }
 
@@ -989,6 +1040,16 @@ class MusicLibraryService : MediaLibraryService() {
         }
     }
 
+    private fun broadcastDownloadProgress(songId: String, progress: Float, isCompleted: Boolean) {
+        val intent = Intent(ACTION_DOWNLOAD_PROGRESS).apply {
+            putExtra(EXTRA_DOWNLOAD_SONG_ID, songId)
+            putExtra(EXTRA_DOWNLOAD_PROGRESS, progress)
+            putExtra(EXTRA_DOWNLOAD_COMPLETED, isCompleted)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
+    }
+
     private fun saveLikedSong(song: Song) {
         serviceScope.launch(Dispatchers.IO) {
             downloadSemaphore.withPermit {
@@ -1007,6 +1068,8 @@ class MusicLibraryService : MediaLibraryService() {
 
                     if (finalFile.exists()) return@withPermit
 
+                    broadcastDownloadProgress(song.id, 0.01f, isCompleted = false)
+
                     val downloadedPath: String = if (song.youtubeUrl.startsWith("content://") || song.youtubeUrl.startsWith("file://") || song.youtubeUrl.startsWith("/")) {
                         val linkFile = File(app.cacheDir, finalFileName)
                         try { Os.link(song.youtubeUrl, linkFile.absolutePath) } catch (e: Exception) { File(song.youtubeUrl).copyTo(linkFile, overwrite = true) }
@@ -1014,7 +1077,10 @@ class MusicLibraryService : MediaLibraryService() {
                     } else {
                         val tempDir = File(app.cacheDir, "downloads")
                         if (!tempDir.exists()) tempDir.mkdirs()
-                        repository.downloadSong(song.copy(isLiked = true), tempDir) { progress -> }
+                        tempDir.listFiles()?.filter { it.name.startsWith(song.id) }?.forEach { try { it.delete() } catch (e: Exception) {} }
+                        repository.downloadSong(song.copy(isLiked = true), tempDir) { progress ->
+                            broadcastDownloadProgress(song.id, progress, isCompleted = false)
+                        }
                     }
 
                     val fileToInsert = File(downloadedPath)
@@ -1039,8 +1105,10 @@ class MusicLibraryService : MediaLibraryService() {
                         resolver.update(uri, details, null, null)
                     }
                     if (fileToInsert.parentFile?.name == "downloads" || fileToInsert.parentFile?.absolutePath == app.cacheDir.absolutePath) fileToInsert.delete()
+                    broadcastDownloadProgress(song.id, 1.0f, isCompleted = true)
                 } catch (e: Exception) {
                     Napier.e("Failed to download song ${song.title}: ${e.message}", e)
+                    broadcastDownloadProgress(song.id, 0f, isCompleted = true)
                 }
             }
         }
@@ -1604,17 +1672,15 @@ class MusicLibraryService : MediaLibraryService() {
             browser: MediaSession.ControllerInfo,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<MediaItem>> {
-            val rootExtras = Bundle().apply {
+            val rootExtras = createGridExtras().apply {
                 putBoolean("android.media.browse.SEARCH_SUPPORTED", true)
-                putBoolean("CONTENT_STYLE_SUPPORTED", true)
-                putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
-                putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
                 putBoolean("android.media.browse.EXTRA_RECENT", true)
                 putBoolean("EXTRA_RECENT", true)
             }
 
             if (params?.extras != null) {
                 rootExtras.putAll(params.extras)
+                rootExtras.putAll(createGridExtras())
             }
 
             val libraryParams = LibraryParams.Builder()
@@ -1654,11 +1720,11 @@ class MusicLibraryService : MediaLibraryService() {
                     val children = when (parentId.uppercase()) {
                         "ROOT", "/", "MEDIA_ROOT" -> {
                             listOf(
-                                createBrowsableItem("NOW_PLAYING", "Now Playing"),
+                                createBrowsableItem("NOW_PLAYING", "Now Playing", gridFormat=false),
                                 createBrowsableItem("NEW", "New Songs"),
                                 createBrowsableItem("LIKED", "Liked Songs"),
                                 createBrowsableItem("DISLIKED", "Disliked Songs"),
-                                createBrowsableItem("SETTINGS", "Settings")
+                                createBrowsableItem("SETTINGS", "Settings", gridFormat=false)
                             )
                         }
                         "RECENT", "RECENTLY_PLAYED" -> {
@@ -1679,19 +1745,19 @@ class MusicLibraryService : MediaLibraryService() {
                             )
                         }
                         "NOW_PLAYING_LIKED" -> {
-                            val liked = currentList.filter { it.isLiked }.ifEmpty { app.database.songDao().getLikedSongsList() }
+                            val liked = currentList.filter { it.isLiked }
                             liked.map { it.toMediaItem(parentId = "NOW_PLAYING_LIKED", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NOW_PLAYING_DISLIKED" -> {
-                            val disliked = currentList.filter { it.isDisliked }.ifEmpty { app.database.songDao().getDislikedSongsList() }
+                            val disliked = currentList.filter { it.isDisliked }
                             disliked.map { it.toMediaItem(parentId = "NOW_PLAYING_DISLIKED", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NOW_PLAYING_NEW" -> {
-                            val newSongs = currentList.filter { !it.isLiked && !it.isDisliked }.ifEmpty { app.database.songDao().getNewSongsList() }
+                            val newSongs = currentList.filter { !it.isLiked && !it.isDisliked }
                             newSongs.map { it.toMediaItem(parentId = "NOW_PLAYING_NEW", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NOW_PLAYING_ALL" -> {
-                            val songList = currentList.ifEmpty { app.database.songDao().getAllSongs() }
+                            val songList = currentList
                             songList.map { it.toMediaItem(parentId = "NOW_PLAYING_ALL", isCurrentSong = (it.id == currentPlayingId)) }
                         }
                         "NEW" -> {
@@ -1704,7 +1770,7 @@ class MusicLibraryService : MediaLibraryService() {
                         }
                         "SETTINGS" -> {
                             listOf(
-                                createBrowsableItem("SETTINGS_PLAYBACK_MODE", "Playback Mode", "Current: ${currentMode.displayName}")
+                                createBrowsableItem("SETTINGS_PLAYBACK_MODE", "Playback Mode", "Current: ${currentMode.displayName}", gridFormat = false)
                             )
                         }
                         "SETTINGS_PLAYBACK_MODE" -> {
@@ -1751,7 +1817,36 @@ class MusicLibraryService : MediaLibraryService() {
                             val disliked = app.database.songDao().getDislikedSongsList()
                             disliked.map { it.toMediaItem(parentId = "DISLIKED", isCurrentSong = (it.id == currentPlayingId)) }
                         }
-                        else -> emptyList()
+                        else -> {
+                            when {
+                                parentId.startsWith("SEARCH_SONGS_") -> {
+                                    val query = parentId.substringAfter("SEARCH_SONGS_")
+                                    searchResultsSongsCache[query] ?: run {
+                                        performSearchInternal(query)
+                                        searchResultsSongsCache[query] ?: emptyList()
+                                    }
+                                }
+                                parentId.startsWith("SEARCH_PLAYLISTS_") -> {
+                                    val query = parentId.substringAfter("SEARCH_PLAYLISTS_")
+                                    searchResultsPlaylistsCache[query] ?: run {
+                                        performSearchInternal(query)
+                                        searchResultsPlaylistsCache[query] ?: emptyList()
+                                    }
+                                }
+                                parentId.startsWith("PLAYLIST_") || parentId.contains("list=") -> {
+                                    val playlistUrl = if (parentId.startsWith("PLAYLIST_")) {
+                                        parentId.substringAfter("PLAYLIST_")
+                                    } else parentId
+
+                                    val repo = YoutubeDLRepository(app)
+                                    val playlistSongs = playlistCache[playlistUrl] ?: repo.getPlaylistSongs(playlistUrl).also {
+                                        if (it.isNotEmpty()) playlistCache[playlistUrl] = it
+                                    }
+                                    playlistSongs.map { it.toMediaItem(parentId = parentId, isCurrentSong = (it.id == currentPlayingId)) }
+                                }
+                                else -> emptyList()
+                            }
+                        }
                     }
 
                     val paginatedChildren = if (pageSize > 0 && page >= 0) {
@@ -1762,12 +1857,10 @@ class MusicLibraryService : MediaLibraryService() {
                         children
                     }
 
-                    val returnParams = params ?: LibraryParams.Builder().setExtras(
-                        Bundle().apply {
-                            putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
-                            putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
-                        }
-                    ).build()
+                    val returnExtras = Bundle(params?.extras ?: Bundle()).apply {
+                        putAll(createGridExtras())
+                    }
+                    val returnParams = LibraryParams.Builder().setExtras(returnExtras).build()
 
                     settableFuture.set(LibraryResult.ofItemList(ImmutableList.copyOf(paginatedChildren), returnParams))
                 } catch (t: Throwable) {
@@ -1800,6 +1893,25 @@ class MusicLibraryService : MediaLibraryService() {
                     val mediaId = clickedItem.mediaId
                     val parentId = (clickedItem.mediaMetadata.extras?.getString("parentId")
                         ?: clickedItem.requestMetadata.extras?.getString("parentId"))?.uppercase() ?: ""
+
+                    if (mediaId.startsWith("PLAYLIST_") || mediaId.contains("list=")) {
+                        val playlistUrl = if (mediaId.startsWith("PLAYLIST_")) mediaId.substringAfter("PLAYLIST_") else mediaId
+                        val repo = YoutubeDLRepository(app)
+                        val playlistSongs = playlistCache[playlistUrl] ?: repo.getPlaylistSongs(playlistUrl).also {
+                            if (it.isNotEmpty()) playlistCache[playlistUrl] = it
+                        }
+                        if (playlistSongs.isNotEmpty()) {
+                            val firstSongId = playlistSongs.first().id
+                            val resultItems = playlistSongs.map {
+                                it.toMediaItem(parentId = mediaId, isCurrentSong = (it.id == firstSongId))
+                            }
+                            withContext(Dispatchers.Main) {
+                                setQueueAndPlay(playlistSongs, firstSongId, 0, 0L)
+                                settableFuture.set(MediaSession.MediaItemsWithStartPosition(resultItems, 0, 0L))
+                            }
+                            return@launch
+                        }
+                    }
 
                     if (mediaId.startsWith("MODE_")) {
                         val modeStr = when (mediaId) {
@@ -1849,26 +1961,59 @@ class MusicLibraryService : MediaLibraryService() {
 
                     val currentList = synchronized(queueLock) { activeQueue.toList() }
 
-                    val listToPlay = when (parentId) {
-                        "LIKED" -> app.database.songDao().getLikedSongsList()
-                        "DISLIKED" -> app.database.songDao().getDislikedSongsList()
-                        "NEW" -> {
+                    val listToPlay = when {
+                        parentId.startsWith("PLAYLIST_") || parentId.contains("list=") -> {
+                            val playlistUrl = if (parentId.startsWith("PLAYLIST_")) parentId.substringAfter("PLAYLIST_") else parentId
+                            val repo = YoutubeDLRepository(app)
+                            playlistCache[playlistUrl] ?: repo.getPlaylistSongs(playlistUrl).also {
+                                if (it.isNotEmpty()) playlistCache[playlistUrl] = it
+                            }
+                        }
+                        parentId == "LIKED" -> app.database.songDao().getLikedSongsList()
+                        parentId == "DISLIKED" -> app.database.songDao().getDislikedSongsList()
+                        parentId == "NEW" -> {
                             val dbNew = app.database.songDao().getNewSongsList()
                             val queueNew = currentList.filter { !it.isLiked && !it.isDisliked }
                             (dbNew + queueNew)
                                 .filter { !it.isLiked && !it.isDisliked }
                                 .distinctBy { (it.title.lowercase().trim()) + "___" + (it.artist.lowercase().trim()) }
                         }
-                        "NOW_PLAYING_LIKED" -> currentList.filter { it.isLiked }.ifEmpty { app.database.songDao().getLikedSongsList() }
-                        "NOW_PLAYING_DISLIKED" -> currentList.filter { it.isDisliked }.ifEmpty { app.database.songDao().getDislikedSongsList() }
-                        "NOW_PLAYING_NEW" -> currentList.filter { !it.isLiked && !it.isDisliked }.ifEmpty { app.database.songDao().getNewSongsList() }
-                        "NOW_PLAYING_ALL" -> currentList.ifEmpty { app.database.songDao().getAllSongs() }
+                        parentId == "NOW_PLAYING_LIKED" -> currentList.filter { it.isLiked }.ifEmpty { app.database.songDao().getLikedSongsList() }
+                        parentId == "NOW_PLAYING_DISLIKED" -> currentList.filter { it.isDisliked }.ifEmpty { app.database.songDao().getDislikedSongsList() }
+                        parentId == "NOW_PLAYING_NEW" -> currentList.filter { !it.isLiked && !it.isDisliked }.ifEmpty { app.database.songDao().getNewSongsList() }
+                        parentId == "NOW_PLAYING_ALL" -> currentList.ifEmpty { app.database.songDao().getAllSongs() }
                         else -> {
                             if (currentList.any { it.id == mediaId }) {
                                 currentList
                             } else {
                                 val allDb = app.database.songDao().getAllSongs()
-                                if (allDb.any { it.id == mediaId }) allDb else app.database.songDao().getSongById(mediaId)?.let { listOf(it) } ?: emptyList()
+                                if (allDb.any { it.id == mediaId }) {
+                                    allDb
+                                } else {
+                                    val dbSong = app.database.songDao().getSongById(mediaId)
+                                    if (dbSong != null) {
+                                        listOf(dbSong)
+                                    } else {
+                                        val playableItems = mediaItems.filter { it.mediaMetadata.isBrowsable != true }
+                                        if (playableItems.isNotEmpty()) {
+                                            playableItems.map { item ->
+                                                val id = item.mediaId
+                                                val title = item.mediaMetadata.title?.toString() ?: "Unknown Title"
+                                                val artist = item.mediaMetadata.artist?.toString() ?: "Unknown Artist"
+                                                val artwork = item.mediaMetadata.artworkUri?.toString() ?: ""
+                                                val uriStr = item.requestMetadata.mediaUri?.toString() ?: item.localConfiguration?.uri?.toString() ?: ""
+                                                val ytUrl = if (uriStr.startsWith("http")) uriStr else "https://www.youtube.com/watch?v=$id"
+                                                Song(
+                                                    id = id,
+                                                    title = title,
+                                                    artist = artist,
+                                                    thumbnailUrl = artwork,
+                                                    youtubeUrl = ytUrl
+                                                )
+                                            }
+                                        } else emptyList()
+                                    }
+                                }
                             }
                         }
                     }
@@ -1948,6 +2093,124 @@ class MusicLibraryService : MediaLibraryService() {
             return settableFuture
         }
 
+        private suspend fun performSearchInternal(query: String): List<MediaItem> = withContext(Dispatchers.IO) {
+            val cleanQuery = query.trim()
+            if (cleanQuery.isBlank()) return@withContext emptyList()
+
+            searchResultsCache[cleanQuery]?.let { if (it.isNotEmpty()) return@withContext it }
+
+            try {
+                val app = application as MusicDLPApplication
+                val songDao = app.database.songDao()
+                val repo = YoutubeDLRepository(app)
+
+                val allDbSongs = songDao.getAllSongs()
+
+                val likedMatches = allDbSongs.filter {
+                    it.isLiked && (it.title.contains(cleanQuery, ignoreCase = true) || it.artist.contains(cleanQuery, ignoreCase = true) || (it.rawTitle?.contains(cleanQuery, ignoreCase = true) == true))
+                }
+
+                val dislikedMatches = allDbSongs.filter {
+                    it.isDisliked && (it.title.contains(cleanQuery, ignoreCase = true) || it.artist.contains(cleanQuery, ignoreCase = true) || (it.rawTitle?.contains(cleanQuery, ignoreCase = true) == true))
+                }
+
+                val onlineSongs = repo.searchSongsOrPlaylists(cleanQuery)
+                val onlinePlaylists = repo.searchPlaylists(cleanQuery)
+
+                val likedOrDislikedIds = (likedMatches + dislikedMatches).map { it.id }.toSet()
+                val filteredSongs = onlineSongs.filter { it.id !in likedOrDislikedIds && !it.youtubeUrl.contains("list=") }
+
+                val singleSongs = likedMatches + dislikedMatches + filteredSongs
+                val songMediaItems = singleSongs.map { song ->
+                    val baseItem = song.toMediaItem(parentId = "SEARCH_SONGS_$cleanQuery")
+                    val gridExtras = createGridExtras()
+                    val mergedExtras = Bundle(baseItem.mediaMetadata.extras ?: Bundle()).apply { putAll(gridExtras) }
+                    baseItem.buildUpon()
+                        .setMediaMetadata(
+                            baseItem.mediaMetadata.buildUpon()
+                                .setExtras(mergedExtras)
+                                .build()
+                        )
+                        .build()
+                }
+
+                val playlistMediaItems = onlinePlaylists.take(5).map { pl ->
+                    val artworkUri = if (pl.thumbnailUrl.isNotBlank()) Uri.parse(pl.thumbnailUrl) else null
+                    val playlistMediaId = if (pl.playlistUrl.startsWith("http")) "PLAYLIST_${pl.playlistUrl}" else "PLAYLIST_https://www.youtube.com/playlist?list=${pl.id}"
+                    val itemExtras = Bundle().apply {
+                        putString("playlistUrl", pl.playlistUrl)
+                        putString("parentId", playlistMediaId)
+                        putAll(createGridExtras())
+                    }
+                    MediaItem.Builder()
+                        .setMediaId(playlistMediaId)
+                        .setMediaMetadata(
+                            MediaMetadata.Builder()
+                                .setTitle(pl.title.ifBlank { "Playlist" })
+                                .setArtist("${pl.uploader.ifBlank { "YouTube" }} • Playlist")
+                                .setArtworkUri(artworkUri)
+                                .setIsBrowsable(true)
+                                .setIsPlayable(true)
+                                .setFolderType(MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                                .setExtras(itemExtras)
+                                .build()
+                        )
+                        .build()
+                }
+
+                searchResultsSongsCache[cleanQuery] = songMediaItems
+                searchResultsPlaylistsCache[cleanQuery] = playlistMediaItems
+
+                val folders = mutableListOf<MediaItem>()
+
+                if (songMediaItems.isNotEmpty()) {
+                    val songsExtras = createGridExtras()
+                    folders.add(
+                        MediaItem.Builder()
+                            .setMediaId("SEARCH_SONGS_$cleanQuery")
+                            .setMediaMetadata(
+                                MediaMetadata.Builder()
+                                    .setTitle("Songs")
+                                    .setSubtitle("${songMediaItems.size} tracks")
+                                    .setIsBrowsable(true)
+                                    .setIsPlayable(false)
+                                    .setFolderType(MediaMetadata.FOLDER_TYPE_TITLES)
+                                    .setExtras(songsExtras)
+                                    .build()
+                            )
+                            .build()
+                    )
+                }
+
+                if (playlistMediaItems.isNotEmpty()) {
+                    val playlistsExtras = createGridExtras()
+                    folders.add(
+                        MediaItem.Builder()
+                            .setMediaId("SEARCH_PLAYLISTS_$cleanQuery")
+                            .setMediaMetadata(
+                                MediaMetadata.Builder()
+                                    .setTitle("Playlists")
+                                    .setSubtitle("${playlistMediaItems.size} playlists")
+                                    .setIsBrowsable(true)
+                                    .setIsPlayable(false)
+                                    .setFolderType(MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                                    .setExtras(playlistsExtras)
+                                    .build()
+                            )
+                            .build()
+                    )
+                }
+
+                if (folders.isNotEmpty()) {
+                    searchResultsCache[cleanQuery] = folders
+                }
+                folders
+            } catch (e: Exception) {
+                Napier.e("performSearchInternal failed: ${e.message}", e, tag = "DEBUG_METADATA")
+                emptyList()
+            }
+        }
+
         override fun onSearch(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
@@ -1955,39 +2218,13 @@ class MusicLibraryService : MediaLibraryService() {
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<Void>> {
             serviceScope.launch(Dispatchers.IO) {
-                try {
-                    val app = application as MusicDLPApplication
-                    val songDao = app.database.songDao()
-                    val repo = YoutubeDLRepository(app)
-
-                    val allDbSongs = songDao.getAllSongs()
-
-                    val likedMatches = allDbSongs.filter {
-                        it.isLiked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true) || (it.rawTitle?.contains(query, ignoreCase = true) == true))
+                val results = performSearchInternal(query)
+                if (results.isNotEmpty()) {
+                    val notifyExtras = Bundle(params?.extras ?: Bundle()).apply {
+                        putAll(createGridExtras())
                     }
-
-                    val dislikedMatches = allDbSongs.filter {
-                        it.isDisliked && (it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true) || (it.rawTitle?.contains(query, ignoreCase = true) == true))
-                    }
-
-                    val onlineResults = repo.searchSongsOrPlaylists(query)
-
-                    val likedOrDislikedIds = (likedMatches + dislikedMatches).map { it.id }.toSet()
-                    val filteredOnline = onlineResults.filter { it.id !in likedOrDislikedIds }
-
-                    val combinedResults = likedMatches + dislikedMatches + filteredOnline
-
-                    if (combinedResults.isNotEmpty()) {
-                        val mediaItems = combinedResults.map { it.toMediaItem() }
-                        searchResultsCache[query] = mediaItems
-                        session.notifySearchResultChanged(browser, query, mediaItems.size, params)
-
-                        withContext(Dispatchers.Main) {
-                            setQueueAndPlay(combinedResults, combinedResults.first().id, 0, 0L)
-                        }
-                    }
-                } catch (e: Exception) {
-                    Napier.e("onSearch failed: ${e.message}", e, tag = "DEBUG_METADATA")
+                    val notifyParams = LibraryParams.Builder().setExtras(notifyExtras).build()
+                    session.notifySearchResultChanged(browser, query, results.size, notifyParams)
                 }
             }
             return Futures.immediateFuture(LibraryResult.ofVoid())
@@ -2001,30 +2238,83 @@ class MusicLibraryService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-            val results = searchResultsCache[query] ?: emptyList()
-            val returnParams = params ?: LibraryParams.Builder().setExtras(
-                Bundle().apply {
-                    putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
-                    putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
+            val settableFuture = SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
+            serviceScope.launch(Dispatchers.IO) {
+                val results = performSearchInternal(query)
+
+                val paginated = if (pageSize > 0 && page >= 0) {
+                    val fromIndex = (page.toLong() * pageSize.toLong()).coerceIn(0L, results.size.toLong()).toInt()
+                    val toIndex = (fromIndex.toLong() + pageSize.toLong()).coerceIn(fromIndex.toLong(), results.size.toLong()).toInt()
+                    results.subList(fromIndex, toIndex)
+                } else {
+                    results
                 }
-            ).build()
-            return Futures.immediateFuture(LibraryResult.ofItemList(ImmutableList.copyOf(results), returnParams))
+
+                val gridExtras = createGridExtras()
+
+                // Attach grid styling to each MediaItem's metadata extras
+                val styledResults = paginated.map { item ->
+                    val existingExtras = item.mediaMetadata.extras ?: Bundle()
+                    val mergedExtras = Bundle(existingExtras).apply { putAll(gridExtras) }
+
+                    val updatedMetadata = item.mediaMetadata.buildUpon()
+                        .setExtras(mergedExtras)
+                        .build()
+
+                    item.buildUpon()
+                        .setMediaMetadata(updatedMetadata)
+                        .build()
+                }
+
+                val returnExtras = Bundle(params?.extras ?: Bundle()).apply {
+                    putAll(gridExtras)
+                }
+                val returnParams = LibraryParams.Builder().setExtras(returnExtras).build()
+
+                settableFuture.set(LibraryResult.ofItemList(ImmutableList.copyOf(styledResults), returnParams))
+            }
+
+            return settableFuture
         }
 
         @Suppress("DEPRECATION")
-        private fun createBrowsableItem(id: String, title: String, subtitle: String? = null): MediaItem {
+        private fun createBrowsableItem(id: String, title: String, subtitle: String? = null, gridFormat: Boolean = true): MediaItem {
             val itemExtras = Bundle().apply {
-                putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
+                if (gridFormat) {
+                    putInt("CONTENT_STYLE_BROWSABLE_HINT", 2)
+                    putInt("CONTENT_STYLE_PLAYABLE_HINT", 2)
+                    putInt(
+                        MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
+                        MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM
+                    )
+                    putInt(
+                        MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
+                        MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM
+                    )
+                } else {
+                    putInt("CONTENT_STYLE_BROWSABLE_HINT", 1)
+                    putInt("CONTENT_STYLE_PLAYABLE_HINT", 1)
+                    putInt(
+                        MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
+                        MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM
+                    )
+                    putInt(
+                        MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
+                        MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM
+                    )
+                }
             }
+
+
             return MediaItem.Builder()
                 .setMediaId(id)
                 .setMediaMetadata(
                     MediaMetadata.Builder()
+                        .setTitle(title)
+                        .setSubtitle(subtitle)
                         .setIsBrowsable(true)
                         .setIsPlayable(false)
                         .setFolderType(MediaMetadata.FOLDER_TYPE_MIXED)
-                        .setTitle(title)
-                        .setSubtitle(subtitle)
                         .setExtras(itemExtras)
                         .build()
                 )

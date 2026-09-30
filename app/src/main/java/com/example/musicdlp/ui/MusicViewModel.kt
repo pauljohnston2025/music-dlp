@@ -30,6 +30,8 @@ import com.google.common.util.concurrent.MoreExecutors
 import com.yausername.youtubedl_android.YoutubeDL
 import io.github.aakira.napier.Napier
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -288,6 +290,21 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         _currentPlayingSong.value = noMoreSong
                     }
                 }
+                MusicLibraryService.ACTION_DOWNLOAD_PROGRESS -> {
+                    val songId = intent.getStringExtra(MusicLibraryService.EXTRA_DOWNLOAD_SONG_ID)
+                    val progress = intent.getFloatExtra(MusicLibraryService.EXTRA_DOWNLOAD_PROGRESS, 0f)
+                    val isCompleted = intent.getBooleanExtra(MusicLibraryService.EXTRA_DOWNLOAD_COMPLETED, false)
+
+                    if (!songId.isNullOrBlank()) {
+                        val currentMap = _downloadProgress.value.toMutableMap()
+                        if (isCompleted) {
+                            currentMap.remove(songId)
+                        } else {
+                            currentMap[songId] = progress
+                        }
+                        _downloadProgress.value = currentMap
+                    }
+                }
             }
         }
     }
@@ -301,6 +318,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
         val filter = IntentFilter().apply {
             addAction(MusicLibraryService.ACTION_QUEUE_CHANGED)
+            addAction(MusicLibraryService.ACTION_DOWNLOAD_PROGRESS)
         }
         ContextCompat.registerReceiver(application, notificationReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
@@ -506,11 +524,50 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             try {
-                val playlists = repository.searchPlaylists(cleanQuery)
-                _playlistSearchResults.value = playlists
+                coroutineScope {
+                    val playlistsDeferred = async { repository.searchPlaylists(cleanQuery) }
+                    val songsDeferred = async { repository.searchSongsOrPlaylists(cleanQuery) }
 
-                val onlineResults = repository.searchSongsOrPlaylists(cleanQuery)
-                _searchResults.value = onlineResults
+                    val rawPlaylists = playlistsDeferred.await()
+                    val rawSongs = songsDeferred.await()
+
+                    val playlistUrlSet = mutableSetOf<String>()
+                    val cleanedPlaylists = mutableListOf<PlaylistSearchResult>()
+
+                    for (pl in rawPlaylists) {
+                        if (playlistUrlSet.add(pl.playlistUrl)) {
+                            cleanedPlaylists.add(pl)
+                        }
+                    }
+
+                    for (song in rawSongs) {
+                        if (song.youtubeUrl.contains("list=") || song.id.startsWith("PL") || song.id.startsWith("RD") || song.id.startsWith("OLAK")) {
+                            val plUrl = if (song.youtubeUrl.contains("list=")) song.youtubeUrl else "https://www.youtube.com/playlist?list=${song.id}"
+                            if (playlistUrlSet.add(plUrl)) {
+                                cleanedPlaylists.add(
+                                    PlaylistSearchResult(
+                                        id = song.id,
+                                        title = song.title,
+                                        uploader = song.artist,
+                                        thumbnailUrl = song.thumbnailUrl,
+                                        playlistUrl = plUrl
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                    val cleanedSongs = rawSongs.filter {
+                        !it.youtubeUrl.contains("list=") && !it.id.startsWith("PL") && !it.id.startsWith("RD") && !it.id.startsWith("OLAK")
+                    }
+
+                    _playlistSearchResults.value = cleanedPlaylists.take(5)
+                    _searchResults.value = cleanedSongs
+                }
+
+                val playlists = _playlistSearchResults.value
+                val onlineResults = _searchResults.value
+
                 _isSearching.value = false
                 _isPlaylistLoading.value = false
 
