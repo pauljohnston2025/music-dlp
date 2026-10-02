@@ -57,6 +57,7 @@ import java.io.File
 import java.io.IOException
 
 import com.example.musicdlp.data.SwipingMode
+import java.io.FileOutputStream
 
 private const val CUSTOM_ACTION_LIKE = "com.example.musicdlp.COMMAND_LIKE"
 private const val CUSTOM_ACTION_DISLIKE = "com.example.musicdlp.COMMAND_DISLIKE"
@@ -305,11 +306,50 @@ class MusicLibraryService : MediaLibraryService() {
             .setMediaSourceFactory(mediaSourceFactory)
             .build()
 
+        val retryCountMap = mutableMapOf<String, Int>()
+
         exoPlayer.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 val currentMediaId = exoPlayer.currentMediaItem?.mediaId
-                if (!currentMediaId.isNullOrBlank()) {
+                Napier.e("onPlayerError: ${error.message}, mediaId=$currentMediaId", error, tag = "DEBUG_METADATA")
+                if (!currentMediaId.isNullOrBlank() && currentMediaId != "no_more_songs") {
                     bufferedStreamUrls.remove(currentMediaId)
+                    val retries = retryCountMap[currentMediaId] ?: 0
+                    if (retries < 2) {
+                        retryCountMap[currentMediaId] = retries + 1
+                        serviceScope.launch(Dispatchers.Main) {
+                            delay(800)
+                            val currentList = synchronized(queueLock) { activeQueue.toList() }
+                            val currentSong = currentList.firstOrNull { it.id == currentMediaId }
+                            if (currentSong != null) {
+                                val freshUrl = withContext(Dispatchers.IO) {
+                                    val repo = YoutubeDLRepository(application as MusicDLPApplication)
+                                    repo.getStreamUrl(currentSong.youtubeUrl)
+                                }
+                                if (!freshUrl.isNullOrBlank()) {
+                                    bufferedStreamUrls[currentMediaId] = freshUrl
+                                    val idx = exoPlayer.currentMediaItemIndex
+                                    val mediaItem = currentSong.toMediaItem(playableUri = freshUrl, isCurrentSong = true)
+                                    if (idx in 0 until exoPlayer.mediaItemCount) {
+                                        exoPlayer.replaceMediaItem(idx, mediaItem)
+                                        exoPlayer.prepare()
+                                        exoPlayer.play()
+                                        Napier.d("Successfully retried stream from scratch for ${currentSong.title}", tag = "DEBUG_METADATA")
+                                        return@launch
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    val currentMediaId = exoPlayer.currentMediaItem?.mediaId
+                    if (!currentMediaId.isNullOrBlank()) {
+                        retryCountMap.remove(currentMediaId)
+                    }
                 }
             }
 
@@ -402,11 +442,23 @@ class MusicLibraryService : MediaLibraryService() {
 
             override fun seekToNextMediaItem() {
                 val currentList = synchronized(queueLock) { activeQueue.toList() }
-                val startIdx = virtualCurrentIndex ?: currentMediaItemIndex
+                val isNoMoreSongs = virtualCurrentIndex != null || exoPlayer.currentMediaItem?.mediaId == "no_more_songs"
+                val startIdx = if (isNoMoreSongs) (virtualCurrentIndex ?: currentList.size) else currentMediaItemIndex
                 val nextIdx = getNextSongIndex(currentList, startIdx, currentMode)
-                if (nextIdx != -1 && nextIdx < mediaItemCount) {
+
+                if (nextIdx != -1) {
                     virtualCurrentIndex = null
-                    seekTo(nextIdx, 0L)
+                    if (isNoMoreSongs || mediaItemCount != currentList.size) {
+                        val currentPlayingId = currentList.getOrNull(nextIdx)?.id
+                        val mediaItems = currentList.map { it.toMediaItem(isCurrentSong = (it.id == currentPlayingId)) }
+                        exoPlayer.setMediaItems(mediaItems, nextIdx, 0L)
+                        exoPlayer.prepare()
+                        exoPlayer.play()
+                        savePlaybackState()
+                        broadcastQueueChanged()
+                    } else {
+                        seekTo(nextIdx, 0L)
+                    }
                 } else {
                     showNoMoreSongsState()
                 }
@@ -418,11 +470,23 @@ class MusicLibraryService : MediaLibraryService() {
 
             override fun seekToPreviousMediaItem() {
                 val currentList = synchronized(queueLock) { activeQueue.toList() }
-                val startIdx = virtualCurrentIndex ?: currentMediaItemIndex
+                val isNoMoreSongs = virtualCurrentIndex != null || exoPlayer.currentMediaItem?.mediaId == "no_more_songs"
+                val startIdx = if (isNoMoreSongs) (virtualCurrentIndex ?: currentList.size) else currentMediaItemIndex
                 val prevIdx = getPreviousSongIndex(currentList, startIdx, currentMode)
-                if (prevIdx != -1 && prevIdx < mediaItemCount) {
+
+                if (prevIdx != -1) {
                     virtualCurrentIndex = null
-                    seekTo(prevIdx, 0L)
+                    if (isNoMoreSongs || mediaItemCount != currentList.size) {
+                        val currentPlayingId = currentList.getOrNull(prevIdx)?.id
+                        val mediaItems = currentList.map { it.toMediaItem(isCurrentSong = (it.id == currentPlayingId)) }
+                        exoPlayer.setMediaItems(mediaItems, prevIdx, 0L)
+                        exoPlayer.prepare()
+                        exoPlayer.play()
+                        savePlaybackState()
+                        broadcastQueueChanged()
+                    } else {
+                        seekTo(prevIdx, 0L)
+                    }
                 }
             }
         }
@@ -612,8 +676,31 @@ class MusicLibraryService : MediaLibraryService() {
         }
     }
 
+    private fun getOrCreateSilentMp3File(): File {
+        val silentFile = File(cacheDir, "silent_no_more_songs.mp3")
+        if (!silentFile.exists() || silentFile.length() == 0L) {
+            try {
+                val fos = FileOutputStream(silentFile)
+                val header = byteArrayOf(0xFF.toByte(), 0xFB.toByte(), 0x90.toByte(), 0x64.toByte())
+                val frame = ByteArray(417)
+                System.arraycopy(header, 0, frame, 0, 4)
+                for (i in 0 until 5) {
+                    fos.write(frame)
+                }
+                fos.flush()
+                fos.close()
+            } catch (e: Exception) {
+                Napier.e("Failed to create silent mp3: ${e.message}", e, tag = "DEBUG_METADATA")
+            }
+        }
+        return silentFile
+    }
+
     private fun createNoMoreSongsMediaItem(mode: SwipingMode): MediaItem {
         val messageTitle = "No more songs for playback mode: ${mode.displayName}"
+        val silentFile = getOrCreateSilentMp3File()
+        val silentUri = Uri.fromFile(silentFile)
+
         val itemExtras = Bundle().apply {
             putBoolean("isLiked", false)
             putBoolean("isDisliked", false)
@@ -623,10 +710,10 @@ class MusicLibraryService : MediaLibraryService() {
 
         return MediaItem.Builder()
             .setMediaId("no_more_songs")
-            .setUri(Uri.parse("http://dummy/no_more_songs"))
+            .setUri(silentUri)
             .setRequestMetadata(
                 MediaItem.RequestMetadata.Builder()
-                    .setMediaUri(Uri.parse("http://dummy/no_more_songs"))
+                    .setMediaUri(silentUri)
                     .setExtras(itemExtras)
                     .build()
             )
@@ -635,7 +722,7 @@ class MusicLibraryService : MediaLibraryService() {
                     .setTitle(messageTitle)
                     .setArtist("MusicDLP")
                     .setIsBrowsable(false)
-                    .setIsPlayable(false)
+                    .setIsPlayable(true)
                     .setFolderType(MediaMetadata.FOLDER_TYPE_NONE)
                     .setExtras(itemExtras)
                     .build()
@@ -869,15 +956,25 @@ class MusicLibraryService : MediaLibraryService() {
                 }
 
                 if (existingLiked != null) {
-                    val updated = existingLiked.addAlternateVersion(
-                        AlternateVersion(
-                            youtubeUrl = songToLike.youtubeUrl,
-                            rawTitle = songToLike.rawTitle ?: songToLike.title,
-                            thumbnailUrl = songToLike.thumbnailUrl
+                    if (existingLiked.id == songToLike.id || existingLiked.youtubeUrl == songToLike.youtubeUrl) {
+                        val newLiked = songToLike.copy(
+                            isLiked = true,
+                            isDisliked = false,
+                            likedAt = if ((existingLiked.likedAt ?: 0L) > 0L) existingLiked.likedAt else System.currentTimeMillis()
                         )
-                    )
-                    songDao.insertSong(updated)
-                    saveLikedSong(updated)
+                        songDao.insertSong(newLiked)
+                        saveLikedSong(newLiked)
+                    } else {
+                        val updated = existingLiked.addAlternateVersion(
+                            AlternateVersion(
+                                youtubeUrl = songToLike.youtubeUrl,
+                                rawTitle = songToLike.rawTitle ?: songToLike.title,
+                                thumbnailUrl = songToLike.thumbnailUrl
+                            )
+                        )
+                        songDao.insertSong(updated)
+                        saveLikedSong(updated)
+                    }
                 } else {
                     val newLiked = songToLike.copy(isLiked = true, isDisliked = false, likedAt = System.currentTimeMillis())
                     songDao.insertSong(newLiked)
@@ -1084,6 +1181,8 @@ class MusicLibraryService : MediaLibraryService() {
                     }
 
                     val fileToInsert = File(downloadedPath)
+                    YoutubeDLRepository.writeId3Tags(fileToInsert, song.title, song.artist, song.thumbnailUrl)
+
                     val resolver = app.contentResolver
                     val audioCollection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY) else MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
                     val details = ContentValues().apply {
@@ -1103,6 +1202,9 @@ class MusicLibraryService : MediaLibraryService() {
                         details.clear()
                         details.put(MediaStore.Audio.Media.IS_PENDING, 0)
                         resolver.update(uri, details, null, null)
+                    }
+                    if (finalFile.exists()) {
+                        YoutubeDLRepository.writeId3Tags(finalFile, song.title, song.artist, song.thumbnailUrl)
                     }
                     if (fileToInsert.parentFile?.name == "downloads" || fileToInsert.parentFile?.absolutePath == app.cacheDir.absolutePath) fileToInsert.delete()
                     broadcastDownloadProgress(song.id, 1.0f, isCompleted = true)
@@ -1181,7 +1283,9 @@ class MusicLibraryService : MediaLibraryService() {
 
                     val cleanedSong: Song
 
-                    if (matchingExistingSong != null) {
+                    if (songToProcess.id.startsWith("preview_")) {
+                        cleanedSong = songToProcess.copy(isMetadataCleaned = true, updatedAt = System.currentTimeMillis())
+                    } else if (matchingExistingSong != null) {
                         val alternate = AlternateVersion(
                             youtubeUrl = songToProcess.youtubeUrl,
                             rawTitle = songToProcess.rawTitle ?: cleanResult.recoveredRawTitle ?: cleanResult.title,
@@ -1192,7 +1296,6 @@ class MusicLibraryService : MediaLibraryService() {
                         )
                         songDao.insertSong(updatedExisting)
 
-                        // Clean up standalone MP3 file for songToProcess if it existed on disk
                         val safeArtist = songToProcess.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
                         val safeTitle = songToProcess.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
                         if (safeArtist.isNotBlank() && safeTitle.isNotBlank()) {
@@ -1255,7 +1358,8 @@ class MusicLibraryService : MediaLibraryService() {
                             val isPlaying = exoPlayer.isPlaying
                             val currentItemInPlayer = exoPlayer.getMediaItemAt(idxInPlayer)
                             val existingUri = currentItemInPlayer.localConfiguration?.uri?.toString()
-                            val mediaItem = cleanedSong.toMediaItem(playableUri = existingUri)
+                            val usableUri = if (existingUri != null && !existingUri.contains("dummy")) existingUri else bufferedStreamUrls[cleanedSong.id]
+                            val mediaItem = cleanedSong.toMediaItem(playableUri = usableUri)
                             exoPlayer.replaceMediaItem(idxInPlayer, mediaItem)
                             if (exoPlayer.currentMediaItemIndex == idxInPlayer) {
                                 exoPlayer.seekTo(idxInPlayer, currentPos)
@@ -2165,6 +2269,7 @@ class MusicLibraryService : MediaLibraryService() {
 
                 if (songMediaItems.isNotEmpty()) {
                     val songsExtras = createGridExtras()
+                    val firstSongArtwork = songMediaItems.firstOrNull()?.mediaMetadata?.artworkUri
                     folders.add(
                         MediaItem.Builder()
                             .setMediaId("SEARCH_SONGS_$cleanQuery")
@@ -2172,6 +2277,7 @@ class MusicLibraryService : MediaLibraryService() {
                                 MediaMetadata.Builder()
                                     .setTitle("Songs")
                                     .setSubtitle("${songMediaItems.size} tracks")
+                                    .setArtworkUri(firstSongArtwork)
                                     .setIsBrowsable(true)
                                     .setIsPlayable(false)
                                     .setFolderType(MediaMetadata.FOLDER_TYPE_TITLES)
@@ -2184,6 +2290,7 @@ class MusicLibraryService : MediaLibraryService() {
 
                 if (playlistMediaItems.isNotEmpty()) {
                     val playlistsExtras = createGridExtras()
+                    val firstPlaylistArtwork = playlistMediaItems.firstOrNull()?.mediaMetadata?.artworkUri
                     folders.add(
                         MediaItem.Builder()
                             .setMediaId("SEARCH_PLAYLISTS_$cleanQuery")
@@ -2191,6 +2298,7 @@ class MusicLibraryService : MediaLibraryService() {
                                 MediaMetadata.Builder()
                                     .setTitle("Playlists")
                                     .setSubtitle("${playlistMediaItems.size} playlists")
+                                    .setArtworkUri(firstPlaylistArtwork)
                                     .setIsBrowsable(true)
                                     .setIsPlayable(false)
                                     .setFolderType(MediaMetadata.FOLDER_TYPE_PLAYLISTS)

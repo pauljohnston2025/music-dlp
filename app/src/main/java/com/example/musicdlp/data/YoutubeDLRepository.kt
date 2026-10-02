@@ -28,6 +28,8 @@ import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.serialization.kotlinx.json.*
+import java.io.FileOutputStream
+import java.net.URI
 import java.util.UUID
 
 @Serializable
@@ -875,6 +877,228 @@ class YoutubeDLRepository(private val context: Context) {
 
     companion object {
         const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+        fun writeId3Tags(
+            file: File,
+            title: String,
+            artist: String,
+            thumbnailUrl: String? = null,
+            album: String? = "MusicDLP"
+        ) {
+            try {
+                if (!file.exists() || !file.canWrite()) return
+                val rawBytes = file.readBytes()
+                if (rawBytes.isEmpty()) return
+
+                val hasId3 = rawBytes.size >= 10 &&
+                        rawBytes[0] == 'I'.toByte() &&
+                        rawBytes[1] == 'D'.toByte() &&
+                        rawBytes[2] == '3'.toByte()
+
+                var mp3DataStart = 0
+                val preservedFrames = mutableListOf<ByteArray>()
+
+                if (hasId3) {
+                    val majorVersion = rawBytes[3].toInt() and 0xFF
+                    val flags = rawBytes[5].toInt() and 0xFF
+                    val tagSize = ((rawBytes[6].toInt() and 0x7F) shl 21) or
+                            ((rawBytes[7].toInt() and 0x7F) shl 14) or
+                            ((rawBytes[8].toInt() and 0x7F) shl 7) or
+                            (rawBytes[9].toInt() and 0x7F)
+
+                    mp3DataStart = (10 + tagSize).coerceAtMost(rawBytes.size)
+
+                    if (majorVersion == 3 || majorVersion == 4) {
+                        var offset = 10
+                        val hasExtendedHeader = (flags and 0x40) != 0
+                        if (hasExtendedHeader && offset + 4 <= mp3DataStart) {
+                            val extHeaderSize = if (majorVersion == 3) {
+                                ((rawBytes[offset].toInt() and 0xFF) shl 24) or
+                                        ((rawBytes[offset + 1].toInt() and 0xFF) shl 16) or
+                                        ((rawBytes[offset + 2].toInt() and 0xFF) shl 8) or
+                                        (rawBytes[offset + 3].toInt() and 0xFF)
+                            } else {
+                                ((rawBytes[offset].toInt() and 0x7F) shl 21) or
+                                        ((rawBytes[offset + 1].toInt() and 0x7F) shl 14) or
+                                        ((rawBytes[offset + 2].toInt() and 0x7F) shl 7) or
+                                        (rawBytes[offset + 3].toInt() and 0x7F)
+                            }
+                            offset += (extHeaderSize + 4).coerceAtLeast(4)
+                        }
+
+                        while (offset + 10 <= mp3DataStart) {
+                            val id0 = rawBytes[offset].toInt().toChar()
+                            val id1 = rawBytes[offset + 1].toInt().toChar()
+                            val id2 = rawBytes[offset + 2].toInt().toChar()
+                            val id3 = rawBytes[offset + 3].toInt().toChar()
+
+                            if (id0 == '\u0000' || id1 == '\u0000' || !id0.isLetterOrDigit()) {
+                                break
+                            }
+
+                            val frameId = "$id0$id1$id2$id3"
+                            val frameSize = if (majorVersion == 3) {
+                                ((rawBytes[offset + 4].toInt() and 0xFF) shl 24) or
+                                        ((rawBytes[offset + 5].toInt() and 0xFF) shl 16) or
+                                        ((rawBytes[offset + 6].toInt() and 0xFF) shl 8) or
+                                        (rawBytes[offset + 7].toInt() and 0xFF)
+                            } else {
+                                ((rawBytes[offset + 4].toInt() and 0x7F) shl 21) or
+                                        ((rawBytes[offset + 5].toInt() and 0x7F) shl 14) or
+                                        ((rawBytes[offset + 6].toInt() and 0x7F) shl 7) or
+                                        (rawBytes[offset + 7].toInt() and 0x7F)
+                            }
+
+                            if (frameSize < 0 || offset + 10 + frameSize > mp3DataStart) {
+                                break
+                            }
+
+                            val totalFrameLen = 10 + frameSize
+                            val isReplacingFrame = frameId == "TIT2" || frameId == "TPE1" || (!album.isNullOrBlank() && frameId == "TALB")
+                            if (!isReplacingFrame) {
+                                val frameBytes = rawBytes.copyOfRange(offset, offset + totalFrameLen)
+                                preservedFrames.add(frameBytes)
+                            }
+
+                            offset += totalFrameLen
+                        }
+                    }
+                }
+
+                fun hasFrame(id: String): Boolean {
+                    val idBytes = id.toByteArray(Charsets.US_ASCII)
+                    return preservedFrames.any { frame ->
+                        frame.size >= 4 &&
+                                frame[0] == idBytes[0] &&
+                                frame[1] == idBytes[1] &&
+                                frame[2] == idBytes[2] &&
+                                frame[3] == idBytes[3]
+                    }
+                }
+
+                fun createTextFrame(id: String, text: String): ByteArray {
+                    val textBytes = text.toByteArray(Charsets.UTF_8)
+                    val content = ByteArray(1 + textBytes.size)
+                    content[0] = 3 // UTF-8 encoding flag
+                    System.arraycopy(textBytes, 0, content, 1, textBytes.size)
+
+                    val frame = ByteArray(10 + content.size)
+                    val idBytes = id.toByteArray(Charsets.US_ASCII)
+                    System.arraycopy(idBytes, 0, frame, 0, 4)
+                    val len = content.size
+                    frame[4] = ((len shr 24) and 0xFF).toByte()
+                    frame[5] = ((len shr 16) and 0xFF).toByte()
+                    frame[6] = ((len shr 8) and 0xFF).toByte()
+                    frame[7] = (len and 0xFF).toByte()
+                    frame[8] = 0
+                    frame[9] = 0
+                    System.arraycopy(content, 0, frame, 10, content.size)
+                    return frame
+                }
+
+                fun fetchImageBytes(urlStr: String): ByteArray? {
+                    if (urlStr.isBlank()) return null
+                    return try {
+                        if (urlStr.startsWith("http://") || urlStr.startsWith("https://")) {
+                            val conn = URL(urlStr).openConnection() as HttpURLConnection
+                            conn.connectTimeout = 5000
+                            conn.readTimeout = 5000
+                            conn.requestMethod = "GET"
+                            conn.setRequestProperty("User-Agent", USER_AGENT)
+                            if (conn.responseCode == 200) {
+                                conn.inputStream.use { it.readBytes() }
+                            } else null
+                        } else if (urlStr.startsWith("file://") || urlStr.startsWith("/")) {
+                            val f = if (urlStr.startsWith("file://")) File(URI(urlStr)) else File(urlStr)
+                            if (f.exists() && f.canRead()) f.readBytes() else null
+                        } else null
+                    } catch (e: Exception) {
+                        Napier.w("Failed to fetch thumbnail image from $urlStr: ${e.message}", tag = "DEBUG_METADATA")
+                        null
+                    }
+                }
+
+                fun createApicFrame(imageBytes: ByteArray): ByteArray {
+                    val isPng = imageBytes.size >= 8 &&
+                            imageBytes[0] == 0x89.toByte() &&
+                            imageBytes[1] == 'P'.toByte() &&
+                            imageBytes[2] == 'N'.toByte() &&
+                            imageBytes[3] == 'G'.toByte()
+                    val mimeStr = if (isPng) "image/png" else "image/jpeg"
+                    val mimeBytes = "$mimeStr\u0000".toByteArray(Charsets.US_ASCII)
+
+                    val payloadSize = 1 + mimeBytes.size + 1 + 1 + imageBytes.size
+                    val payload = ByteArray(payloadSize)
+                    var p = 0
+                    payload[p++] = 0 // ISO-8859-1
+                    System.arraycopy(mimeBytes, 0, payload, p, mimeBytes.size)
+                    p += mimeBytes.size
+                    payload[p++] = 3 // Cover (front)
+                    payload[p++] = 0 // empty description string terminator
+                    System.arraycopy(imageBytes, 0, payload, p, imageBytes.size)
+
+                    val frame = ByteArray(10 + payload.size)
+                    val idBytes = "APIC".toByteArray(Charsets.US_ASCII)
+                    System.arraycopy(idBytes, 0, frame, 0, 4)
+                    val len = payload.size
+                    frame[4] = ((len shr 24) and 0xFF).toByte()
+                    frame[5] = ((len shr 16) and 0xFF).toByte()
+                    frame[6] = ((len shr 8) and 0xFF).toByte()
+                    frame[7] = (len and 0xFF).toByte()
+                    frame[8] = 0
+                    frame[9] = 0
+                    System.arraycopy(payload, 0, frame, 10, payload.size)
+                    return frame
+                }
+
+                val framesToWrite = mutableListOf<ByteArray>()
+                framesToWrite.addAll(preservedFrames)
+
+                if (!hasFrame("APIC") && !thumbnailUrl.isNullOrBlank()) {
+                    val imgBytes = fetchImageBytes(thumbnailUrl)
+                    if (imgBytes != null && imgBytes.isNotEmpty()) {
+                        framesToWrite.add(createApicFrame(imgBytes))
+                    }
+                }
+
+                if (title.isNotBlank()) {
+                    framesToWrite.add(createTextFrame("TIT2", title))
+                }
+                if (artist.isNotBlank()) {
+                    framesToWrite.add(createTextFrame("TPE1", artist))
+                }
+                if (!album.isNullOrBlank() && !hasFrame("TALB")) {
+                    framesToWrite.add(createTextFrame("TALB", album))
+                }
+
+                val framesSize = framesToWrite.sumOf { it.size }
+
+                val header = ByteArray(10)
+                header[0] = 'I'.toByte()
+                header[1] = 'D'.toByte()
+                header[2] = '3'.toByte()
+                header[3] = 3 // ID3v2.3
+                header[4] = 0
+                header[5] = 0
+
+                header[6] = ((framesSize shr 21) and 0x7F).toByte()
+                header[7] = ((framesSize shr 14) and 0x7F).toByte()
+                header[8] = ((framesSize shr 7) and 0x7F).toByte()
+                header[9] = (framesSize and 0x7F).toByte()
+
+                val fos = FileOutputStream(file)
+                fos.write(header)
+                for (frame in framesToWrite) {
+                    fos.write(frame)
+                }
+                fos.write(rawBytes, mp3DataStart, rawBytes.size - mp3DataStart)
+                fos.flush()
+                fos.close()
+                Napier.d("Updated ID3 tags for ${file.name}: $artist - $title (preserved ${preservedFrames.size} frames)", tag = "DEBUG_METADATA")
+            } catch (e: Exception) {
+                Napier.e("Failed to write ID3 tags to ${file.name}: ${e.message}", e, tag = "DEBUG_METADATA")
+            }
+        }
     }
 
     var rateLimitCooldownUntilMs: Long = 0L
@@ -973,10 +1197,21 @@ class YoutubeDLRepository(private val context: Context) {
             throw e
         }
 
-        val downloaded = downloadDir.listFiles()?.firstOrNull { 
-            it.name.startsWith(song.id) && (it.extension == "mp3" || it.extension == "m4a" || it.extension == "webm")
+        val effectiveVideoId = when {
+            song.youtubeUrl.contains("watch?v=") -> song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+            song.youtubeUrl.contains("youtu.be/") -> song.youtubeUrl.substringAfter("youtu.be/").substringBefore("&").substringBefore("?")
+            song.id.length == 11 -> song.id
+            else -> ""
+        }
+
+        val downloaded = downloadDir.listFiles()?.firstOrNull { file ->
+            file.isFile && (file.extension == "mp3" || file.extension == "m4a" || file.extension == "webm") &&
+                    ((effectiveVideoId.isNotBlank() && file.name.contains(effectiveVideoId)) ||
+                            file.name.contains(song.id) ||
+                            downloadDir.listFiles()?.count { it.isFile && (it.extension == "mp3" || it.extension == "m4a" || it.extension == "webm") } == 1)
         }
         if (downloaded != null && downloaded.exists()) {
+            writeId3Tags(downloaded, song.title, song.artist, song.thumbnailUrl)
             return@withContext downloaded.absolutePath
         }
         throw IllegalStateException("Downloaded file not found for song: ${song.title}")

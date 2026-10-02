@@ -2,6 +2,7 @@ package com.example.musicdlp.data
 
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.util.UnstableApi
@@ -119,6 +120,31 @@ data class Song(
     }
 }
 
+fun Song.getEffectiveThumbnail(): Any {
+    if (thumbnailUrl.isNotBlank()) return thumbnailUrl
+
+    val videoId = when {
+        youtubeUrl.contains("watch?v=") -> youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+        youtubeUrl.contains("youtu.be/") -> youtubeUrl.substringAfter("youtu.be/").substringBefore("&").substringBefore("?")
+        id.length == 11 -> id
+        else -> ""
+    }
+    if (videoId.isNotBlank() && videoId.length == 11) {
+        return "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+    }
+
+    val safeArtist = artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+    val safeTitle = title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+    if (safeArtist.isNotBlank() && safeTitle.isNotBlank()) {
+        val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+        val localFile = File(File(publicMusicDir, "MusicDLP"), "$safeArtist - $safeTitle.mp3")
+        if (localFile.exists()) {
+            return localFile
+        }
+    }
+    return ""
+}
+
 @UnstableApi
 fun Song.toMediaItem(
     playableUri: String? = null,
@@ -126,12 +152,12 @@ fun Song.toMediaItem(
     isCurrentSong: Boolean = false,
     completionPercentage: Double? = null
 ): MediaItem {
-    val artworkUri = if (thumbnailUrl.isNotBlank()) {
-        Uri.parse(thumbnailUrl)
-    } else if (youtubeUrl.contains("watch?v=")) {
-        val id = youtubeUrl.substringAfter("watch?v=").substringBefore("&")
-        Uri.parse("https://i.ytimg.com/vi/$id/hqdefault.jpg")
-    } else null
+    val effectiveThumb = getEffectiveThumbnail()
+    val artworkUri = when (effectiveThumb) {
+        is String -> if (effectiveThumb.isNotBlank()) Uri.parse(effectiveThumb) else null
+        is File -> Uri.fromFile(effectiveThumb)
+        else -> null
+    }
 
     val safeId = id.ifBlank { "unknown_${youtubeUrl.hashCode()}" }
 

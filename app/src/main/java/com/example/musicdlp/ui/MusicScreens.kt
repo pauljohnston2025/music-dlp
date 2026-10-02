@@ -929,10 +929,21 @@ fun LikedSongsScreen(viewModel: MusicViewModel) {
 fun AlternateVersionsDialog(
     song: Song,
     viewModel: MusicViewModel,
+    isLikedPage: Boolean = false,
+    isSwipeScreen: Boolean = false,
     onDismiss: () -> Unit
 ) {
     val alternates = remember(song) { song.getAlternateVersionsList() }
     val currentlyPlayingId by viewModel.currentlyPlayingId.collectAsState()
+
+    val currentPreviewId = "preview_${song.youtubeUrl.hashCode()}"
+    val isCurrentPlaying = currentlyPlayingId == song.id || currentlyPlayingId == currentPreviewId
+
+    val headerSubtitleText = when {
+        isLikedPage -> "Select an alternate version to preview or replace your downloaded copy:"
+        isSwipeScreen -> "Select an alternate version to set as current version and play:"
+        else -> "Select an alternate version to preview or set as current version:"
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -946,7 +957,7 @@ fun AlternateVersionsDialog(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Select an alternate version to preview or replace your downloaded copy:",
+                    text = headerSubtitleText,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -954,29 +965,74 @@ fun AlternateVersionsDialog(
 
                 LazyColumn(modifier = Modifier.heightIn(max = 350.dp)) {
                     item {
+                        val currentThumbnail = if (song.thumbnailUrl.isNotBlank()) {
+                            song.thumbnailUrl
+                        } else if (song.youtubeUrl.contains("watch?v=")) {
+                            val id = song.youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+                            "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                        } else if (song.youtubeUrl.contains("youtu.be/")) {
+                            val id = song.youtubeUrl.substringAfter("youtu.be/").substringBefore("&").substringBefore("?")
+                            "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                        } else {
+                            ""
+                        }
+
                         Card(
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                         ) {
                             Column(modifier = Modifier.padding(12.dp)) {
                                 Text(
-                                    text = "[Current Downloaded Version]",
+                                    text = if (isLikedPage) "[Current Downloaded Version]" else "[Current Version]",
                                     style = MaterialTheme.typography.labelMedium,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onPrimaryContainer
                                 )
                                 Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = song.rawTitle ?: song.title,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    maxLines = 2
-                                )
-                                Text(
-                                    text = song.youtubeUrl,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1
-                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (currentThumbnail.isNotBlank()) {
+                                        AsyncImage(
+                                            model = currentThumbnail,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(56.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                    }
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = song.rawTitle ?: song.title,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 2
+                                        )
+                                        Text(
+                                            text = song.youtubeUrl,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(8.dp))
+                                if (!isSwipeScreen) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            if (isCurrentPlaying) {
+                                                viewModel.togglePlayPause()
+                                            } else {
+                                                viewModel.playPreviewByUrl(song.youtubeUrl, song.rawTitle ?: song.title, song.artist)
+                                            }
+                                        }
+                                    ) {
+                                        Icon(
+                                            imageVector = if (isCurrentPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(if (isCurrentPlaying) "Pause" else "Preview Current")
+                                    }
+                                }
                             }
                         }
                     }
@@ -1029,29 +1085,42 @@ fun AlternateVersionsDialog(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    OutlinedButton(
-                                        onClick = { viewModel.playPreviewByUrl(version.youtubeUrl, version.rawTitle ?: song.title) }
-                                    ) {
-                                        Icon(
-                                            imageVector = if (isPreviewPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(if (isPreviewPlaying) "Pause" else "Preview")
+                                    if (!isSwipeScreen) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                if (isPreviewPlaying) {
+                                                    viewModel.togglePlayPause()
+                                                } else {
+                                                    viewModel.playPreviewByUrl(version.youtubeUrl, version.rawTitle ?: "Alternate Version", song.artist)
+                                                }
+                                            }
+                                        ) {
+                                            Icon(
+                                                imageVector = if (isPreviewPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(if (isPreviewPlaying) "Pause" else "Preview")
+                                        }
                                     }
 
                                     Button(
                                         onClick = {
-                                            viewModel.replaceLikedSongWithAlternateVersion(song, version)
+                                            viewModel.setAlternateAsCurrentVersion(
+                                                targetSong = song,
+                                                selectedVersion = version,
+                                                isLikedPage = isLikedPage,
+                                                playImmediately = isSwipeScreen
+                                            )
                                             onDismiss()
                                         }
                                     ) {
-                                        Text("Replace Download")
+                                        Text(if (isLikedPage) "Replace Download" else "Set as Current")
                                     }
                                 }
 
-                                if (isPreviewPlaying) {
+                                if (isPreviewPlaying && !isSwipeScreen) {
                                     Spacer(modifier = Modifier.height(4.dp))
                                     PlayerControls(
                                         viewModel = viewModel,
@@ -1200,6 +1269,8 @@ fun FilteredSongsDialog(
         AlternateVersionsDialog(
             song = songForAlternatesDialog!!,
             viewModel = viewModel,
+            isLikedPage = title.contains("Liked", ignoreCase = true),
+            isSwipeScreen = true,
             onDismiss = { songForAlternatesDialog = null }
         )
     }
@@ -1412,6 +1483,8 @@ fun CommonSongListScreen(
         AlternateVersionsDialog(
             song = songForAlternatesDialog!!,
             viewModel = viewModel,
+            isLikedPage = title.contains("Liked", ignoreCase = true),
+            isSwipeScreen = false,
             onDismiss = { songForAlternatesDialog = null }
         )
     }
@@ -1562,14 +1635,23 @@ fun CommonSongListScreen(
                                     .height(32.dp),
                                 contentAlignment = Alignment.Center
                             ) {
-                                if (alternates.isNotEmpty()) {
-                                    AssistChip(
-                                        onClick = { songForAlternatesDialog = song },
-                                        label = { Text("Alternates (${alternates.size})", fontSize = 11.sp) },
-                                        leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(12.dp)) }
-                                    )
-                                } else if (trailingContent != null) {
-                                    trailingContent(song)
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    if (alternates.isNotEmpty()) {
+                                        AssistChip(
+                                            onClick = { songForAlternatesDialog = song },
+                                            label = { Text("Alternates (${alternates.size})", fontSize = 11.sp) },
+                                            leadingIcon = { Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(12.dp)) }
+                                        )
+                                        if (trailingContent != null) {
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                        }
+                                    }
+                                    if (trailingContent != null) {
+                                        trailingContent(song)
+                                    }
                                 }
                             }
                         }

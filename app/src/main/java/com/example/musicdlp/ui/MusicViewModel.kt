@@ -3,11 +3,14 @@ package com.example.musicdlp.ui
 import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
@@ -158,12 +161,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentPlayingSong = MutableStateFlow<Song?>(null)
     val currentPlayingSong: StateFlow<Song?> = _currentPlayingSong
 
-    val canGoPreviousInContext: StateFlow<Boolean> = combine(_currentPlayingSong, _activePlayingList, _currentIndex) { current, list, idx ->
-        if (current == null) false else idx > 0
+    val canGoPreviousInContext: StateFlow<Boolean> = combine(_currentlyPlayingId, _currentPlayingSong, _activePlayingList, _currentIndex) { playingId, current, list, idx ->
+        if (playingId == "no_more_songs") list.isNotEmpty()
+        else if (current == null) false
+        else idx > 0
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
-    val canGoNextInContext: StateFlow<Boolean> = combine(_currentPlayingSong, _activePlayingList, _currentIndex) { current, list, idx ->
-        if (current == null) false else idx < list.lastIndex
+    val canGoNextInContext: StateFlow<Boolean> = combine(_currentlyPlayingId, _currentPlayingSong, _activePlayingList, _currentIndex) { playingId, current, list, idx ->
+        if (playingId == "no_more_songs") false
+        else if (current == null) false
+        else idx < list.size
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     private val _errorMessage = MutableStateFlow<String?>(null)
@@ -342,7 +349,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         controller?.addListener(object : Player.Listener {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 val mediaId = mediaItem?.mediaId ?: return
-                if (mediaId == "no_more_songs" || mediaId == "ROOT") return
+                if (mediaId == "ROOT") return
+
+                if (mediaId == "no_more_songs") {
+                    val noMoreSong = Song(
+                        id = "no_more_songs",
+                        title = "No more songs for playback mode: ${_swipingMode.value.displayName}",
+                        artist = "MusicDLP",
+                        thumbnailUrl = "",
+                        youtubeUrl = ""
+                    )
+                    _currentlyPlayingId.value = "no_more_songs"
+                    _currentPlayingSong.value = noMoreSong
+                    return
+                }
 
                 val currentList = _activePlayingList.value
                 val newIdx = currentList.indexOfFirst { it.id == mediaId }
@@ -417,6 +437,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val fullQueue = if (contextList.isNotEmpty()) contextList else _activePlayingList.value
         val actualQueue = if (fullQueue.none { it.id == song.id }) listOf(song) + fullQueue else fullQueue
 
+        _activePlayingList.value = actualQueue
+        SharedQueueHolder.setQueue(actualQueue)
+
         val intent = Intent(MusicLibraryService.ACTION_SET_QUEUE).apply {
             setPackage(app.packageName)
             putExtra(MusicLibraryService.EXTRA_QUEUE_JSON, json.encodeToString(actualQueue))
@@ -477,15 +500,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         playSong(song)
     }
 
-    fun playPreviewByUrl(youtubeUrl: String, title: String = "Preview") {
+    fun playPreviewByUrl(youtubeUrl: String, title: String = "Preview", artist: String = "Preview") {
+        val effectiveThumbnail = if (youtubeUrl.contains("watch?v=")) {
+            val videoId = youtubeUrl.substringAfter("watch?v=").substringBefore("&")
+            "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+        } else ""
+
         val tempSong = Song(
             id = "preview_${youtubeUrl.hashCode()}",
             title = title,
-            artist = "",
-            thumbnailUrl = "",
+            artist = if (artist.isNotBlank()) artist else "Preview",
+            thumbnailUrl = effectiveThumbnail,
             youtubeUrl = youtubeUrl,
             rawTitle = if (title != "Preview" && title != "Loading...") title else null,
-            isMetadataCleaned = false
+            isMetadataCleaned = true
         )
         playPreview(tempSong)
     }
@@ -830,6 +858,43 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     updatedAt = System.currentTimeMillis()
                 )
 
+                // Update downloaded MP3 file name, ID3 tags, and MediaStore if file exists
+                val oldSafeArtist = song.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                val oldSafeTitle = song.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                val oldFileName = "$oldSafeArtist - $oldSafeTitle.mp3"
+
+                val newSafeArtist = trimmedArtist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                val newSafeTitle = trimmedTitle.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                val newFileName = "$newSafeArtist - $newSafeTitle.mp3"
+
+                val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                val downloadDir = File(publicMusicDir, "MusicDLP")
+
+                val oldFile = File(downloadDir, oldFileName)
+                val targetFile = if (oldFile.exists()) {
+                    if (oldFileName != newFileName) {
+                        val newFile = File(downloadDir, newFileName)
+                        if (oldFile.renameTo(newFile)) newFile else oldFile
+                    } else oldFile
+                } else {
+                    val newFile = File(downloadDir, newFileName)
+                    if (newFile.exists()) newFile else null
+                }
+
+                if (targetFile != null && targetFile.exists()) {
+                    YoutubeDLRepository.writeId3Tags(targetFile, trimmedTitle, trimmedArtist, updatedSong.thumbnailUrl)
+                    try {
+                        val resolver = app.contentResolver
+                        val audioCollection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY) else MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                        val details = ContentValues().apply {
+                            put(MediaStore.Audio.Media.DISPLAY_NAME, newFileName)
+                            put(MediaStore.Audio.Media.ARTIST, trimmedArtist)
+                            put(MediaStore.Audio.Media.TITLE, trimmedTitle)
+                        }
+                        resolver.update(audioCollection, details, "${MediaStore.Audio.Media.DISPLAY_NAME} = ? OR ${MediaStore.Audio.Media.DISPLAY_NAME} = ?", arrayOf(oldFileName, newFileName))
+                    } catch (e: Exception) {}
+                }
+
                 songDao.insertSong(updatedSong)
                 finalSongToBroadcast = updatedSong
             }
@@ -959,9 +1024,19 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         targetSong: Song,
         selectedVersion: AlternateVersion
     ) {
+        setAlternateAsCurrentVersion(targetSong, selectedVersion, isLikedPage = true)
+    }
+
+    fun setAlternateAsCurrentVersion(
+        targetSong: Song,
+        selectedVersion: AlternateVersion,
+        isLikedPage: Boolean = false,
+        playImmediately: Boolean = false
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             _isSongLoading.value = true
-            _errorMessage.value = "Downloading alternate version for ${targetSong.title}..."
+            val statusMsg = if (isLikedPage || targetSong.isLiked) "Downloading alternate version for ${targetSong.title}..." else "Updating version for ${targetSong.title}..."
+            _errorMessage.value = statusMsg
             try {
                 val currentAlternates = targetSong.getAlternateVersionsList().toMutableList()
                 currentAlternates.removeAll { it.youtubeUrl == selectedVersion.youtubeUrl }
@@ -989,12 +1064,43 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     alternateYoutubeUrls = json.encodeToString(currentAlternates)
                 )
 
+                if (isLikedPage || targetSong.isLiked) {
+                    val safeArtist = targetSong.artist.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                    val safeTitle = targetSong.title.replace(Regex("[\\\\/:*?\"<>|]"), "").trim()
+                    if (safeArtist.isNotBlank() && safeTitle.isNotBlank()) {
+                        val oldFileName = "$safeArtist - $safeTitle.mp3"
+                        val publicMusicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+                        val downloadDir = File(publicMusicDir, "MusicDLP")
+                        val oldFile = File(downloadDir, oldFileName)
+                        if (oldFile.exists()) {
+                            oldFile.delete()
+                        }
+                    }
+                }
+
                 songDao.insertSong(updatedSong)
-                likeSong(updatedSong, advance = false)
-                _errorMessage.value = "Replaced ${targetSong.title} with alternate version!"
+
+                val intent = Intent(MusicLibraryService.ACTION_UPDATE_SONG).apply {
+                    setPackage(app.packageName)
+                    putExtra(MusicLibraryService.EXTRA_SONG_JSON, json.encodeToString(updatedSong))
+                }
+                app.sendBroadcast(intent)
+
+                if (isLikedPage || targetSong.isLiked) {
+                    likeSong(updatedSong, advance = false)
+                    _errorMessage.value = "Replaced ${targetSong.title} with alternate version!"
+                } else {
+                    _errorMessage.value = "Set ${targetSong.title} to alternate version!"
+                }
+
+                if (playImmediately) {
+                    withContext(Dispatchers.Main) {
+                        playSong(updatedSong)
+                    }
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
-                _errorMessage.value = "Failed to replace alternate version: ${e.message}"
+                _errorMessage.value = "Failed to update alternate version: ${e.message}"
             } finally {
                 _isSongLoading.value = false
             }
